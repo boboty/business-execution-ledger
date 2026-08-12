@@ -11,6 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Scan the authored branch history, not GitHub's synthetic PR merge commit.
+          # The synthetic merge message embeds full commit SHAs and can accidentally
+          # contain a 10+ digit run that looks like a business identifier.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0 # full history — --history mode needs every reachable commit/blob
       - uses: actions/setup-python@v5
         with:
