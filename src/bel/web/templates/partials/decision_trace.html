@@ -1,0 +1,36 @@
+{# Decision -> Fact -> EvidenceFragment -> EvidenceDocument trace.
+   Rendered inside <details> so no JS is needed to expand it.
+   `trace` is a DecisionTraceVM. #}
+<details class="decision-trace" id="{{ trace.panel_id }}">
+  <summary class="trace-toggle">查看依据</summary>
+  <div class="trace-body">
+    {% for node in trace.nodes %}
+    <div class="trace-node">
+      <div class="trace-node-title">{{ node.label }}</div>
+      {% if node.fields %}
+      <dl class="trace-fields">
+        {% for label, value in node.fields %}
+        <div class="trace-field"><dt>{{ label }}</dt><dd>{{ value }}</dd></div>
+        {% endfor %}
+      </dl>
+      {% endif %}
+      <div class="trace-source">
+        <div class="trace-source-label">来源证据</div>
+        <div class="trace-source-row"><span>来源类型</span>{{ node.source_type }}</div>
+        <div class="trace-source-row"><span>文档</span>{{ node.document }}</div>
+        <div class="trace-source-row"><span>定位</span>{{ node.locator }}</div>
+      </div>
+      {% if node.tech %}
+      <details class="tech-details">
+        <summary>技术详情</summary>
+        <dl class="trace-fields">
+          {% for label, value in node.tech %}
+          <div class="trace-field"><dt>{{ label }}</dt><dd class="mono">{{ value }}</dd></div>
+          {% endfor %}
+        </dl>
+      </details>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</details>

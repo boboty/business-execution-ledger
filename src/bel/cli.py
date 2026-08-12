@@ -8,7 +8,7 @@ from pathlib import Path
 import click
 
 from bel.application.accrual_queries import get_accrual_view, list_accrual_views
-from bel.application.allocate_invoice_item import allocate_invoice_item
+from bel.application.allocate_invoice_item import execute_manual_item_allocation
 from bel.application.get_contract import get_contract
 from bel.application.get_invoice import get_invoice
 from bel.application.get_payment import get_payment
@@ -536,11 +536,19 @@ def invoice_item_allocate(
     quantity: str,
     net_amount: str,
 ) -> None:
-    """Manually confirm a ContractItem <-> InvoiceItem allocation (11-A/B/C enforced)."""
+    """Manually confirm a ContractItem <-> InvoiceItem allocation (11-A/B/C enforced).
+
+    Runs through the SAME serialized write boundary as the Web API
+    (``execute_manual_item_allocation``), so the CLI and Web share one
+    command-level BEGIN IMMEDIATE transaction model."""
+    from sqlalchemy.exc import OperationalError
+
+    from bel.infrastructure.persistence.database import is_database_busy
+
     session_factory = _session_factory(ctx.obj["db_path"])
     try:
         with session_factory() as session:
-            allocation = allocate_invoice_item(
+            allocation = execute_manual_item_allocation(
                 session,
                 invoice_external_key=invoice_external_key,
                 line_no=line_no,
@@ -549,6 +557,11 @@ def invoice_item_allocate(
                 quantity=Decimal(quantity),
                 net_amount=Decimal(net_amount),
             )
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
     except ValueError as exc:
         click.echo(f"Error: {exc}")
         raise SystemExit(1) from exc
@@ -616,6 +629,40 @@ def period_close_preview(ctx: click.Context, period: str) -> None:
     click.echo("Summary:")
     for key, value in preview.summary.items():
         click.echo(f"  {key}: {value}")
+
+
+@cli.command("web")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Interface to bind.")
+@click.option("--port", default=8000, show_default=True, type=int, help="TCP port to bind.")
+@click.pass_context
+def web_cmd(ctx: click.Context, host: str, port: int) -> None:
+    """Serve the Phase 2C workbench (月结工作台 + 合同360°).
+
+    Reads the SAME database as the rest of the CLI. The server is
+    read-only except for the manual InvoiceItem allocation API, and it
+    never opens a browser.
+    """
+    db_path = ctx.obj["db_path"]
+    if db_path == ":memory:":
+        raise click.ClickException(
+            "the Web runtime requires a file SQLite database; ':memory:' is "
+            "test-only and unsupported (it has no concurrent Web guarantee)"
+        )
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        click.echo(
+            "WARNING: BEL may display private business data.\n"
+            "Remote exposure requires your own network/access controls.",
+            err=True,
+        )
+
+    import uvicorn
+
+    from bel.web.app import create_app
+
+    app = create_app(db_path)
+    click.echo("Business Execution Ledger")
+    click.echo(f"http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -28,10 +28,12 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from bel.adapters.common import compute_sha256
 from bel.application.item_allocation import validate_item_allocation
+from bel.infrastructure.persistence.database import is_database_busy
 from bel.domain.accrual import (
     Accrual,
     AccrualBasisFact,
@@ -197,6 +199,23 @@ def _invoice_item_lookup(session: Session) -> dict[tuple[str, int], uuid.UUID]:
 
 
 def import_close_facts(session: Session, file_path: Path) -> CloseFactImportResult:
+    """Import a Close Fact Pack. A SQLite busy/lock error (a concurrent
+    writer holding the write lock) is surfaced as a controlled
+    ``CloseFactPackError`` after rolling the whole transaction back — the
+    import never leaves partial business state."""
+    try:
+        return _import_close_facts(session, file_path)
+    except OperationalError as exc:
+        session.rollback()
+        if is_database_busy(exc):
+            raise CloseFactPackError(
+                "database is busy; the import was rolled back — retry when the "
+                "other write completes"
+            ) from exc
+        raise
+
+
+def _import_close_facts(session: Session, file_path: Path) -> CloseFactImportResult:
     now = datetime.now(timezone.utc)
     sha256 = compute_sha256(file_path)
 

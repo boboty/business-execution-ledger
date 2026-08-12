@@ -1,0 +1,290 @@
+{% extends "base.html" %}
+{% block title %}合同360° · {{ vm.contract_no }} · BEL{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <h1>合同360°</h1>
+  <p class="page-subtitle">从一个合同出发，把已确认的业务事实和当前判断放到一张页面里。</p>
+</div>
+
+<section class="panel">
+  <h2>合同信息</h2>
+  <dl class="kv-grid">
+    <div class="kv"><dt>合同编码</dt><dd>{{ vm.contract_no }}</dd></div>
+    <div class="kv"><dt>供应商</dt><dd>{{ vm.counterparty }}</dd></div>
+    <div class="kv"><dt>买方</dt><dd>{{ vm.buyer }}</dd></div>
+    <div class="kv"><dt>合同金额</dt><dd>{{ vm.gross_amount }} {{ vm.currency }}</dd></div>
+    <div class="kv"><dt>合同日期</dt><dd>{{ vm.contract_date }}</dd></div>
+    <div class="kv"><dt>合同类型</dt><dd>{{ vm.contract_type }}</dd></div>
+  </dl>
+</section>
+
+{% if vm.items %}
+<section class="panel">
+  <h2>合同商品</h2>
+  <div class="table-scroll">
+  <table class="grid">
+    <thead>
+      <tr><th>Item Key</th><th>商品</th><th>规格</th><th>数量</th><th>单位</th><th>单价</th><th>含税金额</th><th>未税金额</th><th>当前暂估状态</th></tr>
+    </thead>
+    <tbody>
+      {% for item in vm.items %}
+      <tr>
+        <td class="mono">{{ item.source_item_key }}</td>
+        <td>{{ item.product_name }}</td>
+        <td>{{ item.specification }}</td>
+        <td class="num">{{ item.quantity }}</td>
+        <td>{{ item.unit }}</td>
+        <td class="num">{{ item.unit_price }}</td>
+        <td class="num">{{ item.gross_amount }}</td>
+        <td class="num">{{ item.net_amount }}</td>
+        <td><span class="tag {{ item.status_class }}">{{ item.status_label }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+{% if vm.invoices %}
+<section class="panel">
+  <h2>发票</h2>
+  {% for invoice in vm.invoices %}
+  <details class="invoice-block" {% if loop.first %}open{% endif %}>
+    <summary>
+      <span class="invoice-title">{{ invoice.invoice_no }}</span>
+      <span class="invoice-meta">{{ invoice.issue_date }} · {{ invoice.direction_label }}</span>
+      <span class="invoice-meta num">未税 {{ invoice.net_amount }} / 税 {{ invoice.tax_amount }} / 含税 {{ invoice.gross_amount }}</span>
+    </summary>
+    <div class="table-scroll">
+    <table class="grid">
+      <thead>
+        <tr><th>行号</th><th>商品</th><th>规格</th><th>数量</th><th>未税金额</th><th>已关联合同明细</th></tr>
+      </thead>
+      <tbody>
+        {% for item in invoice.items %}
+        <tr>
+          <td class="num">{{ item.line_no }}</td>
+          <td>{{ item.product_name }}</td>
+          <td>{{ item.specification }}</td>
+          <td class="num">{{ item.quantity }}</td>
+          <td class="num">{{ item.net_amount }}</td>
+          <td>
+            {% if item.has_allocation %}
+              <span class="tag tag-status">已关联</span>
+            {% else %}
+              <span class="tag tag-none">未关联</span>
+              {% with contract_id = vm.contract_id, invoice_no = invoice.invoice_no %}
+              {% include "partials/allocation_form.html" %}
+              {% endwith %}
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <div class="invoice-footer">
+      <span class="kv-inline">匹配方式：{{ invoice.match_method }}</span>
+      <span class="kv-inline">确认方式：{{ invoice.confirmation_type }}</span>
+    </div>
+  </details>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if vm.payments %}
+<section class="panel">
+  <h2>付款</h2>
+  <div class="table-scroll">
+  <table class="grid">
+    <thead>
+      <tr><th>日期</th><th>付款/收款</th><th>金额</th><th>交易对手</th><th>确认方式</th><th>匹配方式</th></tr>
+    </thead>
+    <tbody>
+      {% for payment in vm.payments %}
+      <tr>
+        <td>{{ payment.transaction_date }}</td>
+        <td>{{ payment.direction_label }}</td>
+        <td class="num">{{ payment.amount }}</td>
+        <td>{{ payment.counterparty }}</td>
+        <td>{{ payment.confirmation_type }}</td>
+        <td>{{ payment.match_method }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+{% if vm.accruals %}
+<section class="panel">
+  <h2>暂估余额</h2>
+  <div class="table-scroll">
+  <table class="grid">
+    <thead>
+      <tr><th>商品</th><th>来源期间</th><th>原始数量</th><th>原始暂估成本</th><th>已红冲数量</th><th>已红冲成本</th><th>剩余数量</th><th>剩余成本</th><th>当前状态</th></tr>
+    </thead>
+    <tbody>
+      {% for accrual in vm.accruals %}
+      <tr>
+        <td>{{ accrual.item_label }}</td>
+        <td>{{ accrual.source_period }}</td>
+        <td class="num">{{ accrual.original_quantity }}</td>
+        <td class="num">{{ accrual.original_estimated_cost }}</td>
+        <td class="num">{{ accrual.reversed_quantity }}</td>
+        <td class="num">{{ accrual.reversed_cost }}</td>
+        <td class="num">{{ accrual.remaining_quantity }}</td>
+        <td class="num">{{ accrual.remaining_cost }}</td>
+        <td><span class="tag tag-status">{{ accrual.status_label }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>当前期间业务判断</h2>
+  {% if not vm.decisions.has_any %}
+  <p class="empty-state">当前期间没有需要处理的业务判断。</p>
+  {% else %}
+
+  {% if vm.decisions.blockers %}
+  <p class="section-note">当前有 {{ vm.decisions.blockers|length }} 项业务信息不足，系统不会自动猜测。</p>
+  <div class="table-scroll">
+  <table class="grid">
+    <thead><tr><th>类型</th><th>说明</th><th>商品</th></tr></thead>
+    <tbody>
+      {% for blocker in vm.decisions.blockers %}
+      <tr>
+        <td><span class="tag tag-blocker">{{ blocker.type }}</span></td>
+        <td class="blocker-meaning">{{ blocker.meaning }}</td>
+        <td>{{ blocker.item_label }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+
+  {% if vm.decisions.reversals %}
+  <div class="table-scroll">
+  <table class="grid">
+    <thead><tr><th>来源期间</th><th>商品</th><th>到票数量</th><th>红冲成本</th><th>预计剩余</th><th>预计状态</th><th>依据</th></tr></thead>
+    <tbody>
+      {% for row in vm.decisions.reversals %}
+      <tr>
+        <td>{{ row.source_period }}</td>
+        <td>{{ row.item_label }}</td>
+        <td class="num">{{ row.arrival_quantity }}</td>
+        <td class="num">{{ row.reversal_cost }}</td>
+        <td class="num">{{ row.remaining_quantity }} / {{ row.remaining_cost }}</td>
+        <td><span class="tag tag-status">{{ row.status_label }}</span></td>
+        <td>{% set trace = row.trace %}{% include "partials/decision_trace.html" %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+
+  {% if vm.decisions.accruals %}
+  <div class="table-scroll">
+  <table class="grid">
+    <thead><tr><th>商品</th><th>数量</th><th>预计成本</th><th>状态</th><th>依据</th></tr></thead>
+    <tbody>
+      {% for row in vm.decisions.accruals %}
+      <tr>
+        <td>{{ row.item_label }}</td>
+        <td class="num">{{ row.quantity }}</td>
+        <td class="num">{{ row.estimated_cost }}</td>
+        <td><span class="tag tag-accrual-required">Accrual Required</span></td>
+        <td>{% set trace = row.trace %}{% include "partials/decision_trace.html" %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+
+  {% if vm.decisions.candidates %}
+  <div class="table-scroll">
+  <table class="grid">
+    <thead><tr><th>预计成本</th><th>缺失信息</th><th>状态</th><th>依据</th></tr></thead>
+    <tbody>
+      {% for row in vm.decisions.candidates %}
+      <tr>
+        <td class="num">{{ row.estimated_cost }}</td>
+        <td>{{ row.missing_info }}</td>
+        <td><span class="tag tag-candidate">尚不能形成正式暂估</span></td>
+        <td>{% set trace = row.trace %}{% include "partials/decision_trace.html" %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+
+  {% if vm.decisions.differences %}
+  <div class="table-scroll">
+  <table class="grid">
+    <thead><tr><th>商品</th><th>正式成本</th><th>历史暂估成本</th><th>差异</th><th>依据</th></tr></thead>
+    <tbody>
+      {% for row in vm.decisions.differences %}
+      <tr>
+        <td>{{ row.item_label }}</td>
+        <td class="num">{{ row.actual_net_cost }}</td>
+        <td class="num">{{ row.reversed_estimated_cost }}</td>
+        <td class="num">{{ row.difference }}</td>
+        <td>{% set trace = row.trace %}{% include "partials/decision_trace.html" %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+
+  {% endif %}
+</section>
+
+{% if vm.evidence %}
+<section class="panel">
+  <h2>证据</h2>
+  <div class="table-scroll">
+  <table class="grid">
+    <thead><tr><th>类型</th><th>来源</th><th>定位</th><th>时间</th></tr></thead>
+    <tbody>
+      {% for evidence in vm.evidence %}
+      <tr>
+        <td>{{ evidence.category }}</td>
+        <td>{{ evidence.source_type }}</td>
+        <td class="mono">{{ evidence.locator }}</td>
+        <td>{{ evidence.time }}</td>
+      </tr>
+      <tr class="evidence-detail-row">
+        <td colspan="4">
+          <details class="evidence-details">
+            <summary>元数据</summary>
+            <dl class="trace-fields">
+              {% for key, value in evidence.metadata_items %}
+              <div class="trace-field"><dt>{{ key }}</dt><dd class="mono">{{ value }}</dd></div>
+              {% endfor %}
+              <div class="trace-field"><dt>fragment id</dt><dd class="mono">{{ evidence.tech[0][1] }}</dd></div>
+              <div class="trace-field"><dt>document id</dt><dd class="mono">{{ evidence.tech[1][1] }}</dd></div>
+              <div class="trace-field"><dt>sha256</dt><dd class="mono">{{ evidence.tech[2][1] }}</dd></div>
+            </dl>
+          </details>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+{% endblock %}

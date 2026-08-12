@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}合同搜索 · BEL{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>合同360°</h1>
+  <p class="page-subtitle">合同搜索：{{ vm.query or "（空）" }}</p>
+</div>
+
+{% if not vm.matches %}
+<section class="panel">
+  <p class="empty-state">没有找到合同编码为 “{{ vm.query }}” 的合同。</p>
+</section>
+{% else %}
+<section class="panel">
+  <div class="table-scroll">
+  <table class="grid">
+    <thead>
+      <tr><th>合同编码</th><th>供应商</th><th>买方</th><th>金额</th><th>币种</th></tr>
+    </thead>
+    <tbody>
+      {% for contract in vm.matches %}
+      <tr>
+        <td><a href="/contracts/{{ contract.id }}?period={{ vm.period }}">{{ contract.contract_no }}</a></td>
+        <td>{{ contract.counterparty or "—" }}</td>
+        <td>{{ contract.buyer or "—" }}</td>
+        <td class="num">{{ contract.gross_amount }}</td>
+        <td>{{ contract.currency }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

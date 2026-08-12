@@ -1,0 +1,36 @@
+{# Manual InvoiceItem <-> ContractItem allocation form.
+   Phase 2C's only write operation. The user must explicitly pick a
+   ContractItem — the select is never preselected, no name/amount/order
+   guessing happens. app.js posts the JSON; on success the page reloads. #}
+<details class="allocation-form">
+  <summary class="allocation-toggle">关联合同明细</summary>
+  <div class="allocation-body">
+    <p class="allocation-hint">原发票数量：{{ item.quantity }}　原发票未税金额：{{ item.net_amount }}</p>
+    <form method="post" action="/api/invoice-item-allocations" data-allocation-submit>
+      <input type="hidden" name="invoice_external_key" value="{{ invoice_no }}">
+      <input type="hidden" name="line_no" value="{{ item.line_no }}">
+      <input type="hidden" name="contract_id" value="{{ contract_id }}">
+      <div class="field">
+        <label for="source-item-{{ invoice_no }}-{{ item.line_no }}">合同商品</label>
+        <select id="source-item-{{ invoice_no }}-{{ item.line_no }}" name="source_item_key" required>
+          <option value="" disabled selected>请选择合同商品</option>
+          {% for key, product in item.contract_item_options %}
+          <option value="{{ key }}">{{ key }} · {{ product }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="qty-{{ invoice_no }}-{{ item.line_no }}">数量</label>
+        <input id="qty-{{ invoice_no }}-{{ item.line_no }}" type="text" name="quantity" required inputmode="decimal" placeholder="0">
+      </div>
+      <div class="field">
+        <label for="net-{{ invoice_no }}-{{ item.line_no }}">未税金额</label>
+        <input id="net-{{ invoice_no }}-{{ item.line_no }}" type="text" name="net_amount" required inputmode="decimal" placeholder="0.00">
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn">确认关联</button>
+      </div>
+      <p class="form-error" data-allocation-error hidden></p>
+    </form>
+  </div>
+</details>

@@ -48,7 +48,7 @@ Finance, tax-rebate, ERP and BI systems are consumers of BEL output. Future inte
 
 ## Current capabilities
 
-Phase 2B currently includes:
+Phase 2B/2C currently includes:
 
 - contract-ledger evidence import and canonical contract facts
 - purchase-invoice and bank-statement adapters
@@ -57,8 +57,17 @@ Phase 2B currently includes:
 - accrual, reversal and historical close facts
 - a read-only period-close preview that recomputes confirmed numbered rules from current facts
 - synthetic golden tests, public CI and privacy scanning
+- the first two human-facing V1 workbench pages — 月结工作台 (period-close)
+  and 合同360° (Contract 360) — served by `bel --db /path/to/bel.db web`
+  at `http://127.0.0.1:8000`
 
 The close preview is intentionally stateless and read-only: it writes no vouchers, accounting entries or events.
+
+Phase 2C's pages render through the same Application Services as the CLI;
+the only human write is the manual InvoiceItem allocation, which reuses
+the exact CLI command's `allocate_invoice_item`. See
+[docs/PHASE2C-DECISIONS.md](docs/PHASE2C-DECISIONS.md) and
+[docs/PHASE2C-ACCEPTANCE.md](docs/PHASE2C-ACCEPTANCE.md).
 
 ## Getting started
 
@@ -71,6 +80,7 @@ git config core.hooksPath .githooks
 .venv/bin/bel import-invoices <path-to-发票.xlsx> --direction purchase
 .venv/bin/bel import-bank <path-to-对账单.pdf> --profile cmb
 .venv/bin/bel match run
+.venv/bin/bel --db bel.db web        # Phase 2C workbench at http://127.0.0.1:8000
 .venv/bin/pytest
 ```
 
@@ -84,6 +94,7 @@ The SQLite runtime database (`bel.db`) is a local development artifact and must 
 - [Rules](docs/RULES.md) — numbered business rules
 - [Golden Tests](docs/GOLDEN-TEST.md) — verification methodology
 - [Private Data Policy](docs/PRIVATE-DATA-POLICY.md) — sensitive-data handling boundary
+- [Phase 2C Decisions](docs/PHASE2C-DECISIONS.md) / [Acceptance](docs/PHASE2C-ACCEPTANCE.md)
 - [Roadmap](ROADMAP.md) — planned capability progression
 - [Contributing](CONTRIBUTING.md) — contribution rules and development setup
 

@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block title %}月结工作台 · BEL{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <h1>月结工作台</h1>
+  <p class="page-subtitle">基于当前业务事实重新计算，不生成凭证，不修改月结状态</p>
+</div>
+
+<form class="period-form" method="get" action="/period-close">
+  <label for="period-select">期间</label>
+  <select id="period-select" name="period">
+    {% for p in vm.available_periods %}
+    <option value="{{ p }}" {% if p == vm.period %}selected{% endif %}>{{ p }}</option>
+    {% endfor %}
+    {% if vm.period not in vm.available_periods %}
+    <option value="{{ vm.period }}" selected>{{ vm.period }}</option>
+    {% endif %}
+  </select>
+  <button type="submit" class="btn">重新计算</button>
+</form>
+
+<section class="cards">
+  {% for card in vm.summary %}
+  <div class="card {{ 'card-danger' if card.key == 'blockers' and card.value > 0 else '' }}">
+    <div class="card-value">{{ card.value }}</div>
+    <div class="card-label">{{ card.label }}</div>
+  </div>
+  {% endfor %}
+</section>
+
+{% if vm.blockers %}
+<section class="panel panel-blockers">
+  <h2>阻塞项</h2>
+  <p class="section-note">当前有 {{ vm.blockers|length }} 项业务信息不足，系统不会自动猜测。</p>
+  <table class="grid">
+    <thead>
+      <tr><th>类型</th><th>说明</th><th>合同</th><th>商品</th></tr>
+    </thead>
+    <tbody>
+      {% for blocker in vm.blockers %}
+      <tr>
+        <td><span class="tag tag-blocker">{{ blocker.type }}</span></td>
+        <td class="blocker-meaning">{{ blocker.meaning }}</td>
+        <td><a href="/contracts/{{ blocker.contract_id }}?period={{ vm.period }}">{{ blocker.contract_no }}</a></td>
+        <td>{{ blocker.item_label }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if vm.reversals %}
+<section class="panel">
+  <h2>历史暂估待红冲</h2>
+  <div class="table-scroll">
+  <table class="grid">
+    <thead>
+      <tr>
+        <th>合同</th><th>供应商</th><th>商品</th><th>来源期间</th><th>到票数量</th>
+        <th>历史暂估红冲</th><th>预计剩余</th><th>预计状态</th><th>实际成本差异</th><th>依据</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in vm.reversals %}
+      <tr>
+        <td><a href="/contracts/{{ row.contract_id }}?period={{ vm.period }}">{{ row.contract_no }}</a></td>
+        <td>{{ row.counterparty }}</td>
+        <td>{{ row.item_label }}</td>
+        <td>{{ row.source_period }}</td>
+        <td class="num">{{ row.arrival_quantity }}</td>
+        <td class="num">{{ row.reversal_cost }}</td>
+        <td class="num">{{ row.remaining_quantity }} / {{ row.remaining_cost }}</td>
+        <td><span class="tag tag-status">{{ row.status_label }}</span></td>
+        <td class="num">{{ row.difference }}</td>
+        <td>{% set trace = row.trace %}{% include "partials/decision_trace.html" %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+{% if vm.accruals %}
+<section class="panel">
+  <h2>新增暂估</h2>
+  <div class="table-scroll">
+  <table class="grid">
+    <thead>
+      <tr><th>合同</th><th>供应商</th><th>商品</th><th>数量</th><th>预计成本</th><th>状态</th><th>依据</th></tr>
+    </thead>
+    <tbody>
+      {% for row in vm.accruals %}
+      <tr>
+        <td><a href="/contracts/{{ row.contract_id }}?period={{ vm.period }}">{{ row.contract_no }}</a></td>
+        <td>{{ row.counterparty }}</td>
+        <td>{{ row.item_label }}</td>
+        <td class="num">{{ row.quantity }}</td>
+        <td class="num">{{ row.estimated_cost }}</td>
+        <td><span class="tag tag-accrual-required">Accrual Required</span></td>
+        <td>{% set trace = row.trace %}{% include "partials/decision_trace.html" %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+{% if vm.candidates %}
+<section class="panel">
+  <h2>合同级待补明细</h2>
+  <div class="table-scroll">
+  <table class="grid">
+    <thead>
+      <tr><th>合同</th><th>供应商</th><th>预计成本</th><th>缺失信息</th><th>状态</th><th>依据</th></tr>
+    </thead>
+    <tbody>
+      {% for row in vm.candidates %}
+      <tr>
+        <td><a href="/contracts/{{ row.contract_id }}?period={{ vm.period }}">{{ row.contract_no }}</a></td>
+        <td>{{ row.counterparty }}</td>
+        <td class="num">{{ row.estimated_cost }}</td>
+        <td>{{ row.missing_info }}</td>
+        <td><span class="tag tag-candidate">尚不能形成正式暂估</span></td>
+        <td>{% set trace = row.trace %}{% include "partials/decision_trace.html" %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+{% if vm.differences %}
+<section class="panel">
+  <h2>成本差异</h2>
+  <div class="table-scroll">
+  <table class="grid">
+    <thead>
+      <tr><th>合同</th><th>商品</th><th>正式成本</th><th>历史暂估成本</th><th>差异</th><th>依据</th></tr>
+    </thead>
+    <tbody>
+      {% for row in vm.differences %}
+      <tr>
+        <td><a href="/contracts/{{ row.contract_id }}?period={{ vm.period }}">{{ row.contract_no }}</a></td>
+        <td>{{ row.item_label }}</td>
+        <td class="num">{{ row.actual_net_cost }}</td>
+        <td class="num">{{ row.reversed_estimated_cost }}</td>
+        <td class="num">{{ row.difference }}</td>
+        <td>{% set trace = row.trace %}{% include "partials/decision_trace.html" %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+{% if not vm.reversals and not vm.accruals and not vm.candidates and not vm.differences and not vm.blockers %}
+<section class="panel">
+  <p class="empty-state">当前期间没有需要处理的业务判断。</p>
+</section>
+{% endif %}
+
+{% endblock %}

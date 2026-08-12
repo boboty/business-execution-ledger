@@ -72,6 +72,24 @@ def validate_item_allocation(
             "cannot verify allocation capacity; refusing to guess (11-D)"
         )
 
+    if allocated_quantity <= 0:
+        raise ValueError(
+            f"allocated_quantity must be positive, got {allocated_quantity} — "
+            "a zero or negative allocation is never accepted (11-B)"
+        )
+
+    if allocated_net_amount < 0:
+        raise ValueError(
+            f"allocated_net_amount must be non-negative, got {allocated_net_amount} — "
+            "negative manual allocations are rejected (11-B)"
+        )
+
+    if allocated_net_amount > invoice_item.net_amount:
+        raise ValueError(
+            f"InvoiceItem {invoice_item.id} net amount exceeded: "
+            f"allocated {allocated_net_amount} > line {invoice_item.net_amount} (11-B)"
+        )
+
     if existing_allocated_quantity is None:
         from bel.infrastructure.persistence.repositories import InvoiceItemAllocationRepository
 

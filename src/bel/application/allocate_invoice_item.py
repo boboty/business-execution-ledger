@@ -17,11 +17,13 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from bel.application.item_allocation import validate_item_allocation
 from bel.domain.accrual import InvoiceItemAllocation, ItemAllocationConfirmationType
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
+from bel.infrastructure.persistence.database import serialized_write_transaction
 from bel.infrastructure.persistence.repositories import (
     ContractItemRepository,
     ContractRepository,
@@ -30,6 +32,33 @@ from bel.infrastructure.persistence.repositories import (
     InvoiceItemRepository,
     InvoiceRepository,
 )
+
+
+def execute_manual_item_allocation(
+    session: Session,
+    *,
+    invoice_external_key: str,
+    line_no: int,
+    contract_id: uuid.UUID,
+    source_item_key: str,
+    quantity: Decimal,
+    net_amount: Decimal,
+) -> InvoiceItemAllocation:
+    """The shared command-level serialized write boundary for EVERY manual
+    InvoiceItemAllocation writer — Web route, CLI, and any future Agent.
+    Runs inside ``serialized_write_transaction`` (BEGIN IMMEDIATE before
+    any read, single commit/rollback), so all manual allocation writers
+    serialize on the same database-level write lock."""
+    with serialized_write_transaction(session):
+        return allocate_invoice_item(
+            session,
+            invoice_external_key=invoice_external_key,
+            line_no=line_no,
+            contract_id=contract_id,
+            source_item_key=source_item_key,
+            quantity=quantity,
+            net_amount=net_amount,
+        )
 
 
 def allocate_invoice_item(
@@ -42,6 +71,14 @@ def allocate_invoice_item(
     quantity: Decimal,
     net_amount: Decimal,
 ) -> InvoiceItemAllocation:
+    """Validate and create one MANUAL_CONFIRMED InvoiceItemAllocation with
+    its EvidenceDocument/EvidenceFragment.
+
+    Deliberately does NOT commit: the caller must run it inside a
+    transaction that it owns (the shared ``serialized_write_transaction``
+    boundary via ``execute_manual_item_allocation``). A caller that holds
+    no write lock (e.g. tests) is responsible for committing.
+    """
     now = datetime.now(timezone.utc)
 
     invoice_repo = InvoiceRepository(session)
@@ -62,14 +99,6 @@ def allocate_invoice_item(
     if contract_item is None:
         raise ValueError(f"Contract {contract_id} has no contract item with source_item_key={source_item_key!r}")
 
-    validate_item_allocation(
-        session=session,
-        invoice_item=invoice_item,
-        contract_item=contract_item,
-        allocated_quantity=quantity,
-        allocated_net_amount=net_amount,
-    )
-
     raw_data = {
         "invoice_external_key": invoice_external_key,
         "line_no": line_no,
@@ -81,6 +110,23 @@ def allocate_invoice_item(
     document_sha = hashlib.sha256(json.dumps(raw_data, sort_keys=True).encode("utf-8")).hexdigest()
 
     evidence_repo = EvidenceRepository(session)
+    if evidence_repo.find_document_by_sha256(document_sha) is not None:
+        # A byte-identical manual allocation payload is already recorded —
+        # a retried POST must never create a duplicate document/allocation
+        # (the evidence_documents.sha256 column is UNIQUE).
+        raise ValueError(
+            "duplicate allocation request: an identical InvoiceItemAllocation "
+            "payload is already recorded"
+        )
+
+    validate_item_allocation(
+        session=session,
+        invoice_item=invoice_item,
+        contract_item=contract_item,
+        allocated_quantity=quantity,
+        allocated_net_amount=net_amount,
+    )
+
     document = EvidenceDocument(
         id=uuid.uuid4(),
         file_name=f"manual-invoice-item-allocation-{now.isoformat()}.json",
@@ -100,7 +146,6 @@ def allocate_invoice_item(
         created_at=now,
     )
     evidence_repo.add_fragment(fragment)
-    session.flush()
 
     allocation = InvoiceItemAllocation(
         id=uuid.uuid4(),
@@ -113,5 +158,22 @@ def allocate_invoice_item(
         created_at=now,
     )
     InvoiceItemAllocationRepository(session).add(allocation)
-    session.commit()
+
+    # The sha256 pre-check above is a fast path for sequential duplicates,
+    # but two concurrent identical requests can both pass it (TOCTOU). The
+    # UNIQUE constraint on evidence_documents.sha256 is the authoritative
+    # guard: on conflict the session is rolled back (zero partial rows)
+    # and the request becomes the same controlled 400 the pre-check
+    # produces.
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        detail = " ".join(str(arg) for arg in exc.args).lower()
+        if "evidence_documents" in detail and "sha256" in detail:
+            raise ValueError(
+                "duplicate allocation request: an identical InvoiceItemAllocation "
+                "payload is already recorded"
+            ) from exc
+        raise
     return allocation
