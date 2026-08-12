@@ -1,0 +1,8 @@
+{
+  "note": "Synthetic fixture (fixtures/synthetic/scenarios.py) — independently constructed, no real business data.",
+  "invoices_created": 6,
+  "invoice_items_created": 7,
+  "net_amount_total": "5825.25",
+  "tax_amount_total": "0",
+  "gross_amount_total": "5825.25"
+}

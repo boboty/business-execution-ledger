@@ -1,0 +1,18 @@
+{
+  "note": "Synthetic fixture (fixtures/synthetic/scenarios.py) — independently constructed, no real business data.",
+  "invoice_matching": {
+    "eligible_total": 5,
+    "auto_confirmed": 2,
+    "human_confirmation_required": 2,
+    "unmatched_within_eligible": 1,
+    "capacity_exceeded": 0
+  },
+  "payment_matching": {
+    "eligible_total": 6,
+    "auto_confirmed": 3,
+    "human_confirmation_required": 2,
+    "unmatched_within_eligible": 1,
+    "capacity_exceeded": 0
+  },
+  "ambiguous_amount_clusters": ["1580.00"]
+}

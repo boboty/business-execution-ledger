@@ -1,0 +1,19 @@
+# Real business data (contracts, invoices, bank statements, counterparties, etc.)
+# Never commit this. Anonymized/synthetic subsets may later be promoted into fixtures/.
+data/private/
+
+# OS / editor noise
+.DS_Store
+*.swp
+
+# Python toolchain
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Runtime SQLite databases — schema lives in migrations/, not the binary file
+*.db
+*.db-journal

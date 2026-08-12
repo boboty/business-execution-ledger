@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  privacy-check:
+    name: privacy-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history — --history mode needs every reachable commit/blob
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install scanner dependencies
+        run: pip install pyyaml
+      # No BEL_PRIVATE_DATA_ROOT / BEL_PRIVACY_DENYLIST here — Generic Guard
+      # and Path Guard must stand on their own in Public CI.
+      - name: Scan tracked files
+        run: python tools/privacy_scan.py --tracked
+      - name: Scan full history
+        run: python tools/privacy_scan.py --history
+
+  synthetic-tests:
+    name: synthetic-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      # Public synthetic suite only (tests/unit, tests/integration,
+      # tests/golden/synthetic-v1) — tests/private_acceptance/runner.py is
+      # a standalone script, not pytest-discoverable, and is never run here.
+      - name: Run tests
+        run: pytest

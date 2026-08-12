@@ -1,0 +1,18 @@
+{
+  "note": "Synthetic fixture (fixtures/synthetic/scenarios.py) — independently constructed, no real business data.",
+  "sheets_detected": 1,
+  "primary_sheet": "报关出口购销合同",
+  "columns": 6,
+  "business_rows": 8,
+  "blank_trailing_rows": 0,
+  "contracts_created": 8,
+  "contract_items_created": 0,
+  "distinct_sellers": 7,
+  "distinct_buyers": 1,
+  "distinct_owners": 0,
+  "distinct_customs_receivers": 0,
+  "missing_export_contract_no": 1,
+  "business_key_conflicts": 1,
+  "duplicate_contract_no_groups": 1,
+  "gross_amount_total": "15645.75"
+}

@@ -1,0 +1,8 @@
+{
+  "note": "Synthetic fixture (fixtures/synthetic/scenarios.py) — independently constructed, no real business data.",
+  "payments_created": 7,
+  "opening_balance": "50000.00",
+  "total_in": "0",
+  "total_out": "12105.50",
+  "closing_balance": "37894.50"
+}

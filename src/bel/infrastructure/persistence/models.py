@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import uuid
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class EvidenceDocumentModel(Base):
+    __tablename__ = "evidence_documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    file_name: Mapped[str] = mapped_column(String, nullable=False)
+    # UNIQUE is the idempotency mechanism: re-importing the same bytes
+    # must not create a second EvidenceDocument. See docs/PHASE1-DECISIONS.md.
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    source_type: Mapped[str] = mapped_column(String, nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class EvidenceFragmentModel(Base):
+    """fragment_kind distinguishes locator shape: EXCEL_ROW uses
+    sheet_name/row_number (kept for Phase 1 backward compatibility),
+    PDF_TRANSACTION and any future kind use locator_json instead. See
+    docs/PHASE2A-DECISIONS.md."""
+
+    __tablename__ = "evidence_fragments"
+    __table_args__ = (
+        UniqueConstraint("evidence_document_id", "sheet_name", "row_number", name="uq_fragment_location"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    evidence_document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("evidence_documents.id"), nullable=False, index=True
+    )
+    fragment_kind: Mapped[str] = mapped_column(String, nullable=False, default="EXCEL_ROW")
+    sheet_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    row_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    locator_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    raw_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ContractModel(Base):
+    __tablename__ = "contracts"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    # Business key — deliberately NOT unique. Duplicates are expected and
+    # produce a BusinessKeyConflict TaskException instead of a DB error.
+    # See docs/DOMAIN.md and docs/RULES.md R004.
+    contract_no: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    contract_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    counterparty: Mapped[str | None] = mapped_column(String, nullable=True)
+    buyer: Mapped[str | None] = mapped_column(String, nullable=True)
+    gross_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    contract_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    current_source_fragment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("evidence_fragments.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ContractItemModel(Base):
+    __tablename__ = "contract_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    sku: Mapped[str | None] = mapped_column(String, nullable=True)
+    product_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    specification: Mapped[str | None] = mapped_column(String, nullable=True)
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    unit: Mapped[str | None] = mapped_column(String, nullable=True)
+    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    gross_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    tax_rate: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    net_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    current_source_fragment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("evidence_fragments.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class BusinessEventModel(Base):
+    __tablename__ = "business_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    event_type: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class TaskExceptionModel(Base):
+    __tablename__ = "task_exceptions"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    exception_type: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    summary: Mapped[str] = mapped_column(String, nullable=False)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ImportRunModel(Base):
+    """Audit trail only — not a replay/event-sourcing mechanism.
+    See docs/V1-SCOPE.md non-goals."""
+
+    __tablename__ = "import_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    evidence_document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("evidence_documents.id"), nullable=False, index=True
+    )
+    file_name: Mapped[str] = mapped_column(String, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    is_reimport: Mapped[bool] = mapped_column(nullable=False)
+    contracts_created_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    contract_items_created_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    business_key_conflicts_detected_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class InvoiceModel(Base):
+    __tablename__ = "invoices"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    direction: Mapped[str] = mapped_column(String, nullable=False)  # PURCHASE / SALES / UNKNOWN
+    invoice_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    invoice_no: Mapped[str | None] = mapped_column(String, nullable=True)
+    digital_invoice_no: Mapped[str | None] = mapped_column(String, nullable=True)
+    # external_invoice_key: digital_invoice_no when present (today, always).
+    # UNIQUE + nullable lets a future invoice_code+invoice_no fallback
+    # coexist without a schema change. See docs/PHASE2A-DECISIONS.md.
+    external_invoice_key: Mapped[str | None] = mapped_column(String, nullable=True, unique=True, index=True)
+    issue_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    seller: Mapped[str | None] = mapped_column(String, nullable=True)
+    buyer: Mapped[str | None] = mapped_column(String, nullable=True)
+    net_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    gross_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    invoice_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class InvoiceItemModel(Base):
+    __tablename__ = "invoice_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    invoice_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("invoices.id"), nullable=False, index=True)
+    line_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    product_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    specification: Mapped[str | None] = mapped_column(String, nullable=True)
+    unit: Mapped[str | None] = mapped_column(String, nullable=True)
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    net_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    tax_rate: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    gross_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+
+
+class PaymentModel(Base):
+    __tablename__ = "payments"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    transaction_date: Mapped[date] = mapped_column(Date, nullable=False)
+    direction: Mapped[str] = mapped_column(String, nullable=False)  # IN / OUT
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)  # always positive
+    counterparty: Mapped[str | None] = mapped_column(String, nullable=True)
+    business_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    bank_reference: Mapped[str | None] = mapped_column(String, nullable=True)
+    description: Mapped[str | None] = mapped_column(String, nullable=True)
+    running_balance: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class InvoiceAllocationModel(Base):
+    """Many-to-many by construction: an Invoice can have allocations
+    against more than one Contract, and vice versa. Phase 2A never
+    auto-splits — every row here comes from a unique-candidate M001
+    match or a future manual confirmation. See docs/RULES.md-adjacent
+    docs/PHASE2A-DECISIONS.md for the M001 rule."""
+
+    __tablename__ = "invoice_allocations"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    invoice_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("invoices.id"), nullable=False, index=True)
+    contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    # Beyond the spec's minimum field list ("at least"): traces every
+    # Allocation back to the MatchCase that authorized it, per section 27's
+    # Allocation -> MatchCase -> Fact -> Evidence chain. See PHASE2A-DECISIONS.md.
+    match_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("match_cases.id"), nullable=False, index=True)
+    allocated_gross_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    match_method: Mapped[str] = mapped_column(String, nullable=False)
+    confirmation_type: Mapped[str] = mapped_column(String, nullable=False)  # AUTO_CONFIRMED / HUMAN_CONFIRMED
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class PaymentAllocationModel(Base):
+    __tablename__ = "payment_allocations"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    payment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("payments.id"), nullable=False, index=True)
+    contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    match_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("match_cases.id"), nullable=False, index=True)
+    allocated_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    match_method: Mapped[str] = mapped_column(String, nullable=False)
+    confirmation_type: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class MatchCaseModel(Base):
+    """subject_id is polymorphic (points at invoices.id or payments.id
+    per subject_type) so it is intentionally not an FK — a single column
+    can't target two tables without a generic-association framework,
+    which Phase 2A explicitly avoids building."""
+
+    __tablename__ = "match_cases"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    subject_type: Mapped[str] = mapped_column(String, nullable=False, index=True)  # INVOICE / PAYMENT
+    subject_id: Mapped[uuid.UUID] = mapped_column(nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    match_method: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class MatchCandidateModel(Base):
+    """Real rows, not a JSON blob on MatchCase — candidates are formal
+    data, per spec section 25."""
+
+    __tablename__ = "match_candidates"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    match_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("match_cases.id"), nullable=False, index=True)
+    contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
