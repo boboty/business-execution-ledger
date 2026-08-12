@@ -27,10 +27,15 @@ class Contract:
 @dataclass
 class ContractItem:
     """First-class per docs/DOMAIN.md. Phase 1 never synthesizes these —
-    only a contract with genuine per-item evidence gets one."""
+    only a contract with genuine per-item evidence gets one.
+
+    source_item_key is an implementation-level stable reference used by
+    Fact Pack selectors — not a global business key and not a SKU. See
+    docs/PHASE2B-DECISIONS.md."""
 
     id: UUID
     contract_id: UUID
+    source_item_key: str | None
     sku: str | None
     product_name: str | None
     specification: str | None

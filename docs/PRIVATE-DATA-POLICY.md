@@ -1,7 +1,9 @@
 # Private Data Policy
 
-This policy protects sensitive business data. The repository remains
-**Private** while the policy is enforced by tooling.
+This policy is designed to keep the repository safe for public
+development while private business data is used only through the
+external private acceptance boundary. The policy is enforced by
+tooling.
 
 ## The rules
 
@@ -67,6 +69,7 @@ $BEL_PRIVATE_DATA_ROOT/
     contracts/                 private contract ledger workbook(s)
     invoices/                  private invoice ledger workbook(s)
     bank/                      private bank statement PDF(s)
+    facts/                     private Close Fact Pack(s) for period close, e.g. phase2b-close-facts.json
     expected/                  private expected-results material
   reports/                     private-acceptance diagnostics
 

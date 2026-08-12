@@ -32,11 +32,11 @@ instead of relying on implicit ORM ordering. Covered by
 
 ## Technology choices
 
-- **openpyxl, not pandas**, for the Excel adapter. Pandas coerces
-  column dtypes on read, which would collapse exactly the "是" vs.
-  Excel-date-serial distinction that section 8 of the spec requires
-  preserving per-cell. openpyxl with `data_only=True` returns each
-  cell's native type (str/int/float/datetime/None) untouched.
+- **openpyxl, not pandas**, for the Excel adapter. openpyxl with
+  `data_only=True` returns each cell's native type
+  (str/int/float/datetime/None) untouched. pandas coerces column dtypes
+  on read, which would collapse the heterogeneous per-cell types that the
+  Evidence layer must preserve exactly as reported (spec section 8).
 - **click** for the CLI (over argparse) — no bearing on the
   Agent/Business-Core boundary either way; picked for subcommand
   ergonomics (`bel contract search`, `bel contract get`, ...).
@@ -48,24 +48,21 @@ instead of relying on implicit ORM ordering. Covered by
 
 ## Canonical field defaults not specified by any source column
 
-The ledger has no explicit currency or contract-type column, and no
-reliable contract-execution-date column:
+The importer accepts workbooks that carry no explicit currency,
+contract-type, or contract-execution-date column, so those canonical
+fields are handled as follows:
 
-- `currency = "CNY"` for every imported Contract. Rationale: `金额` is
-  the domestic RMB amount paid to Chinese textile suppliers — the
-  workbook has a *separate* `售出金额$` column for the USD-denominated
-  export sale price, which is not promoted to any canonical field in
-  Phase 1.
+- `currency = "CNY"` for every imported Contract. The canonical gross
+  amount is the domestic RMB `金额`; a separate USD-denominated
+  export-sale column, when present, is not promoted to any canonical
+  field in Phase 1.
 - `contract_type = "出口报关购销合同"` for every imported Contract — a
-  constant label taken from the sheet's own title row, since every
-  business row in this sheet is the same contract category. Not
-  inferred per-row from any cell.
-- `contract_date = null` for every imported Contract, always. No column
-  in this sheet represents "when the contract was signed" (开销项发票日,
-  申报印花税日期, 出口日期, 报关日期, etc. are all *other* business
-  dates, not contract execution dates). Per spec section 6, this is
-  never derived from `contract_no` digits or any other column — a
-  `null` result here is the correct, expected output, not a defect.
+  constant label, not inferred per-row from any cell.
+- `contract_date = null` for every imported Contract, always. No
+  imported column carries the contract-execution date; per spec
+  section 6, this is never derived from `contract_no` digits or any
+  other column — a `null` result here is the correct, expected output,
+  not a defect.
 
 ## `docs/DOMAIN.md` field-list divergence (not resolved, flagged for review)
 
@@ -85,10 +82,10 @@ questions for a later phase.
 A row in `报关出口购销合同` counts as a business row **iff its `合同编码`
 cell is non-null and non-blank after stripping whitespace.** This is an
 inferred rule (the spec states the target counts but not the exact
-predicate) — a trailing sheet region with every cell empty except a
-continuing `序号` sequence number is genuinely content-free, not just
-numerically past the last business row, so the rule matches rows that
-are actually blank.
+predicate): a trailing sheet region carrying nothing but a continuing
+`序号` sequence number is genuinely content-free, so the rule matches
+rows that are actually blank, not merely rows numerically past the last
+business row.
 
 The rule is deliberately **not** "`外销合同编码` is present" — a business
 row can lack that column and must still become a Contract (see
@@ -108,11 +105,11 @@ Evidence.
 
 ## Non-primary sheets
 
-`联合运营合同`, `费用合同`, and `印花税25年4月` are recognized only as
-entries in the parsed workbook's sheet-name list (surfaced in the CLI's
-`sheets: 4` output). No rows from them are read; no `EvidenceFragment`
-or domain object is created for them. Per spec section 7, this is
-deliberate — not an oversight to "finish later in this phase."
+Any non-primary sheet is recognized only as an entry in the parsed
+workbook's sheet-name list (surfaced in the CLI's `sheets: N` output). No
+rows from them are read; no `EvidenceFragment` or domain object is
+created for them. Per spec section 7, this is deliberate — not an
+oversight to "finish later in this phase."
 
 ## `raw_data` serialization policy
 
@@ -121,10 +118,9 @@ Every cell value is preserved as its native Python type (`str` / `int`
 values (which openpyxl returns for genuinely date-formatted cells) are
 serialized to ISO-8601 date strings so they're JSON-storable. This is
 lossless serialization for storage, not interpretation — a cell holding
-a malformed date-like string (e.g. `"205/8/14"`) or a stray numeric
-value in a text column is stored as that exact string/number,
-untouched. No cell is ever reinterpreted as a different type than
-openpyxl reported.
+a malformed date-like string or a stray numeric value in a text column
+is stored as that exact string/number, untouched. No cell is ever
+reinterpreted as a different type than openpyxl reported.
 
 ## Idempotency mechanism
 
@@ -161,14 +157,13 @@ group.
 
 ## Statistics that are computed but not persisted as Contract columns
 
-`distinct_sellers`, `distinct_buyers`, `distinct_owners` (对接人),
-`distinct_customs_receivers` (接收报关单位), and
-`missing_export_contract_no` (外销合同编码) are computed in-memory
-during import, from raw row data, purely for the import report. None of
-their source columns (对接人, 接收报关单位, 外销合同编码) are part of the
-canonical Contract field list in spec section 5, so none of them are
-persisted as Contract columns — computing them from `EvidenceFragment`
-data on demand would also be possible later without a schema change.
+`distinct_sellers`, `distinct_buyers`, `distinct_owners`,
+`distinct_customs_receivers`, and `missing_export_contract_no` are
+computed in-memory during import, from raw row data, purely for the
+import report. None of their source columns are part of the canonical
+Contract field list in spec section 5, so none of them are persisted as
+Contract columns — computing them from `EvidenceFragment` data on demand
+would also be possible later without a schema change.
 
 ## Failure behavior for a business row with no parseable amount
 

@@ -36,11 +36,11 @@ zero `MatchCase` rows exist for an out-of-scope subject.
 
 ## Technology choices
 
-- **pdfplumber**, not pypdf/PyPDF2, for the bank statement PDF. The
-  statement has a real text layer but no drawn table grid — pdfplumber's
-  own table-finder returns nothing. What actually reconstructs the table
-  deterministically is per-word `(x0, top)` positions, which pdfplumber
-  exposes and pypdf's flat text-stream extraction does not.
+- **pdfplumber**, not pypdf/PyPDF2, for the bank statement PDF.
+  pdfplumber exposes per-word `(x0, top)` positions; pypdf's flat
+  text-stream extraction does not. The adapter reconstructs transaction
+  rows deterministically from those positions rather than relying on a
+  drawn table grid or pdfplumber's own table-finder.
 - `compute_sha256` moved to `bel/adapters/common.py` (used identically by
   all three importers now); re-exported from `contract_ledger.py` so
   Phase 1's import site didn't need to change.
@@ -168,9 +168,8 @@ re-matching after rejection is out of scope for Phase 2A (no rule for
   correlate exactly with presence of one of these two fields; a
   mismatch would indicate a parsing assumption is wrong.
 - **`buyer`** is read once from cell A2 (the workbook's own title/header
-  cell) and applied as a constant to every Invoice in the import — this
-  batch of purchase invoices is for one company, exactly like Phase 1's
-  `contract_type` constant.
+  cell) and applied as a constant to every Invoice in the import,
+  exactly like Phase 1's `contract_type` constant.
 - **Blank `tax_rate`/`tax_amount`** (both invoice-level and item-level)
   parse to `Decimal("0")`, not `null` — a blank-tax row is expected to
   have `net_amount == gross_amount` (tax-exempt line items), so treating
@@ -184,23 +183,18 @@ re-matching after rejection is out of scope for Phase 2A (no rule for
 
 ## CMB bank statement PDF parsing
 
-- **Column x-positions are not assumed stable across a statement's
-  pages** (amount/balance/counterparty columns can shift left by
-  different amounts from page to page, plausibly from content-driven
-  auto-sizing of the description column). Fixed-pixel column ranges
-  were abandoned in favor of **content-based field detection**: the two
-  purely-numeric decimal tokens in a row (`-?[\d,]+\.\d{2}`) are always
-  amount-then-balance regardless of their x-position; `business_type`
-  is the leftmost remaining word; `bank_reference` is a lone long digit
-  token right after it, if present; everything else before the amount
-  is `description`, everything after balance is `counterparty`.
-- **Row banding**: a transaction's wrapped text (e.g. a long
-  counterparty name) can appear on physical PDF lines both *above and
-  below* its own date anchor — a counterparty name's first line can
-  land above its transaction's date anchor, its wrapped continuation
-  below, same transaction. Rows are therefore assigned to bands by
-  proximity to the nearest date anchor (midpoint between consecutive
-  anchors), not by "next date starts a new row."
+- **The adapter does not assume fixed cross-page column positions.**
+  Fixed-pixel column ranges were abandoned in favor of
+  **content-based field detection**: the two purely-numeric decimal
+  tokens in a row (`-?[\d,]+\.\d{2}`) are always amount-then-balance
+  regardless of their x-position; `business_type` is the leftmost
+  remaining word; `bank_reference` is a lone long digit token right
+  after it, if present; everything else before the amount is
+  `description`, everything after balance is `counterparty`.
+- **Row banding**: a transaction's text can wrap across multiple
+  physical PDF lines. Rows are therefore assigned to bands by proximity
+  to the nearest date anchor (midpoint between consecutive anchors),
+  not by "next date starts a new row."
 - **Page footers** ("第N页/共M页...") bleed into the last transaction's
   band unless excluded — the footer's own vertical position is found and
   used as that page's bottom boundary.

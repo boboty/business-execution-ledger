@@ -7,6 +7,14 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from bel.domain.accrual import (
+    Accrual,
+    AccrualBasisFact,
+    AccrualReversal,
+    CostRecognitionFact,
+    HistoricalAccrualFact,
+    InvoiceItemAllocation,
+)
 from bel.domain.contract import Contract, ContractItem
 from bel.domain.event import BusinessEvent
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment
@@ -15,13 +23,19 @@ from bel.domain.invoice import Invoice, InvoiceItem
 from bel.domain.matching import InvoiceAllocation, MatchCandidate, MatchCase, PaymentAllocation
 from bel.domain.payment import Payment
 from bel.infrastructure.persistence.models import (
+    AccrualBasisFactModel,
+    AccrualModel,
+    AccrualReversalModel,
     BusinessEventModel,
     ContractItemModel,
     ContractModel,
+    CostRecognitionFactModel,
     EvidenceDocumentModel,
     EvidenceFragmentModel,
+    HistoricalAccrualFactModel,
     ImportRunModel,
     InvoiceAllocationModel,
+    InvoiceItemAllocationModel,
     InvoiceItemModel,
     InvoiceModel,
     MatchCandidateModel,
@@ -64,6 +78,25 @@ def _contract_to_domain(m: ContractModel) -> Contract:
         current_source_fragment_id=m.current_source_fragment_id,
         created_at=m.created_at,
         updated_at=m.updated_at,
+    )
+
+
+def _contract_item_to_domain(m: ContractItemModel) -> ContractItem:
+    return ContractItem(
+        id=m.id,
+        contract_id=m.contract_id,
+        source_item_key=m.source_item_key,
+        sku=m.sku,
+        product_name=m.product_name,
+        specification=m.specification,
+        quantity=m.quantity,
+        unit=m.unit,
+        unit_price=m.unit_price,
+        gross_amount=m.gross_amount,
+        tax_rate=m.tax_rate,
+        net_amount=m.net_amount,
+        current_source_fragment_id=m.current_source_fragment_id,
+        created_at=m.created_at,
     )
 
 
@@ -263,6 +296,7 @@ class ContractItemRepository:
             ContractItemModel(
                 id=item.id,
                 contract_id=item.contract_id,
+                source_item_key=item.source_item_key,
                 sku=item.sku,
                 product_name=item.product_name,
                 specification=item.specification,
@@ -276,6 +310,28 @@ class ContractItemRepository:
                 created_at=item.created_at,
             )
         )
+
+    def get(self, item_id: uuid.UUID) -> ContractItem | None:
+        m = self._session.get(ContractItemModel, item_id)
+        return _contract_item_to_domain(m) if m else None
+
+    def find_by_contract_and_key(self, contract_id: uuid.UUID, source_item_key: str) -> ContractItem | None:
+        m = self._session.scalar(
+            select(ContractItemModel).where(
+                ContractItemModel.contract_id == contract_id, ContractItemModel.source_item_key == source_item_key
+            )
+        )
+        return _contract_item_to_domain(m) if m else None
+
+    def list_for_contract(self, contract_id: uuid.UUID) -> list[ContractItem]:
+        rows = self._session.scalars(
+            select(ContractItemModel).where(ContractItemModel.contract_id == contract_id).order_by(ContractItemModel.created_at)
+        )
+        return [_contract_item_to_domain(m) for m in rows]
+
+    def list_all(self) -> list[ContractItem]:
+        rows = self._session.scalars(select(ContractItemModel))
+        return [_contract_item_to_domain(m) for m in rows]
 
     def count(self) -> int:
         return len(self._session.scalars(select(ContractItemModel.id)).all())
@@ -420,8 +476,16 @@ class InvoiceItemRepository:
             )
         )
 
+    def get(self, item_id: uuid.UUID) -> InvoiceItem | None:
+        m = self._session.get(InvoiceItemModel, item_id)
+        return _invoice_item_to_domain(m) if m else None
+
     def list_for_invoice(self, invoice_id: uuid.UUID) -> list[InvoiceItem]:
         rows = self._session.scalars(select(InvoiceItemModel).where(InvoiceItemModel.invoice_id == invoice_id))
+        return [_invoice_item_to_domain(m) for m in rows]
+
+    def list_all(self) -> list[InvoiceItem]:
+        rows = self._session.scalars(select(InvoiceItemModel))
         return [_invoice_item_to_domain(m) for m in rows]
 
     def count(self) -> int:
@@ -547,6 +611,10 @@ class InvoiceAllocationRepository:
         rows = self._session.scalars(select(InvoiceAllocationModel).where(InvoiceAllocationModel.contract_id == contract_id))
         return [_invoice_allocation_to_domain(m) for m in rows]
 
+    def list_all(self) -> list[InvoiceAllocation]:
+        rows = self._session.scalars(select(InvoiceAllocationModel))
+        return [_invoice_allocation_to_domain(m) for m in rows]
+
     def sum_confirmed_for_contract(self, contract_id: uuid.UUID) -> Decimal:
         rows = self.list_for_contract(contract_id)
         return sum((a.allocated_gross_amount for a in rows), Decimal("0"))
@@ -577,3 +645,348 @@ class PaymentAllocationRepository:
     def sum_confirmed_for_contract(self, contract_id: uuid.UUID) -> Decimal:
         rows = self.list_for_contract(contract_id)
         return sum((a.allocated_amount for a in rows), Decimal("0"))
+
+
+def _invoice_item_allocation_to_domain(m: InvoiceItemAllocationModel) -> InvoiceItemAllocation:
+    return InvoiceItemAllocation(
+        id=m.id,
+        invoice_item_id=m.invoice_item_id,
+        contract_item_id=m.contract_item_id,
+        allocated_quantity=m.allocated_quantity,
+        allocated_net_amount=m.allocated_net_amount,
+        confirmation_type=m.confirmation_type,
+        source_fragment_id=m.source_fragment_id,
+        created_at=m.created_at,
+    )
+
+
+def _cost_recognition_fact_to_domain(m: CostRecognitionFactModel) -> CostRecognitionFact:
+    return CostRecognitionFact(
+        id=m.id,
+        contract_id=m.contract_id,
+        recognition_date=m.recognition_date,
+        basis=m.basis,
+        source_fragment_id=m.source_fragment_id,
+        created_at=m.created_at,
+    )
+
+
+def _accrual_basis_fact_to_domain(m: AccrualBasisFactModel) -> AccrualBasisFact:
+    return AccrualBasisFact(
+        id=m.id,
+        scope_type=m.scope_type,
+        contract_id=m.contract_id,
+        contract_item_id=m.contract_item_id,
+        quantity=m.quantity,
+        estimated_cost=m.estimated_cost,
+        basis=m.basis,
+        source_fragment_id=m.source_fragment_id,
+        created_at=m.created_at,
+    )
+
+
+def _historical_accrual_fact_to_domain(m: HistoricalAccrualFactModel) -> HistoricalAccrualFact:
+    return HistoricalAccrualFact(
+        id=m.id,
+        source_period=m.source_period,
+        contract_item_id=m.contract_item_id,
+        quantity=m.quantity,
+        estimated_cost=m.estimated_cost,
+        basis=m.basis,
+        source_fragment_id=m.source_fragment_id,
+        confirmed_at=m.confirmed_at,
+    )
+
+
+def _accrual_to_domain(m: AccrualModel) -> Accrual:
+    return Accrual(
+        id=m.id,
+        period=m.period,
+        contract_item_id=m.contract_item_id,
+        quantity=m.quantity,
+        estimated_cost=m.estimated_cost,
+        basis=m.basis,
+        status=m.status,
+        created_from_fact_id=m.created_from_fact_id,
+        created_at=m.created_at,
+    )
+
+
+def _accrual_reversal_to_domain(m: AccrualReversalModel) -> AccrualReversal:
+    return AccrualReversal(
+        id=m.id,
+        accrual_id=m.accrual_id,
+        period=m.period,
+        invoice_item_allocation_id=m.invoice_item_allocation_id,
+        reversed_quantity=m.reversed_quantity,
+        reversed_estimated_cost=m.reversed_estimated_cost,
+        created_at=m.created_at,
+    )
+
+
+class InvoiceItemAllocationRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, allocation: InvoiceItemAllocation) -> None:
+        self._session.add(
+            InvoiceItemAllocationModel(
+                id=allocation.id,
+                invoice_item_id=allocation.invoice_item_id,
+                contract_item_id=allocation.contract_item_id,
+                allocated_quantity=allocation.allocated_quantity,
+                allocated_net_amount=allocation.allocated_net_amount,
+                confirmation_type=allocation.confirmation_type,
+                source_fragment_id=allocation.source_fragment_id,
+                created_at=allocation.created_at,
+            )
+        )
+
+    def get(self, allocation_id: uuid.UUID) -> InvoiceItemAllocation | None:
+        m = self._session.get(InvoiceItemAllocationModel, allocation_id)
+        return _invoice_item_allocation_to_domain(m) if m else None
+
+    def list_for_contract_item(self, contract_item_id: uuid.UUID) -> list[InvoiceItemAllocation]:
+        rows = self._session.scalars(
+            select(InvoiceItemAllocationModel).where(InvoiceItemAllocationModel.contract_item_id == contract_item_id)
+        )
+        return [_invoice_item_allocation_to_domain(m) for m in rows]
+
+    def list_for_invoice_item(self, invoice_item_id: uuid.UUID) -> list[InvoiceItemAllocation]:
+        rows = self._session.scalars(
+            select(InvoiceItemAllocationModel).where(InvoiceItemAllocationModel.invoice_item_id == invoice_item_id)
+        )
+        return [_invoice_item_allocation_to_domain(m) for m in rows]
+
+    def list_all(self) -> list[InvoiceItemAllocation]:
+        rows = self._session.scalars(select(InvoiceItemAllocationModel))
+        return [_invoice_item_allocation_to_domain(m) for m in rows]
+
+    def find(self, invoice_item_id: uuid.UUID, contract_item_id: uuid.UUID) -> InvoiceItemAllocation | None:
+        m = self._session.scalar(
+            select(InvoiceItemAllocationModel).where(
+                InvoiceItemAllocationModel.invoice_item_id == invoice_item_id,
+                InvoiceItemAllocationModel.contract_item_id == contract_item_id,
+            )
+        )
+        return _invoice_item_allocation_to_domain(m) if m else None
+
+    def sum_allocated_quantity_for_invoice_item(self, invoice_item_id: uuid.UUID) -> Decimal:
+        rows = self.list_for_invoice_item(invoice_item_id)
+        return sum((a.allocated_quantity for a in rows), Decimal("0"))
+
+    def count(self) -> int:
+        return len(self._session.scalars(select(InvoiceItemAllocationModel.id)).all())
+
+
+class CostRecognitionFactRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, fact: CostRecognitionFact) -> None:
+        self._session.add(
+            CostRecognitionFactModel(
+                id=fact.id,
+                contract_id=fact.contract_id,
+                recognition_date=fact.recognition_date,
+                basis=fact.basis,
+                source_fragment_id=fact.source_fragment_id,
+                created_at=fact.created_at,
+            )
+        )
+
+    def list_all(self) -> list[CostRecognitionFact]:
+        rows = self._session.scalars(select(CostRecognitionFactModel))
+        return [_cost_recognition_fact_to_domain(m) for m in rows]
+
+    def find_duplicate(self, contract_id: uuid.UUID, recognition_date, basis: str) -> CostRecognitionFact | None:
+        m = self._session.scalar(
+            select(CostRecognitionFactModel).where(
+                CostRecognitionFactModel.contract_id == contract_id,
+                CostRecognitionFactModel.recognition_date == recognition_date,
+                CostRecognitionFactModel.basis == basis,
+            )
+        )
+        return _cost_recognition_fact_to_domain(m) if m else None
+
+    def count(self) -> int:
+        return len(self._session.scalars(select(CostRecognitionFactModel.id)).all())
+
+
+class AccrualBasisFactRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, fact: AccrualBasisFact) -> None:
+        self._session.add(
+            AccrualBasisFactModel(
+                id=fact.id,
+                scope_type=fact.scope_type,
+                contract_id=fact.contract_id,
+                contract_item_id=fact.contract_item_id,
+                quantity=fact.quantity,
+                estimated_cost=fact.estimated_cost,
+                basis=fact.basis,
+                source_fragment_id=fact.source_fragment_id,
+                created_at=fact.created_at,
+            )
+        )
+
+    def list_all(self) -> list[AccrualBasisFact]:
+        rows = self._session.scalars(select(AccrualBasisFactModel))
+        return [_accrual_basis_fact_to_domain(m) for m in rows]
+
+    def find_duplicate(
+        self,
+        contract_id: uuid.UUID,
+        scope_type: str,
+        contract_item_id: uuid.UUID | None,
+        estimated_cost: Decimal,
+        basis: str,
+    ) -> AccrualBasisFact | None:
+        query = select(AccrualBasisFactModel).where(
+            AccrualBasisFactModel.contract_id == contract_id,
+            AccrualBasisFactModel.scope_type == scope_type,
+            AccrualBasisFactModel.contract_item_id == contract_item_id,
+            AccrualBasisFactModel.estimated_cost == estimated_cost,
+            AccrualBasisFactModel.basis == basis,
+        )
+        m = self._session.scalar(query)
+        return _accrual_basis_fact_to_domain(m) if m else None
+
+    def count(self) -> int:
+        return len(self._session.scalars(select(AccrualBasisFactModel.id)).all())
+
+
+class HistoricalAccrualFactRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, fact: HistoricalAccrualFact) -> None:
+        self._session.add(
+            HistoricalAccrualFactModel(
+                id=fact.id,
+                source_period=fact.source_period,
+                contract_item_id=fact.contract_item_id,
+                quantity=fact.quantity,
+                estimated_cost=fact.estimated_cost,
+                basis=fact.basis,
+                source_fragment_id=fact.source_fragment_id,
+                confirmed_at=fact.confirmed_at,
+            )
+        )
+
+    def list_all(self) -> list[HistoricalAccrualFact]:
+        rows = self._session.scalars(select(HistoricalAccrualFactModel))
+        return [_historical_accrual_fact_to_domain(m) for m in rows]
+
+    def find_duplicate(
+        self,
+        contract_item_id: uuid.UUID,
+        source_period: str,
+        quantity: Decimal,
+        estimated_cost: Decimal,
+        basis: str,
+    ) -> HistoricalAccrualFact | None:
+        m = self._session.scalar(
+            select(HistoricalAccrualFactModel).where(
+                HistoricalAccrualFactModel.contract_item_id == contract_item_id,
+                HistoricalAccrualFactModel.source_period == source_period,
+                HistoricalAccrualFactModel.quantity == quantity,
+                HistoricalAccrualFactModel.estimated_cost == estimated_cost,
+                HistoricalAccrualFactModel.basis == basis,
+            )
+        )
+        return _historical_accrual_fact_to_domain(m) if m else None
+
+    def count(self) -> int:
+        return len(self._session.scalars(select(HistoricalAccrualFactModel.id)).all())
+
+
+class AccrualRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, accrual: Accrual) -> None:
+        self._session.add(
+            AccrualModel(
+                id=accrual.id,
+                period=accrual.period,
+                contract_item_id=accrual.contract_item_id,
+                quantity=accrual.quantity,
+                estimated_cost=accrual.estimated_cost,
+                basis=accrual.basis,
+                status=accrual.status,
+                created_from_fact_id=accrual.created_from_fact_id,
+                created_at=accrual.created_at,
+            )
+        )
+
+    def get(self, accrual_id: uuid.UUID) -> Accrual | None:
+        m = self._session.get(AccrualModel, accrual_id)
+        return _accrual_to_domain(m) if m else None
+
+    def find_by_item_and_period(self, contract_item_id: uuid.UUID, period: str) -> Accrual | None:
+        m = self._session.scalar(
+            select(AccrualModel).where(
+                AccrualModel.contract_item_id == contract_item_id, AccrualModel.period == period
+            )
+        )
+        return _accrual_to_domain(m) if m else None
+
+    def list_all(self) -> list[Accrual]:
+        rows = self._session.scalars(select(AccrualModel).order_by(AccrualModel.created_at))
+        return [_accrual_to_domain(m) for m in rows]
+
+    def list_for_period(self, period: str) -> list[Accrual]:
+        rows = self._session.scalars(select(AccrualModel).where(AccrualModel.period == period))
+        return [_accrual_to_domain(m) for m in rows]
+
+    def count(self) -> int:
+        return len(self._session.scalars(select(AccrualModel.id)).all())
+
+    def update_status(self, accrual_id: uuid.UUID, status: str) -> None:
+        m = self._session.get(AccrualModel, accrual_id)
+        if m is None:
+            raise KeyError(f"Accrual {accrual_id} not found")
+        m.status = status
+
+
+class AccrualReversalRepository:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, reversal: AccrualReversal) -> None:
+        self._session.add(
+            AccrualReversalModel(
+                id=reversal.id,
+                accrual_id=reversal.accrual_id,
+                period=reversal.period,
+                invoice_item_allocation_id=reversal.invoice_item_allocation_id,
+                reversed_quantity=reversal.reversed_quantity,
+                reversed_estimated_cost=reversal.reversed_estimated_cost,
+                created_at=reversal.created_at,
+            )
+        )
+
+    def list_for_accrual(self, accrual_id: uuid.UUID) -> list[AccrualReversal]:
+        rows = self._session.scalars(
+            select(AccrualReversalModel).where(AccrualReversalModel.accrual_id == accrual_id)
+        )
+        return [_accrual_reversal_to_domain(m) for m in rows]
+
+    def find_by_allocation(self, accrual_id: uuid.UUID, invoice_item_allocation_id: uuid.UUID) -> AccrualReversal | None:
+        m = self._session.scalar(
+            select(AccrualReversalModel).where(
+                AccrualReversalModel.accrual_id == accrual_id,
+                AccrualReversalModel.invoice_item_allocation_id == invoice_item_allocation_id,
+            )
+        )
+        return _accrual_reversal_to_domain(m) if m else None
+
+    def list_all(self) -> list[AccrualReversal]:
+        rows = self._session.scalars(select(AccrualReversalModel))
+        return [_accrual_reversal_to_domain(m) for m in rows]
+
+    def count(self) -> int:
+        return len(self._session.scalars(select(AccrualReversalModel.id)).all())

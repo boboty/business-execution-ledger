@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import uuid
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import click
 
+from bel.application.accrual_queries import get_accrual_view, list_accrual_views
+from bel.application.allocate_invoice_item import allocate_invoice_item
 from bel.application.get_contract import get_contract
 from bel.application.get_invoice import get_invoice
 from bel.application.get_payment import get_payment
 from bel.application.import_bank import import_bank_statement
+from bel.application.import_close_facts import CloseFactPackError, import_close_facts
 from bel.application.import_contract_ledger import import_contract_ledger
 from bel.application.import_invoices import import_invoices
 from bel.application.list_exceptions import list_exceptions
 from bel.application.list_matches import list_match_cases
 from bel.application.matching import confirm_match, match_invoices, match_payments
+from bel.application.period_close import build_period_close_preview
 from bel.application.search_contracts import search_contracts_by_no
 from bel.domain.invoice import InvoiceDirection
 from bel.infrastructure.persistence.database import make_engine, make_session_factory
@@ -412,6 +418,204 @@ def match_confirm(ctx: click.Context, match_case_id: uuid.UUID, contract_id: uui
             raise SystemExit(1) from exc
 
     click.echo(f"MatchCase {match_case_id} confirmed against contract {contract_id} -> RESOLVED")
+
+
+@cli.command("import-close-facts")
+@click.argument("json_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.pass_context
+def import_close_facts_cmd(ctx: click.Context, json_path: Path) -> None:
+    """Import a Close Fact Pack (人工补充事实 for period close)."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = import_close_facts(session, json_path)
+    except CloseFactPackError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+
+    if result.is_reimport:
+        click.echo("Import completed (re-import — same file already on record, 0 new facts)")
+        click.echo("")
+        click.echo(f"  evidence document: {result.evidence_document_id}")
+        click.echo(f"  sha256: {result.sha256}")
+        return
+
+    click.echo("Import completed")
+    click.echo("")
+    click.echo(f"  contract items:            {result.contract_items_created} created / {result.contract_items_skipped} skipped")
+    click.echo(f"  cost recognition facts:    {result.cost_recognition_facts_created} created / {result.cost_recognition_facts_skipped} skipped")
+    click.echo(f"  accrual basis facts:       {result.accrual_basis_facts_created} created / {result.accrual_basis_facts_skipped} skipped")
+    click.echo(f"  historical accrual facts:  {result.historical_accrual_facts_created} created / {result.historical_accrual_facts_skipped} skipped")
+    click.echo(f"  accruals:                  {result.accruals_created} created / {result.accruals_skipped} skipped")
+    click.echo(f"  invoice item allocations:  {result.invoice_item_allocations_created} created / {result.invoice_item_allocations_skipped} skipped")
+    click.echo(f"  accrual reversals:         {result.accrual_reversals_created} created / {result.accrual_reversals_skipped} skipped")
+    click.echo(f"  source periods:            {', '.join(result.source_periods) or '(none)'}")
+    click.echo("")
+    click.echo(f"  evidence document: {result.evidence_document_id}")
+    click.echo(f"  sha256: {result.sha256}")
+
+
+@cli.group("accrual")
+def accrual_group() -> None:
+    """Accrual queries."""
+
+
+@accrual_group.command("list")
+@click.pass_context
+def accrual_list(ctx: click.Context) -> None:
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        views = list_accrual_views(session)
+
+    if not views:
+        click.echo("No accruals.")
+        return
+
+    for v in views:
+        a = v.accrual
+        click.echo(
+            f"{a.id}  [{v.projected_status}] item={a.contract_item_id} period={a.period} "
+            f"qty={a.quantity} cost={a.estimated_cost} remaining_qty={v.remaining_quantity} "
+            f"remaining_cost={v.remaining_estimated_cost}"
+        )
+
+
+@accrual_group.command("get")
+@click.argument("accrual_id", type=click.UUID)
+@click.pass_context
+def accrual_get(ctx: click.Context, accrual_id: uuid.UUID) -> None:
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        view = get_accrual_view(session, accrual_id)
+
+    if view is None:
+        click.echo(f"No accrual with id={accrual_id}")
+        return
+
+    a = view.accrual
+    click.echo("Accrual")
+    click.echo(f"  id:                     {a.id}")
+    click.echo(f"  period:                 {a.period}")
+    click.echo(f"  contract_item_id:       {a.contract_item_id}")
+    click.echo(f"  quantity:               {a.quantity}")
+    click.echo(f"  estimated_cost:         {a.estimated_cost}")
+    click.echo(f"  basis:                  {a.basis}")
+    click.echo(f"  status:                 {a.status}")
+    click.echo(f"  created_from_fact_id:   {a.created_from_fact_id}")
+    click.echo(f"  created_at:             {a.created_at}")
+    click.echo("")
+    click.echo("Balance (derived: original - reversals)")
+    click.echo(f"  reversed_quantity:       {view.reversed_quantity}")
+    click.echo(f"  reversed_estimated_cost: {view.reversed_estimated_cost}")
+    click.echo(f"  remaining_quantity:      {view.remaining_quantity}")
+    click.echo(f"  remaining_estimated_cost: {view.remaining_estimated_cost}")
+    click.echo(f"  projected_status:        {view.projected_status}")
+    click.echo("")
+    click.echo(f"Reversals ({len(view.reversals)}):")
+    for r in view.reversals:
+        click.echo(
+            f"  {r.id}  period={r.period} allocation={r.invoice_item_allocation_id} "
+            f"qty={r.reversed_quantity} cost={r.reversed_estimated_cost}"
+        )
+
+
+@cli.command("invoice-item-allocate")
+@click.option("--invoice", "invoice_external_key", required=True, help="Invoice external_invoice_key (数电发票号码).")
+@click.option("--line", "line_no", type=int, required=True, help="Invoice line number (1-based).")
+@click.option("--contract", "contract_id", type=click.UUID, required=True, help="Contract id.")
+@click.option("--item", "source_item_key", required=True, help="ContractItem source_item_key.")
+@click.option("--quantity", required=True, help="Quantity to allocate.")
+@click.option("--net-amount", required=True, help="Allocated net amount.")
+@click.pass_context
+def invoice_item_allocate(
+    ctx: click.Context,
+    invoice_external_key: str,
+    line_no: int,
+    contract_id: uuid.UUID,
+    source_item_key: str,
+    quantity: str,
+    net_amount: str,
+) -> None:
+    """Manually confirm a ContractItem <-> InvoiceItem allocation (11-A/B/C enforced)."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            allocation = allocate_invoice_item(
+                session,
+                invoice_external_key=invoice_external_key,
+                line_no=line_no,
+                contract_id=contract_id,
+                source_item_key=source_item_key,
+                quantity=Decimal(quantity),
+                net_amount=Decimal(net_amount),
+            )
+    except ValueError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+
+    click.echo(
+        f"InvoiceItemAllocation {allocation.id} created: invoice_item={allocation.invoice_item_id} "
+        f"contract_item={allocation.contract_item_id} qty={allocation.allocated_quantity} "
+        f"net={allocation.allocated_net_amount} [{allocation.confirmation_type}]"
+    )
+
+
+@cli.group("period-close")
+def period_close_group() -> None:
+    """Period close (preview only — read-only, never commits)."""
+
+
+@period_close_group.command("preview")
+@click.argument("period", type=str)
+@click.pass_context
+def period_close_preview(ctx: click.Context, period: str) -> None:
+    """Compute a stateless Period Close Preview for <YYYY-MM>. Pure query:
+    writes nothing, creates no vouchers/accounting entries/events."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        preview = build_period_close_preview(session, period)
+
+    click.echo(f"Period Close Preview: {preview.period}  (period_end={preview.period_end})")
+    click.echo("")
+    click.echo("Prior Accrual Reversals (R001+R006):")
+    for r in preview.prior_accrual_reversals:
+        click.echo(
+            f"  accrual={r.accrual_id} source_period={r.source_period} item={r.contract_item_id} "
+            f"reversal_qty={r.reversal_quantity} reversal_cost={r.reversal_estimated_cost} "
+            f"projected_remaining_qty={r.projected_remaining_quantity} "
+            f"projected_remaining_cost={r.projected_remaining_cost} status={r.projected_status}"
+        )
+    click.echo("")
+    click.echo("New Accrual Requirements (R002):")
+    for a in preview.new_accrual_requirements:
+        click.echo(
+            f"  [{a.level}] contract={a.contract_id} item={a.contract_item_id} "
+            f"qty={a.quantity} estimated_cost={a.estimated_cost} basis={a.basis}"
+        )
+    click.echo("")
+    click.echo("Contract-Level Candidates (R007):")
+    for c in preview.contract_level_candidates:
+        click.echo(
+            f"  [{c.level}] contract={c.contract_id} estimated_cost={c.estimated_cost} "
+            f"blocking_reason={c.blocking_reason}"
+        )
+    click.echo("")
+    click.echo("Accrual Actual Differences (R005):")
+    for d in preview.accrual_actual_differences:
+        click.echo(
+            f"  item={d.contract_item_id} actual_net_cost={d.actual_net_cost} "
+            f"reversed_estimated_cost={d.reversed_estimated_cost} difference={d.difference}"
+        )
+    click.echo("")
+    click.echo("Blockers (diagnostics only, not Decisions):")
+    if not preview.blockers:
+        click.echo("  (none)")
+    for b in preview.blockers:
+        click.echo(f"  {b.blocker_type} contract={b.contract_id} item={b.contract_item_id or '-'}")
+    click.echo("")
+    click.echo("Summary:")
+    for key, value in preview.summary.items():
+        click.echo(f"  {key}: {value}")
 
 
 if __name__ == "__main__":

@@ -71,9 +71,16 @@ class ContractModel(Base):
 
 class ContractItemModel(Base):
     __tablename__ = "contract_items"
+    __table_args__ = (
+        # source_item_key is an implementation-level stable reference for
+        # Fact Pack selectors — NOT a global business key and not a SKU.
+        # Unique per contract only. See docs/PHASE2B-DECISIONS.md.
+        UniqueConstraint("contract_id", "source_item_key", name="uq_contract_item_source_key"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    source_item_key: Mapped[str | None] = mapped_column(String, nullable=True)
     sku: Mapped[str | None] = mapped_column(String, nullable=True)
     product_name: Mapped[str | None] = mapped_column(String, nullable=True)
     specification: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -248,4 +255,93 @@ class MatchCandidateModel(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     match_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("match_cases.id"), nullable=False, index=True)
     contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class InvoiceItemAllocationModel(Base):
+    """ContractItem ↔ InvoiceItem confirmed relationship — the
+    R006 partial-receipt primitive. Created only via MANUAL_CONFIRMED or
+    a Fact Pack; Phase 2B adds no automatic item matching. See
+    docs/PHASE2B-DECISIONS.md and spec sections 10-11."""
+
+    __tablename__ = "invoice_item_allocations"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    invoice_item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("invoice_items.id"), nullable=False, index=True)
+    contract_item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contract_items.id"), nullable=False, index=True)
+    allocated_quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    allocated_net_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    confirmation_type: Mapped[str] = mapped_column(String, nullable=False)
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CostRecognitionFactModel(Base):
+    __tablename__ = "cost_recognition_facts"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    recognition_date: Mapped[date] = mapped_column(Date, nullable=False)
+    basis: Mapped[str] = mapped_column(String, nullable=False)
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class AccrualBasisFactModel(Base):
+    __tablename__ = "accrual_basis_facts"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    scope_type: Mapped[str] = mapped_column(String, nullable=False)  # CONTRACT / CONTRACT_ITEM
+    contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    contract_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("contract_items.id"), nullable=True, index=True
+    )
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    estimated_cost: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    basis: Mapped[str] = mapped_column(String, nullable=False)
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class HistoricalAccrualFactModel(Base):
+    __tablename__ = "historical_accrual_facts"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    source_period: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    contract_item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contract_items.id"), nullable=False, index=True)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    estimated_cost: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    basis: Mapped[str] = mapped_column(String, nullable=False)
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class AccrualModel(Base):
+    __tablename__ = "accruals"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    period: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    contract_item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contract_items.id"), nullable=False, index=True)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    estimated_cost: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    basis: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # created_from_fact_id is intentionally NOT an FK: Phase 2B sources
+    # accruals only from HistoricalAccrualFact, but future self-generated
+    # accruals extend the source set (spec section 7).
+    created_from_fact_id: Mapped[uuid.UUID] = mapped_column(nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class AccrualReversalModel(Base):
+    __tablename__ = "accrual_reversals"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    accrual_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accruals.id"), nullable=False, index=True)
+    period: Mapped[str] = mapped_column(String, nullable=False)
+    invoice_item_allocation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("invoice_item_allocations.id"), nullable=False, index=True
+    )
+    reversed_quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    reversed_estimated_cost: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

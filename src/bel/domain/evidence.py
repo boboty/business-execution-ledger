@@ -24,6 +24,9 @@ class FragmentKind:
 
     EXCEL_ROW = "EXCEL_ROW"
     PDF_TRANSACTION = "PDF_TRANSACTION"
+    # Close Fact Pack entries and manual CLI confirmations — locator is a
+    # {"section": ..., "index": ...} pair. See docs/PHASE2B-DECISIONS.md.
+    MANUAL_FACT = "MANUAL_FACT"
 
 
 @dataclass(frozen=True)

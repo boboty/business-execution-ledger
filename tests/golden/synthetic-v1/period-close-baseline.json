@@ -1,0 +1,96 @@
+{
+  "period": "2031-03",
+  "prior_accrual_reversals": {
+    "PO-CLOSE-001": {
+      "scenario": "S2B-01",
+      "item_key": "ITEM-A",
+      "reversal_quantity": "35",
+      "reversal_estimated_cost": "420.00",
+      "projected_remaining_quantity": "65",
+      "projected_remaining_cost": "780.00",
+      "projected_status": "PARTIALLY_REVERSED"
+    },
+    "PO-CLOSE-002": {
+      "scenario": "S2B-02",
+      "item_key": "ITEM-A",
+      "reversal_quantity": "40",
+      "reversal_estimated_cost": "880.00",
+      "projected_remaining_quantity": "0",
+      "projected_remaining_cost": "0.00",
+      "projected_status": "REVERSED"
+    }
+  },
+  "prior_period_reversal_cross_check": {
+    "scenario": "S2B-03",
+    "expected": "1300.00"
+  },
+  "accrual_actual_differences": {
+    "PO-CLOSE-001": {
+      "actual_net_cost": "455.00",
+      "reversed_estimated_cost": "420.00",
+      "difference": "35.00"
+    },
+    "PO-CLOSE-002": {
+      "actual_net_cost": "840.00",
+      "reversed_estimated_cost": "880.00",
+      "difference": "-40.00"
+    }
+  },
+  "new_accrual_requirements": {
+    "PO-CLOSE-003": {
+      "scenario": "S2B-04",
+      "level": "CONTRACT_ITEM",
+      "item_key": "ITEM-A",
+      "quantity": "60",
+      "estimated_cost": "624.00"
+    }
+  },
+  "contract_level_candidates": {
+    "PO-CLOSE-004": {
+      "scenario": "S2B-05",
+      "estimated_cost": "735.00",
+      "blocking_reason": "MISSING_CONTRACT_ITEM_EVIDENCE"
+    },
+    "PO-CLOSE-007": {
+      "scenario": "S2B-08-run1",
+      "estimated_cost": "900.00",
+      "blocking_reason": "MISSING_CONTRACT_ITEM_EVIDENCE"
+    }
+  },
+  "duplicate_guard": {
+    "scenario": "S2B-06",
+    "PO-CLOSE-005": {
+      "new_accrual_required_count": 0,
+      "monetary_reversal_count": 0,
+      "accrual_status": "PARTIALLY_REVERSED",
+      "remaining_quantity": "60",
+      "remaining_estimated_cost": "300.00"
+    }
+  },
+  "item_match_blocker": {
+    "scenario": "S2B-07",
+    "PO-CLOSE-006": {
+      "monetary_reversal_count": 0,
+      "blocker": "ITEM_MATCH_REQUIRED_FOR_REVERSAL"
+    }
+  },
+  "missing_basis_blocker": {
+    "PO-CLOSE-008": {
+      "blocker": "MISSING_ACCRUAL_BASIS"
+    }
+  },
+  "summary": {
+    "period": "2031-03",
+    "prior_accrual_reversals": 2,
+    "new_accrual_requirements": 1,
+    "contract_level_candidates": 2,
+    "accrual_actual_differences": 2,
+    "blockers": 2
+  },
+  "no_write_invariants": {
+    "accruals": 4,
+    "accrual_reversals": 1,
+    "invoice_allocations": 4,
+    "invoice_item_allocations": 3
+  }
+}

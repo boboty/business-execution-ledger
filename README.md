@@ -47,6 +47,8 @@ between Agent Runtime and Business Core.
 - [docs/PHASE1-DECISIONS.md](docs/PHASE1-DECISIONS.md) — Phase 1 implementation judgment calls
 - [docs/PHASE2A-DECISIONS.md](docs/PHASE2A-DECISIONS.md) — Phase 2A implementation judgment calls
 - [docs/PHASE2A-ACCEPTANCE.md](docs/PHASE2A-ACCEPTANCE.md) — Phase 2A acceptance criteria
+- [docs/PHASE2B-DECISIONS.md](docs/PHASE2B-DECISIONS.md) — Phase 2B implementation judgment calls
+- [docs/PHASE2B-ACCEPTANCE.md](docs/PHASE2B-ACCEPTANCE.md) — Phase 2B acceptance criteria
 - [docs/PRIVATE-DATA-POLICY.md](docs/PRIVATE-DATA-POLICY.md) — sensitive-data handling policy (read this first)
 
 ## Getting started
@@ -63,12 +65,30 @@ git config core.hooksPath .githooks   # one-time: enables the privacy pre-commit
 .venv/bin/pytest
 ```
 
+The SQLite runtime database (`bel.db`, created by `alembic upgrade head`)
+is a local development artifact: keep it **outside** this repository tree
+(any real business data it accumulates must never live inside the repo).
+The committed test suite (`pytest`) runs entirely in-memory against
+synthetic data.
+
 Sensitive business data is never committed to this repository — see
 [docs/PRIVATE-DATA-POLICY.md](docs/PRIVATE-DATA-POLICY.md). The committed
-test suite (`pytest`) runs entirely against independently constructed
+test suite runs entirely against independently constructed
 synthetic data under `fixtures/synthetic/`.
 
 ## Status
+
+Phase 2B — first deterministic month-end close engine on top of Phase 1 +
+Phase 2A. Adds the Close Fact Pack (人工补充事实) import
+(`bel import-close-facts`), the ContractItem ↔ InvoiceItem confirmed
+relationship (`bel invoice-item allocate`), Accrual /
+AccrualReversal / HistoricalAccrualFact / CostRecognitionFact /
+AccrualBasisFact, and a read-only `bel period-close preview` that
+recomputes the CONFIRMED rules R001/R002/R003/R005/R006/R007 from current
+facts every run — stateless recomputation, never R015 (which stays
+PROPOSED). Preview writes nothing: no vouchers, no accounting entries, no
+events. See [docs/PHASE2B-DECISIONS.md](docs/PHASE2B-DECISIONS.md) and
+[docs/PHASE2B-ACCEPTANCE.md](docs/PHASE2B-ACCEPTANCE.md).
 
 Phase 2A — adds Invoice/Payment/Allocation/MatchCase on top of Phase 1's
 Contract import: a purchase-invoice Excel adapter, a deterministic

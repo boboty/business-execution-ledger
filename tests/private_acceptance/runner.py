@@ -35,15 +35,21 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from bel.application.import_bank import import_bank_statement  # noqa: E402
+from bel.application.import_close_facts import import_close_facts  # noqa: E402
 from bel.application.import_contract_ledger import import_contract_ledger  # noqa: E402
 from bel.application.import_invoices import import_invoices  # noqa: E402
 from bel.application.matching import match_invoices, match_payments  # noqa: E402
+from bel.application.period_close import build_period_close_preview  # noqa: E402
+from bel.domain.accrual import get_accrual_balance  # noqa: E402
 from bel.domain.invoice import InvoiceDirection  # noqa: E402
 from bel.infrastructure.persistence.database import make_engine, make_session_factory  # noqa: E402
 from bel.infrastructure.persistence.models import (  # noqa: E402
+    AccrualModel,
+    AccrualReversalModel,
     Base,
     ContractModel,
     InvoiceAllocationModel,
+    InvoiceItemAllocationModel,
     InvoiceModel,
     MatchCaseModel,
     PaymentAllocationModel,
@@ -59,6 +65,11 @@ REASON_SOURCE_FILE_MISSING = "SOURCE_FILE_MISSING"
 REASON_EXPECTED_FILE_MISSING = "EXPECTED_FILE_MISSING"
 REASON_RESULT_MISMATCH = "RESULT_MISMATCH"
 REASON_UNEXPECTED_ERROR = "UNEXPECTED_ERROR"
+# The private root lacks the Phase 2B fact inputs (historical accrual
+# scope / item relationship / cost recognition / basis). Golden answers
+# are acceptance answers, never a source of Evidence — so the private
+# run reports NOT_READY instead of reverse-engineering facts (spec 33).
+REASON_NOT_READY = "NOT_READY"
 
 
 class AcceptanceError(Exception):
@@ -352,11 +363,256 @@ def run_matching(period_dir: Path) -> dict[str, Any]:
     return diagnostic
 
 
+def _p2b_confirm_invoice_contract(session, invoice_id, contract_id) -> None:
+    """Construct Phase 2A contract-level match output (M001/human-confirm)
+    for the private dataset. This is system-state construction, not a
+    new rule."""
+    import uuid as _uuid
+
+    from datetime import datetime, timezone
+
+    from bel.domain.matching import (
+        AllocationMatchMethod,
+        ConfirmationType,
+        InvoiceAllocation,
+        MatchCase,
+        MatchCaseStatus,
+        MatchMethod,
+    )
+    from bel.infrastructure.persistence.repositories import (
+        InvoiceAllocationRepository,
+        MatchCaseRepository,
+    )
+
+    now = datetime.now(timezone.utc)
+    match_case = MatchCase(
+        id=_uuid.uuid4(),
+        subject_type="INVOICE",
+        subject_id=invoice_id,
+        status=MatchCaseStatus.AUTO_CONFIRMED,
+        match_method=MatchMethod.M001,
+        created_at=now,
+        resolved_at=now,
+    )
+    MatchCaseRepository(session).add(match_case)
+    session.flush()
+    InvoiceAllocationRepository(session).add(
+        InvoiceAllocation(
+            id=_uuid.uuid4(),
+            invoice_id=invoice_id,
+            contract_id=contract_id,
+            match_case_id=match_case.id,
+            allocated_gross_amount=Decimal("0"),
+            match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+            confirmation_type=ConfirmationType.AUTO_CONFIRMED,
+            created_at=now,
+        )
+    )
+    session.flush()
+
+
+def _p2b_import_base(period_dir: Path) -> tuple[Any, dict[str, Any]]:
+    """Import the private contracts, invoices and Close Fact Pack into a
+    fresh in-memory DB. Raises NOT_READY when the Phase 2B facts are
+    missing from the private root (spec section 33) — golden answers are
+    never reverse-engineered into Evidence."""
+    from bel.infrastructure.persistence.repositories import (
+        ContractRepository,
+        InvoiceRepository,
+    )
+
+    facts_path = period_dir / "facts" / "phase2b-close-facts.json"
+    if not facts_path.exists():
+        raise AcceptanceError(REASON_NOT_READY, {"missing_facts": "facts/phase2b-close-facts.json"})
+    baseline = _load_expected(period_dir, "phase2b-close-baseline.json")
+    ledger_path = _one_file(period_dir / "contracts", "*.xlsx")
+    invoices_path = _one_file(period_dir / "invoices", "*.xlsx")
+
+    session = _new_session()
+    import_contract_ledger(session, ledger_path)
+    import_invoices(session, invoices_path, InvoiceDirection.PURCHASE)
+
+    contract_by_no = {c.contract_no: c for c in ContractRepository(session).list_all()}
+    for external_key, contract_no in baseline.get("confirmations", []):
+        invoice = InvoiceRepository(session).find_by_external_key(external_key)
+        if invoice is None or contract_no not in contract_by_no:
+            raise AcceptanceError(REASON_NOT_READY, {"confirmations": "expected data inconsistent with invoices/contracts"})
+        _p2b_confirm_invoice_contract(session, invoice.id, contract_by_no[contract_no].id)
+    session.commit()
+
+    import_close_facts(session, facts_path)
+    return session, baseline
+
+
+def _p2b_contract_maps(session) -> tuple[dict[str, Any], dict[Any, Any]]:
+    from bel.infrastructure.persistence.repositories import ContractRepository
+
+    contracts = ContractRepository(session).list_all()
+    by_no = {c.contract_no: c for c in contracts}
+    by_id = {c.id: c for c in contracts}
+    return by_no, by_id
+
+
+def run_p2b_close_fact_import(period_dir: Path) -> dict[str, Any]:
+    session, baseline = _p2b_import_base(period_dir)
+    diagnostic: dict[str, Any] = {"scenario": "P2B_CLOSE_FACT_IMPORT"}
+
+    by_no, _ = _p2b_contract_maps(session)
+    for key, expected in baseline.get("accruals_expected", {}).items():
+        contract_no, item_key = key.split("/")
+        from bel.infrastructure.persistence.repositories import ContractItemRepository, AccrualRepository
+
+        item = ContractItemRepository(session).find_by_contract_and_key(by_no[contract_no].id, item_key)
+        if item is None:
+            diagnostic.setdefault("mismatches", []).append({"field": f"item_missing:{key}"})
+            continue
+        accrual = AccrualRepository(session).find_by_item_and_period(item.id, expected.get("source_period", baseline.get("historical_period")))
+        _assert_equal(diagnostic, f"accrual.{key}.quantity", accrual.quantity if accrual else None, Decimal(expected["quantity"]))
+        _assert_equal(diagnostic, f"accrual.{key}.estimated_cost", accrual.estimated_cost if accrual else None, Decimal(expected["estimated_cost"]))
+
+    # Idempotency through the same bytes: no duplicate facts.
+    reimport = import_close_facts(session, period_dir / "facts" / "phase2b-close-facts.json")
+    _assert_equal(diagnostic, "reimport", reimport.is_reimport, True)
+    _assert_equal(diagnostic, "accruals_total", session.query(AccrualModel).count(), baseline.get("accruals_total"))
+    _assert_equal(diagnostic, "item_allocations_total", session.query(InvoiceItemAllocationModel).count(), baseline.get("item_allocations_total"))
+    _finish(diagnostic)
+    return diagnostic
+
+
+def run_p2b_historical_accrual(period_dir: Path) -> dict[str, Any]:
+    session, baseline = _p2b_import_base(period_dir)
+    diagnostic: dict[str, Any] = {"scenario": "P2B_HISTORICAL_ACCRUAL"}
+    from bel.infrastructure.persistence.repositories import AccrualReversalRepository, AccrualRepository, ContractItemRepository
+
+    by_no, _ = _p2b_contract_maps(session)
+    for key, expected in baseline.get("accruals_expected", {}).items():
+        contract_no, item_key = key.split("/")
+        item = ContractItemRepository(session).find_by_contract_and_key(by_no[contract_no].id, item_key)
+        accrual = AccrualRepository(session).find_by_item_and_period(item.id, expected.get("source_period", baseline.get("historical_period")))
+        _assert_equal(diagnostic, f"accrual.{key}.status", accrual.status if accrual else None, expected["status"])
+        if accrual:
+            remaining_qty, remaining_cost, reversed_qty, reversed_cost = get_accrual_balance(
+                accrual, AccrualReversalRepository(session).list_for_accrual(accrual.id)
+            )
+            _assert_equal(diagnostic, f"accrual.{key}.remaining_quantity", remaining_qty, Decimal(expected["remaining_quantity"]))
+            _assert_equal(diagnostic, f"accrual.{key}.remaining_cost", remaining_cost, Decimal(expected["remaining_cost"]))
+            _assert_equal(diagnostic, f"accrual.{key}.reversed_quantity", reversed_qty, Decimal(expected.get("reversed_quantity", "0")))
+    _finish(diagnostic)
+    return diagnostic
+
+
+def run_p2b_prior_reversal(period_dir: Path) -> dict[str, Any]:
+    session, baseline = _p2b_import_base(period_dir)
+    _, by_id = _p2b_contract_maps(session)
+    preview = build_period_close_preview(session, baseline["close_period"])
+    diagnostic: dict[str, Any] = {"scenario": "P2B_PRIOR_REVERSAL"}
+    reversals = {by_id[r.contract_id].contract_no: r for r in preview.prior_accrual_reversals}
+    for key, expected in baseline.get("reversals_expected", {}).items():
+        reversal = reversals.get(key)
+        if reversal is None:
+            diagnostic.setdefault("mismatches", []).append({"field": f"missing_reversal:{key}"})
+            continue
+        _assert_equal(diagnostic, f"reversal.{key}.quantity", reversal.reversal_quantity, Decimal(expected["quantity"]))
+        _assert_equal(diagnostic, f"reversal.{key}.estimated_cost", reversal.reversal_estimated_cost, Decimal(expected["estimated_cost"]))
+        _assert_equal(diagnostic, f"reversal.{key}.remaining_quantity", reversal.projected_remaining_quantity, Decimal(expected["remaining_quantity"]))
+        _assert_equal(diagnostic, f"reversal.{key}.remaining_cost", reversal.projected_remaining_cost, Decimal(expected["remaining_cost"]))
+        _assert_equal(diagnostic, f"reversal.{key}.status", reversal.projected_status, expected["status"])
+    _assert_equal(diagnostic, "reversal_count", len(preview.prior_accrual_reversals), baseline.get("reversal_count"))
+    _finish(diagnostic)
+    return diagnostic
+
+
+def run_p2b_new_accrual(period_dir: Path) -> dict[str, Any]:
+    session, baseline = _p2b_import_base(period_dir)
+    _, by_id = _p2b_contract_maps(session)
+    accruals_before = session.query(AccrualModel).count()
+    preview = build_period_close_preview(session, baseline["close_period"])
+    diagnostic: dict[str, Any] = {"scenario": "P2B_NEW_ACCRUAL"}
+
+    requirements = {by_id[a.contract_id].contract_no: a for a in preview.new_accrual_requirements}
+    for key, expected in baseline.get("requirements_expected", {}).items():
+        requirement = requirements.get(key)
+        if requirement is None:
+            diagnostic.setdefault("mismatches", []).append({"field": f"missing_requirement:{key}"})
+            continue
+        _assert_equal(diagnostic, f"requirement.{key}.level", requirement.level, expected["level"])
+        _assert_equal(diagnostic, f"requirement.{key}.estimated_cost", requirement.estimated_cost, Decimal(expected["estimated_cost"]))
+
+    candidates = {by_id[c.contract_id].contract_no: c for c in preview.contract_level_candidates}
+    for key, expected in baseline.get("candidates_expected", {}).items():
+        candidate = candidates.get(key)
+        if candidate is None:
+            diagnostic.setdefault("mismatches", []).append({"field": f"missing_candidate:{key}"})
+            continue
+        _assert_equal(diagnostic, f"candidate.{key}.estimated_cost", candidate.estimated_cost, Decimal(expected["estimated_cost"]))
+        _assert_equal(diagnostic, f"candidate.{key}.blocking_reason", candidate.blocking_reason, expected["blocking_reason"])
+
+    # Preview is a Decision, never an INSERT.
+    _assert_equal(diagnostic, "accruals_unchanged", session.query(AccrualModel).count(), accruals_before)
+    _finish(diagnostic)
+    return diagnostic
+
+
+def run_p2b_period_close(period_dir: Path) -> dict[str, Any]:
+    session, baseline = _p2b_import_base(period_dir)
+    accruals_before = session.query(AccrualModel).count()
+    reversals_before = session.query(AccrualReversalModel).count()
+    item_alloc_before = session.query(InvoiceItemAllocationModel).count()
+    preview = build_period_close_preview(session, baseline["close_period"])
+    diagnostic: dict[str, Any] = {"scenario": "P2B_PERIOD_CLOSE"}
+
+    _assert_equal(diagnostic, "summary.reversals", len(preview.prior_accrual_reversals), baseline["summary"]["prior_accrual_reversals"])
+    _assert_equal(diagnostic, "summary.requirements", len(preview.new_accrual_requirements), baseline["summary"]["new_accrual_requirements"])
+    _assert_equal(diagnostic, "summary.candidates", len(preview.contract_level_candidates), baseline["summary"]["contract_level_candidates"])
+    _assert_equal(diagnostic, "summary.differences", len(preview.accrual_actual_differences), baseline["summary"]["accrual_actual_differences"])
+    _assert_equal(diagnostic, "summary.blockers", len(preview.blockers), baseline["summary"]["blockers"])
+
+    # Stateless recomputation: nothing may be written.
+    _assert_equal(diagnostic, "accruals_unchanged", session.query(AccrualModel).count(), accruals_before)
+    _assert_equal(diagnostic, "reversals_unchanged", session.query(AccrualReversalModel).count(), reversals_before)
+    _assert_equal(diagnostic, "item_alloc_unchanged", session.query(InvoiceItemAllocationModel).count(), item_alloc_before)
+    _finish(diagnostic)
+    return diagnostic
+
+
+def run_p2b_recompute(period_dir: Path) -> dict[str, Any]:
+    session, baseline = _p2b_import_base(period_dir)
+    by_no, by_id = _p2b_contract_maps(session)
+    recompute_contract = baseline["recompute_contract"]
+    diagnostic: dict[str, Any] = {"scenario": "P2B_RECOMPUTE"}
+
+    def candidate_nos():
+        preview = build_period_close_preview(session, baseline["close_period"])
+        return {by_id[c.contract_id].contract_no for c in preview.contract_level_candidates}
+
+    run1 = candidate_nos()
+    _assert_equal(diagnostic, "run1.has_candidate", recompute_contract in run1, True)
+
+    accruals_before = session.query(AccrualModel).count()
+    invoice = session.query(InvoiceModel).filter_by(external_invoice_key=baseline["recompute_invoice"]).one()
+    contract = by_no[recompute_contract]
+    _p2b_confirm_invoice_contract(session, invoice.id, contract.id)
+    session.commit()
+
+    run2 = candidate_nos()
+    _assert_equal(diagnostic, "run2.has_candidate", recompute_contract in run2, False)
+    # No stale Decision rows: nothing was persisted, so nothing is deleted.
+    _assert_equal(diagnostic, "accruals_unchanged", session.query(AccrualModel).count(), accruals_before)
+    _finish(diagnostic)
+    return diagnostic
+
+
 SCENARIOS = {
     "P1_IMPORT": run_p1_import,
     "P2A_INVOICE_IMPORT": run_invoice_import,
     "P2A_PAYMENT_IMPORT": run_bank_import,
     "P2A_MATCHING": run_matching,
+    "P2B_CLOSE_FACT_IMPORT": run_p2b_close_fact_import,
+    "P2B_HISTORICAL_ACCRUAL": run_p2b_historical_accrual,
+    "P2B_PRIOR_REVERSAL": run_p2b_prior_reversal,
+    "P2B_NEW_ACCRUAL": run_p2b_new_accrual,
+    "P2B_PERIOD_CLOSE": run_p2b_period_close,
+    "P2B_RECOMPUTE": run_p2b_recompute,
 }
 
 
@@ -430,6 +686,9 @@ def run_scenario(root: Path, period: str | None, scenario_id: str) -> bool:
         return True
     except AcceptanceError as exc:
         _write_report(root, scenario_id, {"scenario": scenario_id, "reason_code": exc.reason_code, **exc.diagnostic})
+        # Missing private prerequisites are FAIL on stdout; the reason code
+        # and the detailed "what evidence is missing" explanation go only
+        # to $BEL_PRIVATE_DATA_ROOT/reports/ (spec section 33).
         print(f"{scenario_id}: FAIL")
         return False
     except Exception:  # noqa: BLE001 — any unexpected error must still redact stdout

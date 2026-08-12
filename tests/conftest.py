@@ -25,6 +25,37 @@ def db_session() -> Session:
         yield session
 
 
+@pytest.fixture
+def phase2b_ledger_path(ledger_workbook_factory) -> Path:
+    from fixtures.synthetic.phase2b_close import PHASE2B_CONTRACT_HEADERS, PHASE2B_CONTRACT_ROWS
+
+    return ledger_workbook_factory(
+        PHASE2B_CONTRACT_HEADERS, PHASE2B_CONTRACT_ROWS, filename="phase2b-contracts.xlsx"
+    )
+
+
+@pytest.fixture
+def phase2b_invoices_path(invoice_workbook_factory) -> Path:
+    from fixtures.synthetic import scenarios
+    from fixtures.synthetic.phase2b_close import PHASE2B_INVOICE_ROWS
+
+    return invoice_workbook_factory(PHASE2B_INVOICE_ROWS, buyer=scenarios.BUYER, filename="phase2b-invoices.xlsx")
+
+
+@pytest.fixture
+def phase2b_close_facts_path(tmp_path) -> Path:
+    from fixtures.synthetic.phase2b_close import write_phase2b_close_facts
+
+    return write_phase2b_close_facts(tmp_path / "phase2b-close-facts.json")
+
+
+@pytest.fixture
+def phase2b_recompute_facts_path(tmp_path) -> Path:
+    from fixtures.synthetic.phase2b_close import write_recompute_fact_pack
+
+    return write_recompute_fact_pack(tmp_path / "phase2b-recompute-facts.json")
+
+
 def write_ledger_workbook(
     path: Path,
     headers: list[str],
