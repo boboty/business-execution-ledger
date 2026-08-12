@@ -133,7 +133,17 @@ def get_contract_360(session: Session, contract_id: uuid.UUID, period: str) -> C
             invoice_items = tuple(
                 ContractInvoiceItem(
                     item=item,
-                    allocations=tuple(invoice_item_allocations.get(item.id, [])),
+                    allocations=tuple(
+                        # An Invoice may reference several Contracts (the
+                        # Domain's many-to-many), but Contract360 must only
+                        # see the item allocations that belong to THIS
+                        # contract's items — an allocation owned by another
+                        # contract's item must never read as "已关联" here,
+                        # or the human would lose the manual-allocation form.
+                        a
+                        for a in invoice_item_allocations.get(item.id, [])
+                        if a.contract_item_id in item_ids
+                    ),
                 )
                 for item in InvoiceItemRepository(session).list_for_invoice(invoice.id)
             )

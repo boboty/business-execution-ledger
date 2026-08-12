@@ -167,3 +167,155 @@ def test_contract_360_get_is_zero_write(app_for_client, contract_id_by_no):
     assert response.status_code == 200
     after = _db_counts(app.state.session_factory)
     assert before == after, "GET /contracts/{id} must not write a single row"
+
+
+def _build_many_to_many_contract_ctx(tmp_path):
+    """Build the Domain's many-to-many attack: one Invoice confirmed to TWO
+    Contracts, with the item allocation belonging to Contract B only."""
+    import uuid
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from fastapi.testclient import TestClient
+
+    from bel.domain.contract import Contract, ContractItem
+    from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
+    from bel.domain.invoice import Invoice, InvoiceDirection, InvoiceItem
+    from bel.domain.matching import (
+        AllocationMatchMethod,
+        ConfirmationType,
+        InvoiceAllocation,
+        MatchCase,
+        MatchCaseStatus,
+        MatchMethod,
+    )
+    from bel.domain.accrual import InvoiceItemAllocation
+    from bel.infrastructure.persistence.database import make_engine, make_session_factory
+    from bel.infrastructure.persistence.models import Base
+    from bel.infrastructure.persistence.repositories import (
+        ContractItemRepository,
+        ContractRepository,
+        EvidenceRepository,
+        InvoiceAllocationRepository,
+        InvoiceItemAllocationRepository,
+        InvoiceItemRepository,
+        InvoiceRepository,
+        MatchCaseRepository,
+    )
+    from bel.web.app import create_app
+
+    now = datetime.now(timezone.utc)
+    db_path = tmp_path / f"m2m-{uuid.uuid4().hex[:8]}.db"
+    engine = make_engine(str(db_path))
+    Base.metadata.create_all(engine)
+
+    with make_session_factory(engine)() as session:
+        ev = EvidenceRepository(session)
+        doc = EvidenceDocument(
+            id=uuid.uuid4(), file_name="synthetic.xlsx", sha256=uuid.uuid4().hex,
+            source_type="synthetic", imported_at=now,
+        )
+        ev.add_document(doc)
+        frag = EvidenceFragment(
+            id=uuid.uuid4(), evidence_document_id=doc.id, fragment_kind=FragmentKind.EXCEL_ROW,
+            sheet_name="s1", row_number=1, locator_json=None, raw_data={}, created_at=now,
+        )
+        ev.add_fragment(frag)
+        session.flush()
+
+        def _contract(no: str) -> Contract:
+            c = Contract(
+                id=uuid.uuid4(), contract_no=no, contract_type=None, counterparty="SupplierM2M",
+                buyer="BuyerM2M", gross_amount=Decimal("1000.00"), currency="CNY", contract_date=None,
+                current_source_fragment_id=frag.id, created_at=now, updated_at=now,
+            )
+            ContractRepository(session).add(c)
+            session.flush()
+            return c
+
+        def _item(contract: Contract, key: str) -> ContractItem:
+            i = ContractItem(
+                id=uuid.uuid4(), contract_id=contract.id, source_item_key=key, sku=None,
+                product_name=f"Item {key}", specification=None, quantity=Decimal("100"), unit="件",
+                unit_price=None, gross_amount=None, tax_rate=None, net_amount=None,
+                current_source_fragment_id=frag.id, created_at=now,
+            )
+            ContractItemRepository(session).add(i)
+            session.flush()
+            return i
+
+        contract_a = _contract("PO-M2M-A")
+        contract_b = _contract("PO-M2M-B")
+        item_a = _item(contract_a, "ITEM-A")
+        item_b = _item(contract_b, "ITEM-B")
+
+        invoice = Invoice(
+            id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+            digital_invoice_no="DIGITAL-M2M-001", external_invoice_key="DIGITAL-M2M-001",
+            issue_date=__import__("datetime").date(2031, 3, 15), seller="SupplierM2M", buyer="BuyerM2M",
+            net_amount=Decimal("1000.00"), tax_amount=Decimal("0"), gross_amount=Decimal("1000.00"),
+            invoice_status=None, source_fragment_id=frag.id, created_at=now, updated_at=now,
+        )
+        InvoiceRepository(session).add(invoice)
+        session.flush()
+        line1 = InvoiceItem(
+            id=uuid.uuid4(), invoice_id=invoice.id, line_no=1, product_name="M2M Widget",
+            specification=None, unit="件", quantity=Decimal("50"), unit_price=None,
+            net_amount=Decimal("1000.00"), tax_rate=None, tax_amount=Decimal("0"),
+            gross_amount=Decimal("1000.00"), source_fragment_id=frag.id,
+        )
+        InvoiceItemRepository(session).add(line1)
+        session.flush()
+
+        def _confirm(contract: Contract) -> None:
+            match_case = MatchCase(
+                id=uuid.uuid4(), subject_type="INVOICE", subject_id=invoice.id,
+                status=MatchCaseStatus.AUTO_CONFIRMED, match_method=MatchMethod.M001,
+                created_at=now, resolved_at=now,
+            )
+            MatchCaseRepository(session).add(match_case)
+            session.flush()
+            InvoiceAllocationRepository(session).add(
+                InvoiceAllocation(
+                    id=uuid.uuid4(), invoice_id=invoice.id, contract_id=contract.id,
+                    match_case_id=match_case.id, allocated_gross_amount=invoice.gross_amount,
+                    match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                    confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=now,
+                )
+            )
+            session.flush()
+
+        # Invoice X confirmed to BOTH contracts (Domain: Invoice ↔ Contract
+        # is many-to-many).
+        _confirm(contract_a)
+        _confirm(contract_b)
+        # The item allocation belongs to Contract B's item ONLY.
+        InvoiceItemAllocationRepository(session).add(
+            InvoiceItemAllocation(
+                id=uuid.uuid4(), invoice_item_id=line1.id, contract_item_id=item_b.id,
+                allocated_quantity=Decimal("10"), allocated_net_amount=Decimal("200.00"),
+                confirmation_type="MANUAL_CONFIRMED", source_fragment_id=frag.id, created_at=now,
+            )
+        )
+        session.commit()
+        ids = {"A": str(contract_a.id), "B": str(contract_b.id)}
+
+    return TestClient(create_app(str(db_path))), ids
+
+
+def test_contract360_item_allocation_is_scoped_to_own_contract(tmp_path):
+    """Domain many-to-many attack: an Invoice confirmed to Contracts A and
+    B, with the item allocation owned by Contract B. Contract A must see
+    line 1 as 未关联 with the manual-allocation form; Contract B sees
+    已关联 without it. The allocation must never leak across contracts."""
+    client, ids = _build_many_to_many_contract_ctx(tmp_path)
+
+    page_a = client.get(f"/contracts/{ids['A']}?period={CLOSE_PERIOD_FIXTURE}").text
+    assert "DIGITAL-M2M-001" in page_a
+    assert "未关联" in page_a, "Contract A must show line 1 as unlinked"
+    assert "请选择合同商品" in page_a, "Contract A must still offer the manual-allocation form"
+
+    page_b = client.get(f"/contracts/{ids['B']}?period={CLOSE_PERIOD_FIXTURE}").text
+    assert "已关联" in page_b, "Contract B must show line 1 as linked"
+    assert "请选择合同商品" not in page_b, "Contract B must NOT offer the allocation form"
+    assert "未关联" not in page_b

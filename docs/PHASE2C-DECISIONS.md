@@ -215,6 +215,20 @@ Any write failure rolls back and leaves no Evidence/Allocation residue
 injects an OperationalError at the REAL commit — after evidence/allocation
 were flushed — and asserts zero residue plus a healthy next write).
 
+## Contract360 scopes item allocations to the current contract
+
+The frozen Domain allows one Invoice to reference several Contracts
+(Invoice ↔ Contract is many-to-many), so an InvoiceItem can carry
+allocations owned by another contract's items. `get_contract_360` builds
+each InvoiceItem's allocation list by filtering
+`allocation.contract_item_id in <current contract's item ids>` — an
+allocation owned by another contract must never read as "已关联" on this
+contract's page, or the human would lose the manual-allocation form for
+work that is genuinely still pending here. The evidence aggregation
+follows the same rule. A permanent test confirms: the same Invoice
+confirmed to Contracts A and B with the allocation owned by B shows
+"未关联" + the allocation form on A and "已关联" without it on B.
+
 ## Concurrency acceptance uses temporary FILE SQLite
 
 All committed concurrency tests run against temporary file databases
