@@ -87,10 +87,12 @@ def test_invoice_area_with_manual_allocation_state(web_client, contract_id_by_no
     assert "发票" in html
     assert "DIGITAL-CLOSE-001" in html
     assert "进项" in html
-    assert "匹配方式" in html
-    assert "AUTO_CONFIRMED" in html
+    assert "匹配依据" in html
+    assert "交易对手 + 金额唯一匹配" in html  # EXACT_COUNTERPARTY_AMOUNT_UNIQUE, human label first
+    assert "系统确定性匹配" in html  # AUTO_CONFIRMED, human label first
+    assert "AUTO_CONFIRMED" in html  # raw literal still traceable (technical detail)
     # line 1 is already linked to a contract item via the fact pack
-    assert "已关联" in html
+    assert "已确认关联" in html
     # invoice item table columns
     assert "行号" in html
     assert "未税金额" in html
@@ -101,7 +103,7 @@ def test_unallocated_invoice_item_offers_manual_allocation_form(web_client, cont
     must offer an explicit, non-preselected allocation form."""
     contract_id = contract_id_by_no["PO-CLOSE-006"]
     html = web_client.get(f"/contracts/{contract_id}?period={CLOSE_PERIOD_FIXTURE}").text
-    assert "未关联" in html
+    assert "尚未关联合同范围" in html
     assert "关联合同明细" in html
     assert "请选择合同商品" in html  # never preselected
     assert "原发票数量" in html
@@ -121,28 +123,34 @@ def test_payment_area_shows_only_allocated_payments(web_client, contract_id_by_n
 def test_accrual_balance_area(web_client, contract_id_by_no):
     contract_id = contract_id_by_no["PO-CLOSE-001"]
     html = web_client.get(f"/contracts/{contract_id}?period={CLOSE_PERIOD_FIXTURE}").text
-    assert "暂估余额" in html
+    assert "当前暂估余额" in html
     assert "2031-02" in html  # source period
     assert "100" in html  # original quantity
     assert "1200.00" in html  # original estimated cost
-    assert "剩余数量" in html
-    assert "未红冲" in html  # ACTIVE (no committed reversals)
+    assert "当前剩余数量" in html
+    # Current State (persisted) is legitimately allowed to say this —
+    # unlike Projected State, this is not a preview (spec section 5.5).
+    assert "未冲销" in html  # ACTIVE (no committed reversals)
 
 
 def test_current_period_decisions_filtered_to_contract(web_client, contract_id_by_no):
     contract_id = contract_id_by_no["PO-CLOSE-001"]
     html = web_client.get(f"/contracts/{contract_id}?period={CLOSE_PERIOD_FIXTURE}").text
-    assert "当前期间业务判断" in html
-    # S2B-01 partial reversal judgment for THIS contract
-    assert "到票数量" in html
-    assert "部分红冲" in html
+    assert "本期业务判断 · 只读预演" in html
+    # S2B-01 partial reversal judgment for THIS contract — Projected State
+    # wording only, never the bare "已红冲"/"部分红冲".
+    assert "本期到票数量" in html
+    assert "红冲后：部分冲销" in html
+    assert "已红冲" not in html
 
 
 def test_contract_with_blocker_shows_its_blocker(web_client, contract_id_by_no):
     contract_id = contract_id_by_no["PO-CLOSE-006"]
     html = web_client.get(f"/contracts/{contract_id}?period={CLOSE_PERIOD_FIXTURE}").text
     assert "ITEM_MATCH_REQUIRED_FOR_REVERSAL" in html
-    assert "已确认到票，但尚未确认发票明细对应哪个合同商品" in html
+    assert "发票已经确认到本合同，但尚未确认对应哪一项合同商品" in html
+    assert "下一步" in html
+    assert "当前版本尚不支持在此直接确认冲销范围。" in html
 
 
 def test_evidence_aggregation(web_client, contract_id_by_no):
@@ -305,17 +313,18 @@ def _build_many_to_many_contract_ctx(tmp_path):
 
 def test_contract360_item_allocation_is_scoped_to_own_contract(tmp_path):
     """Domain many-to-many attack: an Invoice confirmed to Contracts A and
-    B, with the item allocation owned by Contract B. Contract A must see
-    line 1 as 未关联 with the manual-allocation form; Contract B sees
-    已关联 without it. The allocation must never leak across contracts."""
+    B, with the item allocation owned by Contract B. Contract A must show
+    line 1 as unlinked with the manual-allocation form; Contract B shows
+    it linked without the form. The allocation must never leak across
+    contracts."""
     client, ids = _build_many_to_many_contract_ctx(tmp_path)
 
     page_a = client.get(f"/contracts/{ids['A']}?period={CLOSE_PERIOD_FIXTURE}").text
     assert "DIGITAL-M2M-001" in page_a
-    assert "未关联" in page_a, "Contract A must show line 1 as unlinked"
+    assert "尚未关联合同范围" in page_a, "Contract A must show line 1 as unlinked"
     assert "请选择合同商品" in page_a, "Contract A must still offer the manual-allocation form"
 
     page_b = client.get(f"/contracts/{ids['B']}?period={CLOSE_PERIOD_FIXTURE}").text
-    assert "已关联" in page_b, "Contract B must show line 1 as linked"
+    assert "已确认关联" in page_b, "Contract B must show line 1 as linked"
     assert "请选择合同商品" not in page_b, "Contract B must NOT offer the allocation form"
-    assert "未关联" not in page_b
+    assert "尚未关联合同范围" not in page_b

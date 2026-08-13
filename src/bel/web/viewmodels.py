@@ -1,15 +1,25 @@
-"""Web presentation layer for the Phase 2C workbench.
+"""Web presentation layer for the Phase 2C.2 workbench.
 
-Everything here is display-only: blocker meanings, status labels, fact
-field labels, and the Decision -> Fact -> Evidence trace view models.
-Blocker meanings are Presentation (spec section 8) — they never change
-what the close engine blocks. Jinja templates operate on these view
-models only; they never touch repositories.
+Everything here is display-only: blocker business copy, status labels,
+fact field labels, item-evidence presentation, and the Decision -> Fact
+-> Evidence trace view models. Jinja templates operate on these view
+models only; they never touch repositories or the Rule Engine.
+
+Phase 2C.2 four-layer UI semantic (docs/PHASE2C2-DECISIONS.md):
+  Fact ≠ Decision ≠ Projected State ≠ Execution.
+A ``PROJECTED_STATUS_LABELS`` value (e.g. "红冲后：全部冲销") describes
+what would happen if this period's Decision were executed — it must
+never be confused with ``CURRENT_STATUS_LABELS`` (e.g. "已冲销"), which
+describes an already-persisted state. Blocker meanings/titles/reasons
+are Presentation (spec section 8) — they never change what the close
+engine blocks; ``BlockerContext`` (application layer) supplies only
+already-persisted Facts, never a new judgment.
 """
 
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 from typing import Any
 
 from bel.application.contract_360 import (
@@ -34,7 +44,20 @@ from bel.application.period_close_workbench import (
     WorkbenchDifference,
     WorkbenchReversal,
 )
+from bel.domain.contract import ContractItem
 
+# ---- Blocker business copy (Presentation only — existence/type of a
+# blocker is decided exclusively by period_close.py). ----
+
+BLOCKER_TITLES = {
+    ITEM_MATCH_REQUIRED_FOR_REVERSAL: "发票已经确认到本合同，但尚未确认对应哪一项合同商品",
+    MULTIPLE_OPEN_ACCRUALS_REQUIRE_EXPLICIT_SCOPE: "存在多笔未冲销的历史暂估，无法判断本次到票归属哪一笔",
+    MULTIPLE_ITEM_ALLOCATIONS_REQUIRE_EXPLICIT_SCOPE: "发票总额已确认，但明细范围不足以自动冲销",
+    MISSING_ACCRUAL_BASIS: "已满足成本确认条件，但缺少可确认的暂估成本依据",
+}
+
+# Kept for back-compat with places that want the short one-line meaning
+# (e.g. a compact tag) alongside the fuller business card below.
 BLOCKER_MEANINGS = {
     ITEM_MATCH_REQUIRED_FOR_REVERSAL: "已确认到票，但尚未确认发票明细对应哪个合同商品",
     MULTIPLE_OPEN_ACCRUALS_REQUIRE_EXPLICIT_SCOPE: "同一商品存在多笔未结暂估，无法判断此次到票对应哪一笔",
@@ -42,9 +65,39 @@ BLOCKER_MEANINGS = {
     MISSING_ACCRUAL_BASIS: "已满足成本确认条件，但缺少可确认的暂估成本依据",
 }
 
-CANDIDATE_REASON_MEANINGS = {
-    MISSING_CONTRACT_ITEM_EVIDENCE: "缺少 ContractItem Evidence，无法定位到具体合同商品",
+BLOCKER_REASONS = {
+    ITEM_MATCH_REQUIRED_FOR_REVERSAL: (
+        "发票已经确认对应本合同，但历史暂估是按具体合同商品记录的。现有 Evidence 不能证明这张发票"
+        "对应哪一项暂估，因此系统不自动选择，也不按到票顺序猜测。"
+    ),
+    MULTIPLE_OPEN_ACCRUALS_REQUIRE_EXPLICIT_SCOPE: (
+        "同一项合同商品同时存在多笔尚未冲销的历史暂估。现有到票不能证明本次到票应冲销其中哪一笔，"
+        "因此系统不按录入顺序或金额自动选择。"
+    ),
+    MULTIPLE_ITEM_ALLOCATIONS_REQUIRE_EXPLICIT_SCOPE: (
+        "历史暂估只有当前可证明的范围，而发票存在多条明细。现有 Evidence 不能证明历史暂估原本如何"
+        "拆到这些发票明细，因此系统不自动选择其中一条作为成本来源。"
+    ),
+    MISSING_ACCRUAL_BASIS: (
+        "合同已经满足成本确认条件，但目前没有任何可用的暂估成本依据（合同级或合同商品级），"
+        "因此系统无法计算暂估金额。"
+    ),
 }
+
+BLOCKER_NEXT_STEPS = {
+    ITEM_MATCH_REQUIRED_FOR_REVERSAL: "在合同360°中把这张发票的具体明细关联到对应的合同商品。",
+    MULTIPLE_OPEN_ACCRUALS_REQUIRE_EXPLICIT_SCOPE: "明确说明本次到票应归属于哪一笔历史暂估。",
+    MULTIPLE_ITEM_ALLOCATIONS_REQUIRE_EXPLICIT_SCOPE: "补充原始暂估的商品明细，或明确本次冲销应覆盖发票的哪些明细。",
+    MISSING_ACCRUAL_BASIS: "补充该合同的暂估成本依据（合同级或合同商品级）。",
+}
+
+BLOCKER_NO_ACTION_NOTE = "当前版本尚不支持在此直接确认冲销范围。"
+
+CANDIDATE_REASON_MEANINGS = {
+    MISSING_CONTRACT_ITEM_EVIDENCE: "当前已确认到合同范围，但缺少商品明细证据，暂不能形成正式暂估。",
+}
+CANDIDATE_STATUS_LABEL = "尚不能形成正式暂估"
+CANDIDATE_GROUP_STATUS_LABEL = "待补合同商品明细"
 
 FACT_KIND_LABELS = {
     "HISTORICAL_ACCRUAL": "历史暂估事实",
@@ -67,10 +120,24 @@ FACT_FIELD_LABELS = {
     "issue_date": "开票日期",
 }
 
-STATUS_LABELS = {
-    "ACTIVE": "未红冲",
-    "PARTIALLY_REVERSED": "部分红冲",
-    "REVERSED": "已红冲",
+# Projected State — what would happen if this period's Decision were
+# executed. Must never read as an already-executed fact (spec section 3).
+PROJECTED_STATUS_LABELS = {
+    "REVERSED": "红冲后：全部冲销",
+    "PARTIALLY_REVERSED": "红冲后：部分冲销",
+    "ACTIVE": "本期不涉及红冲",
+}
+
+# Current State — derived from already-persisted Facts (Contract360's
+# 暂估余额 area). Legitimately allowed to say "已冲销" because it
+# describes what already happened, not a preview.
+CURRENT_STATUS_LABELS = {
+    "ACTIVE": "未冲销",
+    "PARTIALLY_REVERSED": "部分冲销",
+    "REVERSED": "已冲销",
+}
+
+SCOPE_LABELS = {
     "CONTRACT_ITEM": "合同明细级",
     "CONTRACT": "合同级",
 }
@@ -92,6 +159,28 @@ DIRECTION_LABELS = {
     "UNKNOWN": "未知",
 }
 
+# Technical enums that must appear as a Chinese business label in the
+# primary UI, with the raw literal kept only in technical detail (spec
+# section 7 / 11.E).
+CONFIRMATION_TYPE_LABELS = {
+    "AUTO_CONFIRMED": "系统确定性匹配",
+    "HUMAN_CONFIRMED": "人工确认",
+    "MANUAL_CONFIRMED": "人工确认",
+}
+
+MATCH_METHOD_LABELS = {
+    "EXACT_COUNTERPARTY_AMOUNT_UNIQUE": "交易对手 + 金额唯一匹配",
+}
+
+INVOICE_CONTRACT_MATCH_STATUS_LABEL = "已确认到本合同"
+
+# 未提供商品明细 — the primary business label whenever a ContractItem has
+# no product_name. Presence/absence of product_name is the ONLY signal
+# used (never a name-pattern check like "== 'ITEM-1'"): spec section 4.3.
+NO_PRODUCT_EVIDENCE_LABEL = "未提供商品明细"
+NO_PRODUCT_EVIDENCE_NOTE = "当前暂估仅有合同范围证据"
+NO_PRODUCT_EVIDENCE_COMPLETENESS = "仅合同范围"
+
 
 def _fmt(value: Any) -> str:
     if value is None:
@@ -99,6 +188,15 @@ def _fmt(value: Any) -> str:
     if isinstance(value, (int, float)):
         return f"{value:,}"
     return str(value)
+
+
+def _fmt_difference(value: Decimal | None) -> str:
+    """0.00 must never render as a bare '0' — spec section 4.7."""
+    if value is None:
+        return "—"
+    if value == 0:
+        return f"{value:,.2f} · 无差异"
+    return _fmt(value)
 
 
 def _fragment_locator(fragment) -> str:
@@ -112,6 +210,32 @@ def _fragment_locator(fragment) -> str:
     if fragment.locator_json:
         return " / ".join(f"{k}={v}" for k, v in fragment.locator_json.items())
     return "—"
+
+
+class ItemPresentationVM:
+    """The single shared rule for presenting a ContractItem's business
+    scope, used identically on every page that can show one (Period
+    Close, Contract360, Accrual Balance, Decision, Difference, Blocker —
+    spec section 4.3). The rule depends ONLY on whether ``product_name``
+    is populated, never on the value of ``source_item_key``."""
+
+    def __init__(self, item: ContractItem | None) -> None:
+        self.source_item_key = item.source_item_key if item is not None else None
+        if item is None:
+            self.display = "—"
+            self.has_product_evidence: bool | None = None
+            self.evidence_note: str | None = None
+            self.completeness_label = "—"
+        elif item.product_name:
+            self.display = item.product_name
+            self.has_product_evidence = True
+            self.evidence_note = None
+            self.completeness_label = "—"
+        else:
+            self.display = NO_PRODUCT_EVIDENCE_LABEL
+            self.has_product_evidence = False
+            self.evidence_note = NO_PRODUCT_EVIDENCE_NOTE
+            self.completeness_label = NO_PRODUCT_EVIDENCE_COMPLETENESS
 
 
 class TraceNodeVM:
@@ -148,16 +272,18 @@ class ReversalRowVM:
         self.contract_id = d.contract_id
         self.contract_no = row.contract_no
         self.counterparty = row.counterparty or "—"
-        self.item_label = row.item_label
+        self.item = ItemPresentationVM(row.item)
         self.source_period = d.source_period
         self.arrival_quantity = _fmt(d.reversal_quantity)
         self.reversal_cost = _fmt(d.reversal_estimated_cost)
         self.remaining_quantity = _fmt(d.projected_remaining_quantity)
         self.remaining_cost = _fmt(d.projected_remaining_cost)
         self.status = d.projected_status
-        self.status_label = STATUS_LABELS.get(d.projected_status, d.projected_status)
+        self.status_label = PROJECTED_STATUS_LABELS.get(d.projected_status, d.projected_status)
         diff = differences_by_key.get((d.contract_item_id, d.invoice_item_allocation_id))
-        self.difference = _fmt(diff.decision.difference) if diff is not None else "—"
+        self.raw_difference = diff.decision.difference if diff is not None else None
+        self.difference = _fmt_difference(self.raw_difference)
+        self.raw_reversal_estimated_cost = d.reversal_estimated_cost
         self.trace = _trace_vm(f"trace-reversal-{index}", list(row.trace))
 
 
@@ -167,9 +293,10 @@ class AccrualRowVM:
         self.contract_id = d.contract_id
         self.contract_no = row.contract_no
         self.counterparty = row.counterparty or "—"
-        self.item_label = row.item_label
+        self.item = ItemPresentationVM(row.item)
         self.quantity = _fmt(d.quantity)
         self.estimated_cost = _fmt(d.estimated_cost)
+        self.raw_estimated_cost = d.estimated_cost
         self.trace = _trace_vm(f"trace-accrual-{index}", list(row.trace))
 
 
@@ -180,7 +307,10 @@ class CandidateRowVM:
         self.contract_no = row.contract_no
         self.counterparty = row.counterparty or "—"
         self.estimated_cost = _fmt(d.estimated_cost)
+        self.raw_estimated_cost = d.estimated_cost
         self.missing_info = CANDIDATE_REASON_MEANINGS.get(d.blocking_reason, d.blocking_reason)
+        self.blocking_reason = d.blocking_reason
+        self.status_label = CANDIDATE_STATUS_LABEL
         self.trace = _trace_vm(f"trace-candidate-{index}", list(row.trace))
 
 
@@ -189,53 +319,125 @@ class DifferenceRowVM:
         d = row.decision
         self.contract_id = d.contract_id
         self.contract_no = row.contract_no
-        self.item_label = row.item_label
+        self.item = ItemPresentationVM(row.item)
         self.actual_net_cost = _fmt(d.actual_net_cost)
         self.reversed_estimated_cost = _fmt(d.reversed_estimated_cost)
-        self.difference = _fmt(d.difference)
+        self.raw_difference = d.difference
+        self.difference = _fmt_difference(d.difference)
         self.trace = _trace_vm(f"trace-difference-{index}", list(row.trace))
 
 
 class BlockerRowVM:
     def __init__(self, row: WorkbenchBlocker, index: int) -> None:
         b = row.blocker
+        ctx = row.context
         self.type = b.blocker_type
+        self.title = BLOCKER_TITLES.get(b.blocker_type, b.blocker_type)
+        self.reason = BLOCKER_REASONS.get(b.blocker_type, BLOCKER_MEANINGS.get(b.blocker_type, b.blocker_type))
+        self.next_step = BLOCKER_NEXT_STEPS.get(b.blocker_type, "补充相应的业务证据。")
+        self.no_action_note = BLOCKER_NO_ACTION_NOTE
         self.meaning = BLOCKER_MEANINGS.get(b.blocker_type, b.blocker_type)
         self.contract_no = row.contract_no or "—"
         self.contract_id = b.contract_id
-        self.item_label = row.item_label or "—"
-        self.accrual_ids = b.accrual_ids
+        self.item = ItemPresentationVM(row.item)
         self.index = index
+
+        known_facts: list[tuple[str, str]] = [("合同", self.contract_no)]
+        if ctx.historical_estimated_cost is not None:
+            periods = "、".join(ctx.historical_source_periods) or "—"
+            known_facts.append((f"历史暂估成本（来源期间 {periods}）", _fmt(ctx.historical_estimated_cost)))
+        if ctx.current_remaining_cost is not None:
+            known_facts.append(("当前剩余暂估成本", _fmt(ctx.current_remaining_cost)))
+        if ctx.confirmed_invoice_keys:
+            known_facts.append(("已确认发票", "、".join(ctx.confirmed_invoice_keys)))
+            known_facts.append(("已确认发票未税金额合计", _fmt(ctx.confirmed_invoice_net_total)))
+            known_facts.append(("发票明细数量", str(ctx.invoice_item_line_count)))
+        if ctx.existing_item_allocation_count:
+            known_facts.append(("已关联发票明细数量", str(ctx.existing_item_allocation_count)))
+        if ctx.cost_recognition_date is not None:
+            known_facts.append(("成本确认日期", _fmt(ctx.cost_recognition_date)))
+        self.known_facts = known_facts
 
 
 class SummaryCardVM:
-    def __init__(self, key: str, label: str, value: int) -> None:
+    def __init__(self, key: str, label: str, value: int, secondary: str, anchor: str) -> None:
         self.key = key
         self.label = label
         self.value = value
+        self.secondary = secondary
+        self.anchor = anchor
 
 
-def _summary_cards(summary: dict[str, int]) -> list[SummaryCardVM]:
+def _summary_cards(workbench: PeriodCloseWorkbench) -> list[SummaryCardVM]:
+    reversal_cost_total = sum((r.decision.reversal_estimated_cost for r in workbench.reversals), Decimal("0"))
+    accrual_cost_total = sum((a.decision.estimated_cost for a in workbench.accruals), Decimal("0"))
+    candidate_cost_total = sum((c.decision.estimated_cost for c in workbench.candidates), Decimal("0"))
+    difference_total = sum((d.decision.difference for d in workbench.differences), Decimal("0"))
+    summary = workbench.summary
     return [
-        SummaryCardVM("reversals", "历史暂估待红冲", summary.get("prior_accrual_reversals", 0)),
-        SummaryCardVM("accruals", "新增暂估", summary.get("new_accrual_requirements", 0)),
-        SummaryCardVM("candidates", "合同级待补明细", summary.get("contract_level_candidates", 0)),
-        SummaryCardVM("differences", "成本差异", summary.get("accrual_actual_differences", 0)),
-        SummaryCardVM("blockers", "阻塞项", summary.get("blockers", 0)),
+        SummaryCardVM(
+            "reversals", "本期拟红冲", summary.get("prior_accrual_reversals", 0),
+            f"拟红冲金额合计 {_fmt(reversal_cost_total)}", "reversals-section",
+        ),
+        SummaryCardVM(
+            "accruals", "新增正式暂估", summary.get("new_accrual_requirements", 0),
+            f"预计成本合计 {_fmt(accrual_cost_total)}", "accruals-section",
+        ),
+        SummaryCardVM(
+            "candidates", "待补明细候选", summary.get("contract_level_candidates", 0),
+            f"预计成本合计 {_fmt(candidate_cost_total)}", "candidates-section",
+        ),
+        SummaryCardVM(
+            "differences", "成本差异", summary.get("accrual_actual_differences", 0),
+            f"差异金额合计 {_fmt(difference_total)}", "differences-section",
+        ),
+        SummaryCardVM(
+            "blockers", "阻塞待处理", summary.get("blockers", 0),
+            "系统未自动执行", "blockers-section",
+        ),
     ]
+
+
+class CandidateSupplierGroupVM:
+    """Presentation-only supplier aggregation of Contract-level Candidate
+    rows (spec section 4.4). Never a new Fact or Decision: it groups the
+    SAME CandidateRowVM objects the raw list already contains — grouping
+    can never change the candidate count or the cost sum, and a
+    duplicated contract_no with a different counterparty/contract_id
+    stays a distinct row (and can land in a distinct group)."""
+
+    def __init__(self, counterparty: str, rows: list[CandidateRowVM]) -> None:
+        self.counterparty = counterparty
+        self.rows = rows
+        self.contract_count = len(rows)
+        self.estimated_cost_total = sum((r.raw_estimated_cost for r in rows), Decimal("0"))
+        self.estimated_cost_total_display = _fmt(self.estimated_cost_total)
+        self.status_label = CANDIDATE_GROUP_STATUS_LABEL
+
+
+def _group_candidates_by_supplier(candidates: list[CandidateRowVM]) -> list[CandidateSupplierGroupVM]:
+    groups: dict[str, list[CandidateRowVM]] = {}
+    for row in candidates:
+        groups.setdefault(row.counterparty or "—", []).append(row)
+    ordered = sorted(
+        groups.items(),
+        key=lambda kv: (-sum(r.raw_estimated_cost for r in kv[1]), kv[0]),
+    )
+    return [CandidateSupplierGroupVM(counterparty, rows) for counterparty, rows in ordered]
 
 
 class PeriodCloseVM:
     def __init__(self, workbench: PeriodCloseWorkbench) -> None:
         self.period = workbench.period
         self.available_periods = list(workbench.available_periods)
-        self.summary = _summary_cards(workbench.summary)
+        self.summary = _summary_cards(workbench)
         differences_by_key = {
             (d.decision.contract_item_id, d.decision.invoice_item_allocation_id): d for d in workbench.differences
         }
         self.reversals = [ReversalRowVM(r, i, differences_by_key) for i, r in enumerate(workbench.reversals)]
         self.accruals = [AccrualRowVM(a, i) for i, a in enumerate(workbench.accruals)]
         self.candidates = [CandidateRowVM(c, i) for i, c in enumerate(workbench.candidates)]
+        self.candidate_supplier_groups = _group_candidates_by_supplier(self.candidates)
         self.differences = [DifferenceRowVM(d, i) for i, d in enumerate(workbench.differences)]
         self.blockers = [BlockerRowVM(b, i) for i, b in enumerate(workbench.blockers)]
 
@@ -251,6 +453,7 @@ class InvoiceItemVM:
         self.raw_net_amount = item.net_amount
         self.allocations = allocations
         self.has_allocation = len(allocations) > 0
+        self.allocation_status_label = "已确认关联" if self.has_allocation else "尚未关联合同范围"
         self.contract_item_options = contract_item_options
 
 
@@ -265,9 +468,17 @@ class InvoiceVM:
         self.tax_amount = _fmt(invoice.tax_amount)
         self.gross_amount = _fmt(invoice.gross_amount)
         self.match_method = invoice360.allocation.match_method
+        self.match_method_label = MATCH_METHOD_LABELS.get(self.match_method, self.match_method)
         self.confirmation_type = invoice360.allocation.confirmation_type
+        self.confirmation_type_label = CONFIRMATION_TYPE_LABELS.get(self.confirmation_type, self.confirmation_type)
+        self.match_status_label = INVOICE_CONTRACT_MATCH_STATUS_LABEL
         contract_item_options = [
-            (item.source_item_key, item.product_name or "—") for item in contract_items if item.source_item_key
+            (
+                item.source_item_key,
+                item.product_name if item.product_name else f"{NO_PRODUCT_EVIDENCE_LABEL}（{item.source_item_key}）",
+            )
+            for item in contract_items
+            if item.source_item_key
         ]
         self.items = [InvoiceItemVM(i.item, i.allocations, contract_item_options) for i in invoice360.items]
 
@@ -281,13 +492,15 @@ class PaymentVM:
         self.amount = _fmt(payment.amount)
         self.counterparty = payment.counterparty or "—"
         self.confirmation_type = payment360.allocation.confirmation_type
+        self.confirmation_type_label = CONFIRMATION_TYPE_LABELS.get(self.confirmation_type, self.confirmation_type)
         self.match_method = payment360.allocation.match_method
+        self.match_method_label = MATCH_METHOD_LABELS.get(self.match_method, self.match_method)
 
 
 class AccrualBalanceVM:
     def __init__(self, accrual360: ContractAccrual) -> None:
         view = accrual360.view
-        self.item_label = accrual360.item.product_name if accrual360.item is not None and accrual360.item.product_name else (accrual360.item.source_item_key if accrual360.item else "—")
+        self.item = ItemPresentationVM(accrual360.item)
         self.source_period = accrual360.accrual.period
         self.original_quantity = _fmt(accrual360.accrual.quantity)
         self.original_estimated_cost = _fmt(accrual360.accrual.estimated_cost)
@@ -296,7 +509,9 @@ class AccrualBalanceVM:
         self.remaining_quantity = _fmt(view.remaining_quantity)
         self.remaining_cost = _fmt(view.remaining_estimated_cost)
         self.status = view.projected_status
-        self.status_label = STATUS_LABELS.get(view.projected_status, view.projected_status)
+        # Current State (persisted balance) — "已冲销" is legitimate here,
+        # never the Projected State labels used for this period's preview.
+        self.status_label = CURRENT_STATUS_LABELS.get(view.projected_status, view.projected_status)
 
 
 class EvidenceVM:
@@ -316,8 +531,12 @@ class EvidenceVM:
 
 class ContractItemVM:
     def __init__(self, item, accrual_balance: AccrualBalanceVM | None, requirement_item_ids: set) -> None:
+        presentation = ItemPresentationVM(item)
+        self.item = presentation
         self.source_item_key = item.source_item_key or "—"
-        self.product_name = item.product_name or "—"
+        self.product_display = presentation.display
+        self.has_product_evidence = presentation.has_product_evidence
+        self.evidence_completeness_label = presentation.completeness_label
         self.specification = item.specification or "—"
         self.quantity = _fmt(item.quantity)
         self.unit = item.unit or "—"
@@ -347,7 +566,7 @@ class ContractDecisionsVM:
 
 
 class Contract360VM:
-    def __init__(self, dto: Contract360) -> None:
+    def __init__(self, dto: Contract360, period: str) -> None:
         contract = dto.contract
         self.contract_no = contract.contract_no
         self.counterparty = contract.counterparty or "—"
@@ -357,6 +576,7 @@ class Contract360VM:
         self.contract_date = _fmt(contract.contract_date)
         self.contract_type = contract.contract_type or "—"
         self.contract_id = contract.id
+        self.period = period
 
         accrual_balances = [AccrualBalanceVM(a) for a in dto.accruals]
         accrual_balance_by_item = {

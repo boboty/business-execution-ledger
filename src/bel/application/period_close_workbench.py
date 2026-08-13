@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from bel.application.period_close import (
+    MISSING_ACCRUAL_BASIS,
     AccrualActualDifference,
     AccrualCandidate,
     AccrualRequired,
@@ -28,17 +31,20 @@ from bel.application.period_close import (
     PriorAccrualReversalRequired,
     build_period_close_preview,
 )
+from bel.domain.accrual import get_accrual_balance
 from bel.domain.contract import ContractItem
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment
-from bel.domain.invoice import InvoiceItem
+from bel.domain.invoice import InvoiceDirection, InvoiceItem
 from bel.infrastructure.persistence.repositories import (
     AccrualBasisFactRepository,
     AccrualRepository,
+    AccrualReversalRepository,
     ContractItemRepository,
     ContractRepository,
     CostRecognitionFactRepository,
     EvidenceRepository,
     HistoricalAccrualFactRepository,
+    InvoiceAllocationRepository,
     InvoiceItemAllocationRepository,
     InvoiceItemRepository,
     InvoiceRepository,
@@ -65,7 +71,7 @@ class WorkbenchReversal:
     decision: PriorAccrualReversalRequired
     contract_no: str
     counterparty: str | None
-    item_label: str
+    item: ContractItem | None
     trace: tuple[FactNode, ...]
 
 
@@ -74,7 +80,7 @@ class WorkbenchAccrual:
     decision: AccrualRequired
     contract_no: str
     counterparty: str | None
-    item_label: str
+    item: ContractItem | None
     trace: tuple[FactNode, ...]
 
 
@@ -91,15 +97,36 @@ class WorkbenchDifference:
     decision: AccrualActualDifference
     contract_no: str
     counterparty: str | None
-    item_label: str
+    item: ContractItem | None
     trace: tuple[FactNode, ...]
+
+
+@dataclass(frozen=True)
+class BlockerContext:
+    """Read-only facts composed to explain a blocker in business terms —
+    never a new judgment. Every field here is read back from an
+    already-persisted Fact or Decision; the close engine
+    (``period_close.py``) remains the ONLY source of blocker existence.
+    Fields are presentation-neutral; the Web layer owns the Chinese
+    business copy (spec section 4.5/4.6)."""
+
+    historical_source_periods: tuple[str, ...]
+    historical_estimated_cost: Decimal | None
+    current_remaining_quantity: Decimal | None
+    current_remaining_cost: Decimal | None
+    confirmed_invoice_keys: tuple[str, ...]
+    confirmed_invoice_net_total: Decimal | None
+    invoice_item_line_count: int
+    existing_item_allocation_count: int
+    cost_recognition_date: date | None
 
 
 @dataclass(frozen=True)
 class WorkbenchBlocker:
     blocker: CloseBlocker
     contract_no: str | None
-    item_label: str | None
+    item: ContractItem | None
+    context: BlockerContext
 
 
 @dataclass(frozen=True)
@@ -254,46 +281,104 @@ def get_period_close_workbench(session: Session, period: str) -> PeriodCloseWork
         contracts = {c.id: c for c in ContractRepository(session).list_all()}
         items = {i.id: i for i in ContractItemRepository(session).list_all()}
 
-        def _labels(contract_id: uuid.UUID, contract_item_id: uuid.UUID | None) -> tuple[str, str | None, str]:
+        accrual_repo = AccrualRepository(session)
+        reversal_repo = AccrualReversalRepository(session)
+        item_alloc_repo = InvoiceItemAllocationRepository(session)
+        invoice_alloc_repo = InvoiceAllocationRepository(session)
+        invoice_repo = InvoiceRepository(session)
+        invoice_item_repo = InvoiceItemRepository(session)
+        cost_recognition_facts = CostRecognitionFactRepository(session).list_all()
+
+        def _contract_and_item(
+            contract_id: uuid.UUID, contract_item_id: uuid.UUID | None
+        ) -> tuple[str, str | None, ContractItem | None]:
             contract = contracts.get(contract_id)
             contract_no = contract.contract_no if contract is not None else str(contract_id)
             counterparty = contract.counterparty if contract is not None else None
             item: ContractItem | None = items.get(contract_item_id) if contract_item_id is not None else None
-            if item is not None:
-                item_label = item.product_name or item.source_item_key or "—"
-            else:
-                item_label = "—"
-            return contract_no, counterparty, item_label
+            return contract_no, counterparty, item
+
+        def _blocker_context(blocker: CloseBlocker) -> BlockerContext:
+            """Read-only composition of the Facts around a blocker — never
+            a new judgment. See ``BlockerContext`` docstring."""
+            accrual_ids = blocker.accrual_ids or ((blocker.accrual_id,) if blocker.accrual_id is not None else ())
+            accruals = [a for a in (accrual_repo.get(aid) for aid in accrual_ids) if a is not None]
+
+            remaining_qty_total = Decimal("0")
+            remaining_cost_total = Decimal("0")
+            for accrual in accruals:
+                remaining_qty, remaining_cost, _, _ = get_accrual_balance(
+                    accrual, reversal_repo.list_for_accrual(accrual.id)
+                )
+                remaining_qty_total += remaining_qty
+                remaining_cost_total += remaining_cost
+
+            existing_item_allocation_count = (
+                len(item_alloc_repo.list_for_contract_item(blocker.contract_item_id))
+                if blocker.contract_item_id is not None
+                else 0
+            )
+
+            confirmed_invoice_keys: list[str] = []
+            confirmed_invoice_net_total = Decimal("0")
+            invoice_item_line_count = 0
+            for allocation in invoice_alloc_repo.list_for_contract(blocker.contract_id):
+                invoice = invoice_repo.get(allocation.invoice_id)
+                if invoice is None or invoice.direction != InvoiceDirection.PURCHASE:
+                    continue
+                if invoice.issue_date is None or invoice.issue_date > preview.period_end:
+                    continue
+                confirmed_invoice_keys.append(invoice.external_invoice_key or invoice.invoice_no or str(invoice.id))
+                confirmed_invoice_net_total += invoice.net_amount
+                invoice_item_line_count += len(invoice_item_repo.list_for_invoice(invoice.id))
+
+            cost_recognition_date: date | None = None
+            if blocker.blocker_type == MISSING_ACCRUAL_BASIS:
+                contract_facts = [f for f in cost_recognition_facts if f.contract_id == blocker.contract_id]
+                if contract_facts:
+                    cost_recognition_date = min(f.recognition_date for f in contract_facts)
+
+            return BlockerContext(
+                historical_source_periods=tuple(sorted({a.period for a in accruals})),
+                historical_estimated_cost=sum((a.estimated_cost for a in accruals), Decimal("0")) if accruals else None,
+                current_remaining_quantity=remaining_qty_total if accruals else None,
+                current_remaining_cost=remaining_cost_total if accruals else None,
+                confirmed_invoice_keys=tuple(confirmed_invoice_keys),
+                confirmed_invoice_net_total=confirmed_invoice_net_total if confirmed_invoice_keys else None,
+                invoice_item_line_count=invoice_item_line_count,
+                existing_item_allocation_count=existing_item_allocation_count,
+                cost_recognition_date=cost_recognition_date,
+            )
 
         reversals = []
         for reversal in preview.prior_accrual_reversals:
-            contract_no, counterparty, item_label = _labels(reversal.contract_id, reversal.contract_item_id)
+            contract_no, counterparty, item = _contract_and_item(reversal.contract_id, reversal.contract_item_id)
             reversals.append(
                 WorkbenchReversal(
                     decision=reversal,
                     contract_no=contract_no,
                     counterparty=counterparty,
-                    item_label=item_label,
+                    item=item,
                     trace=_reversal_trace(builder, reversal),
                 )
             )
 
         accruals = []
         for requirement in preview.new_accrual_requirements:
-            contract_no, counterparty, item_label = _labels(requirement.contract_id, requirement.contract_item_id)
+            contract_no, counterparty, item = _contract_and_item(requirement.contract_id, requirement.contract_item_id)
             accruals.append(
                 WorkbenchAccrual(
                     decision=requirement,
                     contract_no=contract_no,
                     counterparty=counterparty,
-                    item_label=item_label,
+                    item=item,
                     trace=_accrual_trace(builder, requirement),
                 )
             )
 
         candidates = []
         for candidate in preview.contract_level_candidates:
-            contract_no, counterparty, _ = _labels(candidate.contract_id, None)
+            contract_no, counterparty, _ = _contract_and_item(candidate.contract_id, None)
             candidates.append(
                 WorkbenchCandidate(
                     decision=candidate,
@@ -305,25 +390,26 @@ def get_period_close_workbench(session: Session, period: str) -> PeriodCloseWork
 
         differences = []
         for difference in preview.accrual_actual_differences:
-            contract_no, counterparty, item_label = _labels(difference.contract_id, difference.contract_item_id)
+            contract_no, counterparty, item = _contract_and_item(difference.contract_id, difference.contract_item_id)
             differences.append(
                 WorkbenchDifference(
                     decision=difference,
                     contract_no=contract_no,
                     counterparty=counterparty,
-                    item_label=item_label,
+                    item=item,
                     trace=_difference_trace(builder, difference),
                 )
             )
 
         blockers = []
         for blocker in preview.blockers:
-            contract_no, _, item_label = _labels(blocker.contract_id, blocker.contract_item_id)
+            contract_no, _, item = _contract_and_item(blocker.contract_id, blocker.contract_item_id)
             blockers.append(
                 WorkbenchBlocker(
                     blocker=blocker,
                     contract_no=contract_no if blocker.contract_id in contracts else None,
-                    item_label=item_label,
+                    item=item,
+                    context=_blocker_context(blocker),
                 )
             )
 

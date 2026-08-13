@@ -217,7 +217,10 @@ def test_sales_invoice_never_reads_as_purchase_arrival(tmp_path):
     html = client.get(f"/contracts/{contract_id}?period={WEB_PERIOD}").text
     assert "Accrual Required" in html
     assert "销项" in html
-    assert "部分红冲" not in html
+    # No reversal rendered at all — guard the actual Projected State
+    # wording (post-rename "部分红冲" alone would pass vacuously even if a
+    # reversal were wrongly rendered).
+    assert "红冲后" not in html
 
     page = client.get(f"/period-close?period={WEB_PERIOD}").text
     assert "Accrual Required" in page
@@ -249,5 +252,6 @@ def test_multiple_open_accruals_require_explicit_scope_in_web(tmp_path):
 
     html = client.get(f"/contracts/{contract_id}?period={WEB_PERIOD}").text
     assert MULTIPLE_OPEN_ACCRUALS_REQUIRE_EXPLICIT_SCOPE in html
-    assert "同一商品存在多笔未结暂估，无法判断此次到票对应哪一笔" in html
-    assert "部分红冲" not in html
+    assert "存在多笔未冲销的历史暂估，无法判断本次到票归属哪一笔" in html
+    # No reversal rendered at all (see Gate B comment above).
+    assert "红冲后" not in html

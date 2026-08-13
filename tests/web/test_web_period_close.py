@@ -66,30 +66,40 @@ def test_page_shows_all_decision_types(web_client):
     assert response.status_code == 200
     html = response.text
 
-    # Summary cards
-    for label in ["历史暂估待红冲", "新增暂估", "合同级待补明细", "成本差异", "阻塞项"]:
+    # Summary cards (spec section 4.1 — Phase 2C.2 relabeling)
+    for label in ["本期拟红冲", "新增正式暂估", "待补明细候选", "成本差异", "阻塞待处理"]:
         assert label in html
 
-    # Prior accrual reversal (S2B-01 partial reversal -> PARTIALLY_REVERSED)
-    assert "历史暂估待红冲" in html
-    assert "部分红冲" in html
+    # Prior accrual reversal (S2B-01 partial reversal -> PARTIALLY_REVERSED).
+    # Projected State wording only — never the bare "已红冲"/"部分红冲"
+    # (spec section 3: Projected State must not read as an already-executed
+    # fact).
+    assert "本期拟红冲" in html
+    assert "红冲后：部分冲销" in html
+    assert "已红冲" not in html
 
     # New accrual (S2B-04)
     assert "Accrual Required" in html
 
-    # Contract-level candidate (S2B-05 / S2B-08) — visually distinct
+    # Contract-level candidate (S2B-05 / S2B-08) — grouped by supplier
+    # (spec section 4.4), original per-contract candidate still visible.
+    assert "待补明细候选" in html
+    assert "个合同" in html
+    assert "缺少商品明细证据" in html
     assert "尚不能形成正式暂估" in html
-    assert "缺少 ContractItem Evidence" in html
 
     # Actual cost difference (S2B-01)
     assert "成本差异" in html
 
-    # Blockers shown first with Chinese meaning (S2B-07, MISSING_ACCRUAL_BASIS)
+    # Blockers shown as business cards with Chinese title/reason/next-step
+    # (S2B-07, MISSING_ACCRUAL_BASIS); raw code stays in technical detail.
     assert "当前有 2 项业务信息不足" in html
     assert "ITEM_MATCH_REQUIRED_FOR_REVERSAL" in html
-    assert "已确认到票，但尚未确认发票明细对应哪个合同商品" in html
+    assert "发票已经确认到本合同，但尚未确认对应哪一项合同商品" in html
     assert "MISSING_ACCRUAL_BASIS" in html
     assert "已满足成本确认条件，但缺少可确认的暂估成本依据" in html
+    assert "下一步" in html
+    assert "当前版本尚不支持在此直接确认冲销范围。" in html
 
 
 def test_decision_trace_renders_fact_and_evidence(web_client):

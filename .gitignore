@@ -17,3 +17,5 @@ __pycache__/
 # Runtime SQLite databases — schema lives in migrations/, not the binary file
 *.db
 *.db-journal
+*.db-shm
+*.db-wal

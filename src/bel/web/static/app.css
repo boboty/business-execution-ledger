@@ -126,13 +126,18 @@ body {
   margin-bottom: 24px;
 }
 .card {
+  display: block;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 14px 16px;
+  color: inherit;
+  text-decoration: none;
 }
+.card:hover { border-color: var(--line-strong); }
 .card-value { font-size: 26px; font-weight: 700; line-height: 1.1; }
 .card-label { color: var(--muted); font-size: 13px; margin-top: 4px; }
+.card-secondary { color: var(--muted); font-size: 12px; margin-top: 6px; }
 .card-danger { border-color: #d8a9a2; background: var(--danger-soft); }
 .card-danger .card-value { color: var(--danger); }
 
@@ -189,6 +194,61 @@ table.grid a:hover { text-decoration: underline; }
 .tag-none { background: var(--gray-tag); color: var(--gray-tag-ink); }
 
 .blocker-meaning { color: var(--danger); white-space: normal; min-width: 320px; }
+
+/* ---- blocker business cards (spec 4.5) ---- */
+.blocker-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--danger);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  background: var(--panel);
+}
+.blocker-card:last-child { margin-bottom: 0; }
+.blocker-card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.blocker-title { font-weight: 650; font-size: 14px; }
+.blocker-facts { margin: 0 0 10px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 20px; }
+.blocker-fact { display: flex; gap: 8px; font-size: 13px; }
+.blocker-fact dt { color: var(--muted); white-space: nowrap; }
+.blocker-fact dd { margin: 0; }
+.blocker-item-scope, .blocker-block, .blocker-next { margin: 0 0 6px; font-size: 13px; line-height: 1.6; }
+.blocker-block strong, .blocker-next strong { color: var(--ink); }
+.blocker-no-action { margin: 0 0 10px; font-size: 12px; color: var(--muted); font-style: italic; }
+.blocker-actions { margin-bottom: 8px; }
+.section-note-muted { color: var(--muted); }
+
+/* ---- candidate supplier grouping (spec 4.4) ---- */
+.candidate-group {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-bottom: 10px;
+  padding: 10px 14px;
+}
+.candidate-group:last-child { margin-bottom: 0; }
+.candidate-group-summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 4px 0;
+}
+.candidate-group-summary::-webkit-details-marker { display: none; }
+.candidate-group-name { font-weight: 650; }
+.candidate-group-meta { color: var(--muted); font-size: 13px; }
+.candidate-group-meta.num { margin-left: auto; }
+.candidate-group table.grid { margin-top: 10px; }
+
+/* ---- missing product evidence note (spec 4.3) ---- */
+.item-evidence-note { color: var(--muted); font-size: 12px; margin-top: 2px; white-space: normal; }
+
+/* ---- back link ---- */
+.back-link { margin: 0 0 10px; font-size: 13px; }
+.back-link a { color: var(--accent); text-decoration: none; }
+.back-link a:hover { text-decoration: underline; }
+
+.invoice-match-status { margin: 6px 0 8px; }
+.invoice-tech { margin-top: 6px; }
 
 /* ---- kv ---- */
 .kv-grid {
@@ -261,7 +321,7 @@ table.grid a:hover { text-decoration: underline; }
 .invoice-meta { color: var(--muted); font-size: 12px; }
 .invoice-meta.num { margin-left: auto; }
 .invoice-footer { margin-top: 8px; font-size: 12px; }
-.evidence-detail-row > td { padding-top: 0; }
+.evidence-detail-row > td, .item-tech-row > td { padding-top: 0; }
 .evidence-details { margin-top: 2px; }
 .evidence-details summary { cursor: pointer; color: var(--accent); font-size: 13px; }
 

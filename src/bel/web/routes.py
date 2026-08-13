@@ -113,7 +113,7 @@ def contract_360_page(
         dto = get_contract_360(session, contract_id, period)
     if dto is None:
         raise HTTPException(status_code=404, detail="contract not found")
-    vm = viewmodels.Contract360VM(dto)
+    vm = viewmodels.Contract360VM(dto, period)
     return _templates(request).TemplateResponse(
         request, "contract_360.html", {"page": "contract-360", "vm": vm}
     )

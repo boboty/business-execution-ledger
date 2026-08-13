@@ -20,7 +20,7 @@ def test_root_redirects_to_period_close(web_client):
 def test_period_close_page_200(web_client):
     response = web_client.get(f"/period-close?period={CLOSE_PERIOD_FIXTURE}")
     assert response.status_code == 200
-    assert "月结工作台" in response.text
+    assert "月结决策工作台" in response.text
 
 
 def test_period_close_default_period(web_client):

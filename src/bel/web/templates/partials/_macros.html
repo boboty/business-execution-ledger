@@ -1,0 +1,10 @@
+{# Shared presentation macros. `item_scope` is the ONE place that renders
+   an ItemPresentationVM's two-layer business/evidence text — every
+   template that shows a ContractItem's scope must call this instead of
+   re-deriving the fallback text inline, so there is exactly one place
+   that can be wrong (spec: Phase 2C.2 Gate A remediation). The rule
+   lives in ItemPresentationVM (src/bel/web/viewmodels.py): keyed only on
+   whether product_name was populated, never on source_item_key's value. #}
+{% macro item_scope(item) -%}
+{{ item.display }}{% if item.evidence_note %}<div class="item-evidence-note">{{ item.evidence_note }}</div>{% endif %}
+{%- endmacro %}
