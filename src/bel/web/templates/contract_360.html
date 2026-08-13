@@ -73,7 +73,7 @@
     <div class="table-scroll">
     <table class="grid">
       <thead>
-        <tr><th>行号</th><th>商品</th><th>规格</th><th>数量</th><th>未税金额</th><th>发票明细关联</th></tr>
+        <tr><th>行号</th><th>商品</th><th>规格</th><th>数量</th><th>未税金额</th><th>合同范围归属</th></tr>
       </thead>
       <tbody>
         {% for item in invoice.items %}
@@ -334,6 +334,8 @@
               <div class="trace-field"><dt>fragment id</dt><dd class="mono">{{ evidence.tech[0][1] }}</dd></div>
               <div class="trace-field"><dt>document id</dt><dd class="mono">{{ evidence.tech[1][1] }}</dd></div>
               <div class="trace-field"><dt>sha256</dt><dd class="mono">{{ evidence.tech[2][1] }}</dd></div>
+              <div class="trace-field"><dt>category</dt><dd class="mono">{{ evidence.tech[3][1] }}</dd></div>
+              <div class="trace-field"><dt>source_type</dt><dd class="mono">{{ evidence.tech[4][1] }}</dd></div>
             </dl>
           </details>
         </td>

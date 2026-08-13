@@ -693,3 +693,238 @@ def test_g_workbench_decision_payloads_still_match_the_frozen_engine(tmp_path):
 
     assert [b.blocker for b in workbench.blockers] == list(preview.blockers)
     assert workbench.summary == preview.summary
+
+
+# ---- H. Human Acceptance Fix — invoice item scope wording, blocker wording,
+# and Evidence business labels (spec section 10). None of these touch the
+# Rule Engine, Domain, or InvoiceItemAllocation semantics — Presentation
+# only, driven by the SAME already-persisted Facts (existence of an
+# allocation, and whether its target ContractItem carries real
+# product_name Evidence).
+
+
+def test_h_a_contract_scope_allocation_without_product_evidence_uses_scope_wording(tmp_path):
+    """An InvoiceItemAllocation exists, but its target ContractItem has no
+    product_name -> the page may only claim scope attribution, never the
+    stronger "confirmed to a contract item" wording, and never the
+    collapsed legacy "已确认关联" that conflated the two."""
+
+    def seed(s: _Seed):
+        c = s.contract("PO-UI-HA", "SupplierUiHotelAlpha")
+        item = s.item(c, "10", product_name=None)
+        inv = s.invoice("DIGITAL-UI-HA", "SupplierUiHotelAlpha", "2031-03-05", "10", "500.00")
+        s.confirm(inv, c)
+        s.item_allocation(inv, item, "10", "500.00")
+        return str(c.id)
+
+    client, _, contract_id = _build_app(tmp_path, seed)
+    html = client.get(f"/contracts/{contract_id}?period={UI_PERIOD}").text
+    assert "已归属本合同范围" in html
+    assert "已确认关联" not in html
+    assert "已确认到合同商品" not in html
+
+
+def test_h_b_contract_scope_allocation_with_real_product_evidence_uses_confirmed_wording(tmp_path):
+    """An InvoiceItemAllocation whose target ContractItem carries a real
+    product_name -> the stronger business label is warranted."""
+
+    def seed(s: _Seed):
+        c = s.contract("PO-UI-HB", "SupplierUiHotelBravo")
+        item = s.item(c, "10", product_name="Synthetic Product")
+        inv = s.invoice("DIGITAL-UI-HB", "SupplierUiHotelBravo", "2031-03-06", "10", "500.00")
+        s.confirm(inv, c)
+        s.item_allocation(inv, item, "10", "500.00")
+        return str(c.id)
+
+    client, _, contract_id = _build_app(tmp_path, seed)
+    html = client.get(f"/contracts/{contract_id}?period={UI_PERIOD}").text
+    assert "已确认到合同商品" in html
+
+
+def test_h_c_unallocated_invoice_item_uses_unassigned_wording(tmp_path):
+    """No InvoiceItemAllocation at all -> the unassigned wording, never
+    the legacy "尚未关联合同范围"."""
+
+    def seed(s: _Seed):
+        c = s.contract("PO-UI-HC", "SupplierUiHotelCharlie")
+        s.item(c, "10", product_name="Synthetic Product C")
+        inv = s.invoice("DIGITAL-UI-HC", "SupplierUiHotelCharlie", "2031-03-07", "10", "500.00")
+        s.confirm(inv, c)
+        return str(c.id)
+
+    client, _, contract_id = _build_app(tmp_path, seed)
+    html = client.get(f"/contracts/{contract_id}?period={UI_PERIOD}").text
+    assert "尚未归属本合同范围" in html
+    assert "尚未关联合同范围" not in html
+
+
+def test_h_d_blocker_known_facts_use_scope_attribution_wording(tmp_path):
+    """MULTIPLE_ITEM_ALLOCATIONS_REQUIRE_EXPLICIT_SCOPE's known-facts card
+    must describe the allocation count as scope attribution, never imply
+    it already resolved the reversal-scope question (spec section 5)."""
+
+    def seed(s: _Seed):
+        c = s.contract("PO-UI-HD", "SupplierUiHotelDelta", gross="2400.00")
+        item = s.item(c, "200")
+        s.accrual(item, "2031-02", "200", "2400.00")
+        inv_a = s.invoice("DIGITAL-UI-HD-A", "SupplierUiHotelDelta", "2031-03-05", "35", "455.00")
+        inv_b = s.invoice("DIGITAL-UI-HD-B", "SupplierUiHotelDelta", "2031-03-06", "40", "480.00")
+        s.confirm(inv_a, c)
+        s.confirm(inv_b, c)
+        s.item_allocation(inv_a, item, "35", "455.00")
+        s.item_allocation(inv_b, item, "40", "480.00")
+        return str(c.id)
+
+    client, app, contract_id = _build_app(tmp_path, seed)
+    with app.state.session_factory() as session:
+        preview = build_period_close_preview(session, UI_PERIOD)
+    blockers = [b for b in preview.blockers if b.blocker_type == MULTIPLE_ITEM_ALLOCATIONS_REQUIRE_EXPLICIT_SCOPE]
+    assert len(blockers) == 1
+
+    for html in (
+        client.get(f"/period-close?period={UI_PERIOD}").text,
+        client.get(f"/contracts/{contract_id}?period={UI_PERIOD}").text,
+    ):
+        assert "已归属本合同范围的发票明细数量" in html
+        assert "已关联发票明细数量" not in html
+
+
+def test_h_e_evidence_business_labels_with_raw_technical_traceability(tmp_path):
+    """Evidence's first layer must show a Chinese business label for a
+    known category/source_type — never the raw technical literal in the
+    primary row — while the raw literal stays reachable under 技术信息
+    (spec section 7/8/10.E). Uses the SAME source_type literals the real
+    importers write (import_contract_ledger.py, import_invoices.py,
+    import_bank.py, import_close_facts.py)."""
+    from bel.domain.payment import Payment
+    from bel.domain.matching import PaymentAllocation
+    from bel.infrastructure.persistence.models import Base
+    from bel.infrastructure.persistence.repositories import (
+        PaymentAllocationRepository,
+        PaymentRepository,
+    )
+    from bel.web.app import create_app
+
+    now = datetime.now(timezone.utc)
+    db_path = tmp_path / f"ui-h-e-{uuid.uuid4().hex[:8]}.db"
+    engine = make_engine(str(db_path))
+    Base.metadata.create_all(engine)
+
+    with make_session_factory(engine)() as session:
+        ev = EvidenceRepository(session)
+
+        def _doc_fragment(source_type: str, sheet: str) -> EvidenceFragment:
+            doc = EvidenceDocument(
+                id=uuid.uuid4(), file_name=f"{source_type}.dat", sha256=uuid.uuid4().hex,
+                source_type=source_type, imported_at=now,
+            )
+            ev.add_document(doc)
+            frag = EvidenceFragment(
+                id=uuid.uuid4(), evidence_document_id=doc.id, fragment_kind=FragmentKind.EXCEL_ROW,
+                sheet_name=sheet, row_number=1, locator_json=None, raw_data={}, created_at=now,
+            )
+            ev.add_fragment(frag)
+            session.flush()
+            return frag
+
+        contract_frag = _doc_fragment("contract_ledger_xlsx", "contracts")
+        item_frag = _doc_fragment("close_fact_pack_json", "facts")
+        invoice_frag = _doc_fragment("invoice_ledger_xlsx", "invoices")
+        payment_frag = _doc_fragment("cmb_bank_statement_pdf", "bank")
+
+        contract = Contract(
+            id=uuid.uuid4(), contract_no="PO-UI-HE", contract_type=None, counterparty="SupplierUiHotelEcho",
+            buyer="BuyerUI", gross_amount=Decimal("1000.00"), currency="CNY", contract_date=None,
+            current_source_fragment_id=contract_frag.id, created_at=now, updated_at=now,
+        )
+        ContractRepository(session).add(contract)
+        session.flush()
+
+        ContractItemRepository(session).add(
+            ContractItem(
+                id=uuid.uuid4(), contract_id=contract.id, source_item_key="ITEM-A", sku=None,
+                product_name="UI Widget HE", specification=None, quantity=Decimal("10"), unit="件",
+                unit_price=None, gross_amount=None, tax_rate=None, net_amount=None,
+                current_source_fragment_id=item_frag.id, created_at=now,
+            )
+        )
+        session.flush()
+
+        invoice = Invoice(
+            id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+            digital_invoice_no="DIGITAL-UI-HE", external_invoice_key="DIGITAL-UI-HE",
+            issue_date=date(2031, 3, 8), seller="SupplierUiHotelEcho", buyer="BuyerUI",
+            net_amount=Decimal("500.00"), tax_amount=Decimal("0"), gross_amount=Decimal("500.00"),
+            invoice_status=None, source_fragment_id=invoice_frag.id, created_at=now, updated_at=now,
+        )
+        InvoiceRepository(session).add(invoice)
+        session.flush()
+        invoice_match_case = MatchCase(
+            id=uuid.uuid4(), subject_type="INVOICE", subject_id=invoice.id,
+            status=MatchCaseStatus.AUTO_CONFIRMED, match_method=MatchMethod.M001,
+            created_at=now, resolved_at=now,
+        )
+        MatchCaseRepository(session).add(invoice_match_case)
+        session.flush()
+        InvoiceAllocationRepository(session).add(
+            InvoiceAllocation(
+                id=uuid.uuid4(), invoice_id=invoice.id, contract_id=contract.id,
+                match_case_id=invoice_match_case.id, allocated_gross_amount=invoice.gross_amount,
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=now,
+            )
+        )
+        session.flush()
+
+        payment = Payment(
+            id=uuid.uuid4(), transaction_date=date(2031, 3, 9), direction="OUT",
+            amount=Decimal("500.00"), counterparty="SupplierUiHotelEcho", business_type="采购款",
+            bank_reference="REF-UI-HE", description=None, running_balance=None,
+            source_fragment_id=payment_frag.id, created_at=now,
+        )
+        PaymentRepository(session).add(payment)
+        session.flush()
+        payment_match_case = MatchCase(
+            id=uuid.uuid4(), subject_type="PAYMENT", subject_id=payment.id,
+            status=MatchCaseStatus.AUTO_CONFIRMED, match_method=MatchMethod.M001,
+            created_at=now, resolved_at=now,
+        )
+        MatchCaseRepository(session).add(payment_match_case)
+        session.flush()
+        PaymentAllocationRepository(session).add(
+            PaymentAllocation(
+                id=uuid.uuid4(), payment_id=payment.id, contract_id=contract.id,
+                match_case_id=payment_match_case.id, allocated_amount=payment.amount,
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=now,
+            )
+        )
+        session.commit()
+        contract_id = str(contract.id)
+
+    client = TestClient(create_app(str(db_path)))
+    html = client.get(f"/contracts/{contract_id}?period={UI_PERIOD}").text
+
+    assert "合同证据" in html
+    assert "合同台账 Excel" in html
+    assert "发票证据" in html
+    assert "发票台账 Excel" in html
+    assert "付款证据" in html
+    assert "银行流水 PDF" in html
+    assert "月结事实包" in html  # CONTRACT_ITEM's close_fact_pack_json source
+
+    raw_values = ("contract_ledger_xlsx", "invoice_ledger_xlsx", "cmb_bank_statement_pdf", "close_fact_pack_json")
+    for raw in raw_values:
+        assert raw in html, f"{raw} must remain traceable in technical detail"
+    tech_index = html.find("技术信息")
+    assert tech_index != -1
+    for raw in raw_values:
+        assert html.find(raw, tech_index) > tech_index, f"{raw} must sit inside a 技术信息 block, not the primary row"
+
+    # Raw category codes (the Evidence dataclass's ``category`` field, e.g.
+    # "CONTRACT") must remain traceable too, alongside source_type — not
+    # only the source_type literal (Gate A-Human-Fix finding).
+    raw_categories = ("CONTRACT", "CONTRACT_ITEM", "INVOICE", "PAYMENT")
+    for raw in raw_categories:
+        idx = html.find(raw, tech_index)
+        assert idx > tech_index, f"raw category {raw} must sit inside a 技术信息 block"

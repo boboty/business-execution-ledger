@@ -91,9 +91,12 @@ def test_invoice_area_with_manual_allocation_state(web_client, contract_id_by_no
     assert "交易对手 + 金额唯一匹配" in html  # EXACT_COUNTERPARTY_AMOUNT_UNIQUE, human label first
     assert "系统确定性匹配" in html  # AUTO_CONFIRMED, human label first
     assert "AUTO_CONFIRMED" in html  # raw literal still traceable (technical detail)
-    # line 1 is already linked to a contract item via the fact pack
-    assert "已确认关联" in html
+    # line 1 is allocated to ITEM-A, which carries real product_name
+    # Evidence ("Alpha Widget") -> the strongest scope label is warranted.
+    assert "已确认到合同商品" in html
+    assert "已确认关联" not in html  # collapsed scope-attribution wording retired
     # invoice item table columns
+    assert "合同范围归属" in html
     assert "行号" in html
     assert "未税金额" in html
 
@@ -103,7 +106,7 @@ def test_unallocated_invoice_item_offers_manual_allocation_form(web_client, cont
     must offer an explicit, non-preselected allocation form."""
     contract_id = contract_id_by_no["PO-CLOSE-006"]
     html = web_client.get(f"/contracts/{contract_id}?period={CLOSE_PERIOD_FIXTURE}").text
-    assert "尚未关联合同范围" in html
+    assert "尚未归属本合同范围" in html
     assert "关联合同明细" in html
     assert "请选择合同商品" in html  # never preselected
     assert "原发票数量" in html
@@ -157,14 +160,24 @@ def test_evidence_aggregation(web_client, contract_id_by_no):
     contract_id = contract_id_by_no["PO-CLOSE-001"]
     html = web_client.get(f"/contracts/{contract_id}?period={CLOSE_PERIOD_FIXTURE}").text
     assert "证据" in html
-    assert "合同 Evidence" in html
-    assert "合同商品 Evidence" in html
-    assert "发票 Evidence" in html
-    assert "付款 Evidence" in html
-    assert "历史暂估事实 Evidence" in html
-    assert "人工明细关联 Evidence" in html
+    assert "合同证据" in html
+    assert "合同范围 / 商品明细证据" in html
+    assert "发票证据" in html
+    assert "付款证据" in html
+    assert "历史暂估证据" in html
+    assert "发票明细归属证据" in html
+    assert "月结事实包" in html  # business label for close_fact_pack_json
     assert "元数据" in html
-    assert "close_fact_pack_json" in html  # source type of fact-pack evidence
+    assert "close_fact_pack_json" in html  # raw source_type still traceable (technical detail)
+    tech_index = html.find("技术信息")
+    assert tech_index != -1 and html.find("close_fact_pack_json", tech_index) > tech_index
+
+    # Raw category codes must remain traceable too — not just source_type.
+    for raw_category in (
+        "CONTRACT", "CONTRACT_ITEM", "INVOICE", "PAYMENT", "HISTORICAL_ACCRUAL", "MANUAL_ITEM_ALLOCATION",
+    ):
+        idx = html.find(raw_category, tech_index)
+        assert idx > tech_index, f"raw category {raw_category} must be traceable inside a 技术信息 block"
 
 
 def test_contract_360_get_is_zero_write(app_for_client, contract_id_by_no):
@@ -321,10 +334,11 @@ def test_contract360_item_allocation_is_scoped_to_own_contract(tmp_path):
 
     page_a = client.get(f"/contracts/{ids['A']}?period={CLOSE_PERIOD_FIXTURE}").text
     assert "DIGITAL-M2M-001" in page_a
-    assert "尚未关联合同范围" in page_a, "Contract A must show line 1 as unlinked"
+    assert "尚未归属本合同范围" in page_a, "Contract A must show line 1 as unlinked"
     assert "请选择合同商品" in page_a, "Contract A must still offer the manual-allocation form"
 
     page_b = client.get(f"/contracts/{ids['B']}?period={CLOSE_PERIOD_FIXTURE}").text
-    assert "已确认关联" in page_b, "Contract B must show line 1 as linked"
+    # item_b carries a real product_name ("Item ITEM-B") -> the strongest label.
+    assert "已确认到合同商品" in page_b, "Contract B must show line 1 as linked to a real contract item"
     assert "请选择合同商品" not in page_b, "Contract B must NOT offer the allocation form"
-    assert "尚未关联合同范围" not in page_b
+    assert "尚未归属本合同范围" not in page_b

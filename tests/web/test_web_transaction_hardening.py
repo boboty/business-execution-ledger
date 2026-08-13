@@ -324,7 +324,9 @@ def run_h_injected_file_runtime_same_db(app, runtime) -> None:
     contract_id = _contract_id(runtime, "PO-CLOSE-006")
     response = client.post("/api/invoice-item-allocations", json=_payload(contract_id, "1", "610.00"))
     assert response.status_code == 201
-    assert "已确认关联" in client.get(f"/contracts/{contract_id}?period={WEB_PERIOD}").text, "GET must see the POST's write"
+    # PO-CLOSE-006's ITEM-A carries a real product_name ("Zeta Widget") ->
+    # the strongest scope label is warranted after the manual allocation.
+    assert "已确认到合同商品" in client.get(f"/contracts/{contract_id}?period={WEB_PERIOD}").text, "GET must see the POST's write"
     with runtime.session_factory() as session:
         assert InvoiceItemAllocationRepository(session).count() == 4  # 3 from fact pack + 1
 

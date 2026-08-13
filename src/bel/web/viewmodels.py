@@ -143,14 +143,25 @@ SCOPE_LABELS = {
 }
 
 EVIDENCE_CATEGORY_LABELS = {
-    "CONTRACT": "合同 Evidence",
-    "CONTRACT_ITEM": "合同商品 Evidence",
-    "INVOICE": "发票 Evidence",
-    "PAYMENT": "付款 Evidence",
-    "HISTORICAL_ACCRUAL": "历史暂估事实 Evidence",
-    "ACCRUAL_BASIS": "暂估依据 Evidence",
-    "COST_RECOGNITION": "成本确认 Evidence",
-    "MANUAL_ITEM_ALLOCATION": "人工明细关联 Evidence",
+    "CONTRACT": "合同证据",
+    "CONTRACT_ITEM": "合同范围 / 商品明细证据",
+    "INVOICE": "发票证据",
+    "PAYMENT": "付款证据",
+    "HISTORICAL_ACCRUAL": "历史暂估证据",
+    "ACCRUAL_BASIS": "暂估依据证据",
+    "COST_RECOGNITION": "成本确认依据",
+    "MANUAL_ITEM_ALLOCATION": "发票明细归属证据",
+}
+
+# Technical source_type literal -> business label for the primary Evidence
+# table (spec section 7/8). An unknown source_type falls back to the raw
+# value rather than being hidden; known values must never show the raw
+# literal in the primary row — the raw value stays reachable under 技术信息.
+SOURCE_TYPE_LABELS = {
+    "contract_ledger_xlsx": "合同台账 Excel",
+    "invoice_ledger_xlsx": "发票台账 Excel",
+    "cmb_bank_statement_pdf": "银行流水 PDF",
+    "close_fact_pack_json": "月结事实包",
 }
 
 DIRECTION_LABELS = {
@@ -173,6 +184,36 @@ MATCH_METHOD_LABELS = {
 }
 
 INVOICE_CONTRACT_MATCH_STATUS_LABEL = "已确认到本合同"
+
+# InvoiceItemScopePresentation (spec section 6/2) — the ladder for an
+# InvoiceItem's relationship to the CURRENT contract, kept strictly
+# separate from two other confirmation levels: Invoice -> Contract
+# (INVOICE_CONTRACT_MATCH_STATUS_LABEL above) and Historical Accrual ->
+# InvoiceItem reversal authorization (a Blocker decides that; this ladder
+# never implies it). Presentation-only: no Domain enum, no DB field.
+# Strength is judged ONLY from an existing Fact — whether an allocation's
+# target ContractItem carries real product_name Evidence — never from
+# whether the ContractItem object merely exists.
+INVOICE_ITEM_SCOPE_UNASSIGNED = "UNASSIGNED"
+INVOICE_ITEM_SCOPE_CONTRACT_SCOPE_ASSIGNED = "CONTRACT_SCOPE_ASSIGNED"
+INVOICE_ITEM_SCOPE_CONTRACT_ITEM_CONFIRMED = "CONTRACT_ITEM_CONFIRMED"
+
+INVOICE_ITEM_SCOPE_LABELS = {
+    INVOICE_ITEM_SCOPE_UNASSIGNED: "尚未归属本合同范围",
+    INVOICE_ITEM_SCOPE_CONTRACT_SCOPE_ASSIGNED: "已归属本合同范围",
+    INVOICE_ITEM_SCOPE_CONTRACT_ITEM_CONFIRMED: "已确认到合同商品",
+}
+
+
+def _invoice_item_scope_state(allocations: Any, contract_item_by_id: dict) -> str:
+    if not allocations:
+        return INVOICE_ITEM_SCOPE_UNASSIGNED
+    for allocation in allocations:
+        target = contract_item_by_id.get(allocation.contract_item_id)
+        if target is not None and target.product_name:
+            return INVOICE_ITEM_SCOPE_CONTRACT_ITEM_CONFIRMED
+    return INVOICE_ITEM_SCOPE_CONTRACT_SCOPE_ASSIGNED
+
 
 # 未提供商品明细 — the primary business label whenever a ContractItem has
 # no product_name. Presence/absence of product_name is the ONLY signal
@@ -353,7 +394,7 @@ class BlockerRowVM:
             known_facts.append(("已确认发票未税金额合计", _fmt(ctx.confirmed_invoice_net_total)))
             known_facts.append(("发票明细数量", str(ctx.invoice_item_line_count)))
         if ctx.existing_item_allocation_count:
-            known_facts.append(("已关联发票明细数量", str(ctx.existing_item_allocation_count)))
+            known_facts.append(("已归属本合同范围的发票明细数量", str(ctx.existing_item_allocation_count)))
         if ctx.cost_recognition_date is not None:
             known_facts.append(("成本确认日期", _fmt(ctx.cost_recognition_date)))
         self.known_facts = known_facts
@@ -443,7 +484,7 @@ class PeriodCloseVM:
 
 
 class InvoiceItemVM:
-    def __init__(self, item, allocations, contract_item_options) -> None:
+    def __init__(self, item, allocations, contract_item_options, contract_item_by_id: dict) -> None:
         self.line_no = item.line_no
         self.product_name = item.product_name or "—"
         self.specification = item.specification or "—"
@@ -453,7 +494,8 @@ class InvoiceItemVM:
         self.raw_net_amount = item.net_amount
         self.allocations = allocations
         self.has_allocation = len(allocations) > 0
-        self.allocation_status_label = "已确认关联" if self.has_allocation else "尚未关联合同范围"
+        self.scope_state = _invoice_item_scope_state(allocations, contract_item_by_id)
+        self.allocation_status_label = INVOICE_ITEM_SCOPE_LABELS[self.scope_state]
         self.contract_item_options = contract_item_options
 
 
@@ -480,7 +522,11 @@ class InvoiceVM:
             for item in contract_items
             if item.source_item_key
         ]
-        self.items = [InvoiceItemVM(i.item, i.allocations, contract_item_options) for i in invoice360.items]
+        contract_item_by_id = {item.id: item for item in contract_items}
+        self.items = [
+            InvoiceItemVM(i.item, i.allocations, contract_item_options, contract_item_by_id)
+            for i in invoice360.items
+        ]
 
 
 class PaymentVM:
@@ -516,9 +562,11 @@ class AccrualBalanceVM:
 
 class EvidenceVM:
     def __init__(self, evidence: ContractEvidence) -> None:
+        self.category_raw = evidence.category
         self.category = EVIDENCE_CATEGORY_LABELS.get(evidence.category, evidence.category)
         self.label = evidence.label
-        self.source_type = evidence.document.source_type
+        self.source_type_raw = evidence.document.source_type
+        self.source_type = SOURCE_TYPE_LABELS.get(self.source_type_raw, self.source_type_raw)
         self.locator = _fragment_locator(evidence.fragment)
         self.time = _fmt(evidence.fragment.created_at)
         self.metadata_items = sorted(evidence.fragment.raw_data.items())
@@ -526,6 +574,8 @@ class EvidenceVM:
             ("fragment id", str(evidence.fragment.id)),
             ("document id", str(evidence.document.id)),
             ("sha256", evidence.document.sha256),
+            ("category", self.category_raw),
+            ("source_type", self.source_type_raw),
         ]
 
 
