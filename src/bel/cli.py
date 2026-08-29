@@ -30,6 +30,15 @@ from bel.application.list_matches import list_match_cases
 from bel.application.matching import confirm_match, match_invoices, match_payments
 from bel.application.period_close import build_period_close_preview
 from bel.application.search_contracts import search_contracts_by_no
+from bel.application.procurement_sales_link import (
+    ProcurementSalesLinkFactError,
+    execute_add_procurement_sales_link,
+    execute_correct_procurement_sales_link,
+    execute_reestablish_procurement_sales_link,
+    get_relationship_history,
+    list_current_links_for_procurement_contract,
+    list_current_links_for_sales_contract,
+)
 from bel.application.sales_contract_facts import (
     SalesContractFactError,
     execute_correct_sales_contract_fact,
@@ -1275,6 +1284,193 @@ def sales_contract_list(ctx: click.Context) -> None:
         click.echo(
             f"  {sc.id} our_entity={sc.our_entity!r} sales_contract_no={sc.sales_contract_no!r} "
             f"customer={sc.customer!r}"
+        )
+
+
+@cli.group("sales-link")
+def sales_link_group() -> None:
+    """ProcurementSalesLink Fact maintenance (Phase 2D.1-R3a Slice 2):
+    add / correct / invalidate / reestablish the confirmed
+    procurement-Contract <-> SalesContract relationship, and inspect its
+    history. A human confirmation IS Evidence — every command here
+    creates its own MANUAL_FACT fragment. Never apportions any amount or
+    quantity across the bridge."""
+
+
+@sales_link_group.command("add")
+@click.option("--procurement-contract", "procurement_contract_id", type=click.UUID, required=True)
+@click.option("--sales-contract", "sales_contract_id", type=click.UUID, required=True)
+@click.pass_context
+def sales_link_add(ctx: click.Context, procurement_contract_id, sales_contract_id) -> None:
+    """ADD: assert a confirmed relationship for a business key that has
+    never existed before (no current, no retired episode). If the
+    business key has retired history, this is rejected — use `reestablish`
+    instead. A duplicate ADD for an already-current pair is an idempotent
+    replay or corroborating Evidence, never a second episode."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_add_procurement_sales_link(
+                session, procurement_contract_id=procurement_contract_id, sales_contract_id=sales_contract_id
+            )
+    except ProcurementSalesLinkFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    if result.created:
+        outcome = "created"
+    elif result.replay:
+        outcome = "already exists (exact replay — same Evidence)"
+    elif result.corroborating:
+        outcome = "already exists (corroborating Evidence — different fragment, same relationship)"
+    else:
+        outcome = "already exists"
+    click.echo(
+        f"ProcurementSalesLink {result.link.id} {outcome}: procurement_contract={result.link.procurement_contract_id} "
+        f"sales_contract={result.link.sales_contract_id} confirmation_type={result.link.confirmation_type}"
+    )
+
+
+@sales_link_group.command("correct")
+@click.option("--superseded-link", "superseded_link_id", type=click.UUID, required=True)
+@click.option("--replacement-procurement-contract", "replacement_procurement_contract_id", type=click.UUID, default=None)
+@click.option("--replacement-sales-contract", "replacement_sales_contract_id", type=click.UUID, default=None)
+@click.pass_context
+def sales_link_correct(
+    ctx: click.Context, superseded_link_id, replacement_procurement_contract_id, replacement_sales_contract_id
+) -> None:
+    """CORRECT: retire a CURRENT episode with a replacement relationship
+    (pass both --replacement-* options) — use `invalidate` instead for a
+    pure invalidation with no replacement. Always HUMAN_CONFIRMED."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_correct_procurement_sales_link(
+                session,
+                superseded_link_id=superseded_link_id,
+                replacement_procurement_contract_id=replacement_procurement_contract_id,
+                replacement_sales_contract_id=replacement_sales_contract_id,
+            )
+    except ProcurementSalesLinkFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    replay_note = " (idempotent replay — no new correction)" if result.replay else ""
+    replacement_note = f" replacement={result.replacement_link.id}" if result.replacement_link else " (pure invalidation)"
+    click.echo(f"ProcurementSalesLink {superseded_link_id} corrected{replay_note}:{replacement_note}")
+
+
+@sales_link_group.command("invalidate")
+@click.option("--superseded-link", "superseded_link_id", type=click.UUID, required=True)
+@click.pass_context
+def sales_link_invalidate(ctx: click.Context, superseded_link_id) -> None:
+    """Pure INVALIDATE: retire a CURRENT episode with no replacement —
+    the relationship simply does not exist. Shorthand for `correct` with
+    no --replacement-* options."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_correct_procurement_sales_link(session, superseded_link_id=superseded_link_id)
+    except ProcurementSalesLinkFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    replay_note = " (idempotent replay — no new correction)" if result.replay else ""
+    click.echo(f"ProcurementSalesLink {superseded_link_id} invalidated{replay_note}")
+
+
+@sales_link_group.command("reestablish")
+@click.option("--procurement-contract", "procurement_contract_id", type=click.UUID, required=True)
+@click.option("--sales-contract", "sales_contract_id", type=click.UUID, required=True)
+@click.pass_context
+def sales_link_reestablish(ctx: click.Context, procurement_contract_id, sales_contract_id) -> None:
+    """REESTABLISH: the business key has a retired episode and no
+    current one. Always HUMAN_CONFIRMED, always requires genuinely new
+    Evidence — never resurrects the old episode, always writes a new
+    one."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_reestablish_procurement_sales_link(
+                session, procurement_contract_id=procurement_contract_id, sales_contract_id=sales_contract_id
+            )
+    except ProcurementSalesLinkFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    click.echo(f"ProcurementSalesLink {result.link.id} reestablished: confirmation_type={result.link.confirmation_type}")
+
+
+@sales_link_group.command("history")
+@click.option("--procurement-contract", "procurement_contract_id", type=click.UUID, required=True)
+@click.option("--sales-contract", "sales_contract_id", type=click.UUID, required=True)
+@click.pass_context
+def sales_link_history(ctx: click.Context, procurement_contract_id, sales_contract_id) -> None:
+    """List every assertion episode ever recorded for this business key,
+    oldest first, each annotated CURRENT or retired-by-<correction id>."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        history = get_relationship_history(session, procurement_contract_id, sales_contract_id)
+    if not history:
+        click.echo(f"No episodes for ({procurement_contract_id}, {sales_contract_id})")
+        return
+
+    click.echo(f"Relationship ({procurement_contract_id}, {sales_contract_id}) — {len(history)} episode(s):")
+    for entry in history:
+        marker = " [CURRENT]" if entry.current else f" [retired by correction {entry.correction.id}]"
+        click.echo(
+            f"  {entry.episode.id}{marker} confirmation_type={entry.episode.confirmation_type} "
+            f"source_fragment={entry.episode.source_fragment_id} created_at={entry.episode.created_at}"
+        )
+
+
+@sales_link_group.command("list")
+@click.option("--procurement-contract", "procurement_contract_id", type=click.UUID, default=None)
+@click.option("--sales-contract", "sales_contract_id", type=click.UUID, default=None)
+@click.pass_context
+def sales_link_list(ctx: click.Context, procurement_contract_id, sales_contract_id) -> None:
+    """List current links for one procurement Contract OR one
+    SalesContract (pass exactly one). Enumerates only — never sums or
+    aggregates any amount/quantity across the bridge."""
+    if (procurement_contract_id is None) == (sales_contract_id is None):
+        click.echo("Error: pass exactly one of --procurement-contract or --sales-contract")
+        raise SystemExit(1)
+
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        if procurement_contract_id is not None:
+            links = list_current_links_for_procurement_contract(session, procurement_contract_id)
+        else:
+            links = list_current_links_for_sales_contract(session, sales_contract_id)
+    if not links:
+        click.echo("No current ProcurementSalesLinks")
+        return
+
+    click.echo(f"Current ProcurementSalesLinks — {len(links)}:")
+    for link in links:
+        click.echo(
+            f"  {link.id} procurement_contract={link.procurement_contract_id} sales_contract={link.sales_contract_id} "
+            f"confirmation_type={link.confirmation_type}"
         )
 
 

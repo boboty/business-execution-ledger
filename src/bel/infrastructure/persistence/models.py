@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    DDL,
     JSON,
     CheckConstraint,
     Date,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -367,6 +369,122 @@ class SalesContractRevisionModel(Base):
     # predecessor.
     asserted_field_names: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ProcurementSalesLinkModel(Base):
+    """One confirmed assertion episode (Phase 2D.1-R3a Slice 2,
+    docs/PHASE2D1-R0-DECISIONS.md section 2.4). Deliberately NOT an
+    anchor+revision Fact: there is no field to supplement or correct in
+    place — a link row is immutable from the moment it is written.
+    Correction happens at the relationship level via
+    `ProcurementSalesLinkCorrectionModel`, never by editing this row.
+
+    No `UniqueConstraint` on `(procurement_contract_id, sales_contract_id)`
+    — that would make `REESTABLISH` impossible, since a business key may
+    legitimately accumulate several episodes over time (at most one
+    current). The one-current-per-business-key invariant instead lives
+    in two places, deliberately redundant:
+
+    1. `ProcurementSalesLinkRepository.insert_episode_if_no_current` —
+       a single atomic `INSERT ... SELECT ... WHERE NOT EXISTS (...)`
+       statement (never a separate check-then-insert) that only
+       succeeds when no un-superseded episode already exists for the
+       target business key.
+    2. `trg_procurement_sales_links_one_current` (registered below via
+       `event.listen`, defined in the R3a Slice 2 migration) — a genuine
+       storage-level backstop that aborts ANY insert (including an ORM
+       bypass that skips the repository entirely) that would create a
+       second current episode for a business key, evaluated against the
+       SAME `ProcurementSalesLinkCorrectionModel` lineage that defines
+       `current()` everywhere else. No plain (partial) unique index can
+       express this predicate — it depends on a different table."""
+
+    __tablename__ = "procurement_sales_links"
+    __table_args__ = (
+        CheckConstraint(
+            "confirmation_type IN ('AUTO_CONFIRMED', 'HUMAN_CONFIRMED')",
+            name="ck_procurement_sales_links_confirmation_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    procurement_contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    sales_contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sales_contracts.id"), nullable=False, index=True)
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    confirmation_type: Mapped[str] = mapped_column(String, nullable=False)  # AUTO_CONFIRMED / HUMAN_CONFIRMED
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ProcurementSalesLinkCorrectionModel(Base):
+    """An append-only correction Fact retiring exactly one assertion
+    episode (docs/PHASE2D1-R0-DECISIONS.md section 2.4). Never updated
+    after insert; `superseded_link_id` is UNIQUE so a correction chain
+    can never fork (an episode may be superseded at most once)."""
+
+    __tablename__ = "procurement_sales_link_corrections"
+    __table_args__ = (
+        CheckConstraint(
+            "confirmation_type = 'HUMAN_CONFIRMED'", name="ck_procurement_sales_link_corrections_confirmation_type"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    superseded_link_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("procurement_sales_links.id"), nullable=False, unique=True
+    )
+    replacement_link_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("procurement_sales_links.id"), nullable=True
+    )
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    # V1-frozen to HUMAN_CONFIRMED only (docs/PHASE2D1-R0-DECISIONS.md:
+    # "a V1 correction record is therefore always HUMAN_CONFIRMED") — the
+    # CHECK constraint above enforces this even against an ORM bypass;
+    # the column itself is a plain String so both models can share the
+    # same ConfirmationType vocabulary conceptually.
+    confirmation_type: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+# Storage-level "at most one current episode per relationship business
+# key" backstop — see ProcurementSalesLinkModel's docstring. This cannot
+# be a declarative Index/CheckConstraint (SQLite partial indexes and
+# CHECK constraints cannot reference another table), so it is a trigger,
+# registered via SQLAlchemy DDL events so `Base.metadata.create_all()`
+# (used by in-memory test fixtures) creates it identically to
+# `alembic upgrade head` (see the R3a Slice 2 migration, which issues the
+# same SQL). Attached to the CORRECTIONS table's create/drop events since
+# SQLAlchemy creates tables in FK-dependency order (links before
+# corrections) and drops them in reverse — this guarantees both tables
+# already exist when the trigger is created, and the trigger is dropped
+# before either table goes away.
+_ONE_CURRENT_LINK_TRIGGER_SQL = """
+CREATE TRIGGER trg_procurement_sales_links_one_current
+BEFORE INSERT ON procurement_sales_links
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM procurement_sales_links existing
+    WHERE existing.procurement_contract_id = NEW.procurement_contract_id
+      AND existing.sales_contract_id = NEW.sales_contract_id
+      AND NOT EXISTS (
+          SELECT 1 FROM procurement_sales_link_corrections c
+          WHERE c.superseded_link_id = existing.id
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'one current assertion episode per relationship business key');
+END;
+"""
+
+event.listen(
+    ProcurementSalesLinkCorrectionModel.__table__,
+    "after_create",
+    DDL(_ONE_CURRENT_LINK_TRIGGER_SQL),
+)
+event.listen(
+    ProcurementSalesLinkCorrectionModel.__table__,
+    "before_drop",
+    DDL("DROP TRIGGER IF EXISTS trg_procurement_sales_links_one_current"),
+)
 
 
 class BusinessEventModel(Base):

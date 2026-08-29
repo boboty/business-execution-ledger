@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import select, text, update
+from sqlalchemy import literal, select, text, update
 from sqlalchemy.orm import Session
 
 from bel.domain.accrual import (
@@ -28,6 +28,7 @@ from bel.domain.exception import TaskException
 from bel.domain.invoice import Invoice, InvoiceItem
 from bel.domain.matching import InvoiceAllocation, MatchCandidate, MatchCase, PaymentAllocation
 from bel.domain.payment import Payment
+from bel.domain.procurement_sales_link import ProcurementSalesLink, ProcurementSalesLinkCorrection
 from bel.domain.sales_contract import SalesContract, SalesContractRevision, SalesContractRevisionType
 from bel.domain.shipment import Shipment, ShipmentRevision, ShipmentRevisionType
 from bel.infrastructure.persistence.models import (
@@ -51,6 +52,8 @@ from bel.infrastructure.persistence.models import (
     MatchCaseModel,
     PaymentAllocationModel,
     PaymentModel,
+    ProcurementSalesLinkCorrectionModel,
+    ProcurementSalesLinkModel,
     SalesContractModel,
     SalesContractRevisionModel,
     ShipmentModel,
@@ -1172,6 +1175,217 @@ class SalesContractRepository:
 
     def count(self) -> int:
         return len(self._session.scalars(select(SalesContractModel.id)).all())
+
+
+def _link_to_domain(m: ProcurementSalesLinkModel) -> ProcurementSalesLink:
+    return ProcurementSalesLink(
+        id=m.id,
+        procurement_contract_id=m.procurement_contract_id,
+        sales_contract_id=m.sales_contract_id,
+        source_fragment_id=m.source_fragment_id,
+        confirmation_type=m.confirmation_type,
+        created_at=m.created_at,
+    )
+
+
+def _correction_to_domain(m: ProcurementSalesLinkCorrectionModel) -> ProcurementSalesLinkCorrection:
+    return ProcurementSalesLinkCorrection(
+        id=m.id,
+        superseded_link_id=m.superseded_link_id,
+        replacement_link_id=m.replacement_link_id,
+        source_fragment_id=m.source_fragment_id,
+        confirmation_type=m.confirmation_type,
+        created_at=m.created_at,
+    )
+
+
+class ProcurementSalesLinkRepository:
+    """Anchor-free Fact storage for `ProcurementSalesLink` /
+    `ProcurementSalesLinkCorrection` (Phase 2D.1-R3a Slice 2,
+    docs/PHASE2D1-R0-DECISIONS.md section 2.4). Unlike every other
+    repository in this module, there is no anchor+revision assembly here
+    — a link row IS the Fact, in full, forever; ``current()`` is a
+    computed predicate over the corrections table, resolved in exactly
+    ONE shared place (this class), exactly as
+    ``get_accrual_balance``/``is_open_accrual`` are the shared predicates
+    for accrual state.
+
+    ``insert_episode_if_no_current`` / ``add_correction_if_uncorrected``
+    are the ONLY write primitives, and both are single atomic
+    ``INSERT ... SELECT ... WHERE NOT EXISTS (...)`` statements — never a
+    separate "check current, then insert" round trip, which is exactly
+    the race ``if repo.find_current() is None: insert()`` would lose
+    under two concurrent sessions. The `NOT EXISTS` predicate is
+    evaluated by SQLite as part of the SAME statement that performs the
+    write, so two competing inserts for the same business key (or the
+    same ``superseded_link_id``) can never both succeed — SQLite executes
+    one write statement at a time. The
+    ``trg_procurement_sales_links_one_current`` trigger (declared in
+    models.py) is a second, independent backstop against the same
+    invariant for any write that bypasses this repository entirely (a
+    raw ORM ``session.add``); ``superseded_link_id UNIQUE`` on the
+    corrections table plays the identical backstop role for corrections.
+
+    No method here ever inspects ``created_at`` to decide which episode
+    is current — that is exclusively a function of whether a correction
+    names it as ``superseded_link_id``."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def get(self, link_id: uuid.UUID) -> ProcurementSalesLink | None:
+        m = self._session.get(ProcurementSalesLinkModel, link_id)
+        return _link_to_domain(m) if m else None
+
+    def is_current(self, link_id: uuid.UUID) -> bool:
+        """The ONE shared current-predicate
+        (docs/PHASE2D1-R0-DECISIONS.md: ``current(link) ⟺ no correction
+        record names it as superseded_link_id``)."""
+        corrected = self._session.scalar(
+            select(ProcurementSalesLinkCorrectionModel.id).where(
+                ProcurementSalesLinkCorrectionModel.superseded_link_id == link_id
+            )
+        )
+        return corrected is None
+
+    def get_current_link(
+        self, procurement_contract_id: uuid.UUID, sales_contract_id: uuid.UUID
+    ) -> ProcurementSalesLink | None:
+        """The current episode for a relationship business key, if any.
+        ``.scalar()`` deliberately raises if the storage-level invariant
+        were ever somehow violated (more than one un-superseded episode
+        for the same key) rather than silently picking one — that would
+        be a bug worth surfacing loudly, never guessed past."""
+        corrected_ids = select(ProcurementSalesLinkCorrectionModel.superseded_link_id)
+        m = self._session.scalar(
+            select(ProcurementSalesLinkModel).where(
+                ProcurementSalesLinkModel.procurement_contract_id == procurement_contract_id,
+                ProcurementSalesLinkModel.sales_contract_id == sales_contract_id,
+                ProcurementSalesLinkModel.id.not_in(corrected_ids),
+            )
+        )
+        return _link_to_domain(m) if m else None
+
+    def list_episodes(
+        self, procurement_contract_id: uuid.UUID, sales_contract_id: uuid.UUID
+    ) -> list[ProcurementSalesLink]:
+        """Every episode (current and retired) ever asserted for this
+        business key — the full audit trail. Ordered by
+        ``(created_at, id)`` purely for deterministic DISPLAY; this
+        ordering is never used to decide which episode is current."""
+        rows = self._session.scalars(
+            select(ProcurementSalesLinkModel)
+            .where(
+                ProcurementSalesLinkModel.procurement_contract_id == procurement_contract_id,
+                ProcurementSalesLinkModel.sales_contract_id == sales_contract_id,
+            )
+            .order_by(ProcurementSalesLinkModel.created_at, ProcurementSalesLinkModel.id)
+        )
+        return [_link_to_domain(m) for m in rows]
+
+    def list_current_links_for_procurement_contract(
+        self, procurement_contract_id: uuid.UUID
+    ) -> list[ProcurementSalesLink]:
+        corrected_ids = select(ProcurementSalesLinkCorrectionModel.superseded_link_id)
+        rows = self._session.scalars(
+            select(ProcurementSalesLinkModel)
+            .where(
+                ProcurementSalesLinkModel.procurement_contract_id == procurement_contract_id,
+                ProcurementSalesLinkModel.id.not_in(corrected_ids),
+            )
+            .order_by(ProcurementSalesLinkModel.created_at, ProcurementSalesLinkModel.id)
+        )
+        return [_link_to_domain(m) for m in rows]
+
+    def list_current_links_for_sales_contract(self, sales_contract_id: uuid.UUID) -> list[ProcurementSalesLink]:
+        corrected_ids = select(ProcurementSalesLinkCorrectionModel.superseded_link_id)
+        rows = self._session.scalars(
+            select(ProcurementSalesLinkModel)
+            .where(
+                ProcurementSalesLinkModel.sales_contract_id == sales_contract_id,
+                ProcurementSalesLinkModel.id.not_in(corrected_ids),
+            )
+            .order_by(ProcurementSalesLinkModel.created_at, ProcurementSalesLinkModel.id)
+        )
+        return [_link_to_domain(m) for m in rows]
+
+    def insert_episode_if_no_current(self, link: ProcurementSalesLink) -> bool:
+        """The ONLY way to create a new assertion episode. Succeeds
+        (returns ``True``) only if no un-superseded episode already
+        exists for ``(link.procurement_contract_id,
+        link.sales_contract_id)`` — evaluated as part of the SAME
+        statement, so this is the storage-level primitive both `ADD` and
+        `REESTABLISH` share; they differ only in the application-layer
+        precondition (whether history exists) checked before calling
+        this, never in the write itself."""
+        links = ProcurementSalesLinkModel.__table__
+        corrections = ProcurementSalesLinkCorrectionModel.__table__
+        existing = links.alias("existing")
+        blocking_current = (
+            select(existing.c.id)
+            .where(
+                existing.c.procurement_contract_id == link.procurement_contract_id,
+                existing.c.sales_contract_id == link.sales_contract_id,
+            )
+            .where(~select(corrections.c.id).where(corrections.c.superseded_link_id == existing.c.id).exists())
+        )
+        select_values = select(
+            literal(link.id, type_=links.c.id.type),
+            literal(link.procurement_contract_id, type_=links.c.procurement_contract_id.type),
+            literal(link.sales_contract_id, type_=links.c.sales_contract_id.type),
+            literal(link.source_fragment_id, type_=links.c.source_fragment_id.type),
+            literal(link.confirmation_type, type_=links.c.confirmation_type.type),
+            literal(link.created_at, type_=links.c.created_at.type),
+        ).where(~blocking_current.exists())
+        stmt = links.insert().from_select(
+            ["id", "procurement_contract_id", "sales_contract_id", "source_fragment_id", "confirmation_type", "created_at"],
+            select_values,
+        )
+        result = self._session.execute(stmt)
+        self._session.flush()
+        return result.rowcount == 1
+
+    def get_correction_for_superseded(self, superseded_link_id: uuid.UUID) -> ProcurementSalesLinkCorrection | None:
+        m = self._session.scalar(
+            select(ProcurementSalesLinkCorrectionModel).where(
+                ProcurementSalesLinkCorrectionModel.superseded_link_id == superseded_link_id
+            )
+        )
+        return _correction_to_domain(m) if m else None
+
+    def add_correction_if_uncorrected(self, correction: ProcurementSalesLinkCorrection) -> bool:
+        """The ONLY way to write a correction. Succeeds only if no
+        correction already names ``correction.superseded_link_id`` —
+        evaluated atomically as part of the SAME insert statement, the
+        same technique as ``insert_episode_if_no_current``. This is what
+        makes ``superseded_link_id`` semantically unique even under
+        concurrent competing corrections, independent of the DB-level
+        ``UNIQUE`` constraint on that column (which remains as a second,
+        ORM-bypass-proof backstop)."""
+        corrections = ProcurementSalesLinkCorrectionModel.__table__
+        existing = corrections.alias("existing")
+        already_corrected = select(existing.c.id).where(existing.c.superseded_link_id == correction.superseded_link_id)
+        select_values = select(
+            literal(correction.id, type_=corrections.c.id.type),
+            literal(correction.superseded_link_id, type_=corrections.c.superseded_link_id.type),
+            literal(correction.replacement_link_id, type_=corrections.c.replacement_link_id.type),
+            literal(correction.source_fragment_id, type_=corrections.c.source_fragment_id.type),
+            literal(correction.confirmation_type, type_=corrections.c.confirmation_type.type),
+            literal(correction.created_at, type_=corrections.c.created_at.type),
+        ).where(~already_corrected.exists())
+        stmt = corrections.insert().from_select(
+            [
+                "id", "superseded_link_id", "replacement_link_id", "source_fragment_id", "confirmation_type",
+                "created_at",
+            ],
+            select_values,
+        )
+        result = self._session.execute(stmt)
+        self._session.flush()
+        return result.rowcount == 1
+
+    def count(self) -> int:
+        return len(self._session.scalars(select(ProcurementSalesLinkModel.id)).all())
 
 
 class ExceptionRepository:

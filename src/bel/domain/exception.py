@@ -53,6 +53,39 @@ class ExceptionType:
     # carries an unresolved-customer Task. It is never guessed."). Closed
     # (ExceptionStatus.RESOLVED) once a SUPPLEMENT fills in `customer`.
     SALES_CONTRACT_CUSTOMER_UNRESOLVED = "SalesContractCustomerUnresolved"
+    # Phase 2D.1-R3a Slice 2: Evidence merely SUGGESTS a procurement/sales
+    # pairing (e.g. a candidate scope reference) without an explicit
+    # AUTO_CONFIRMED/HUMAN_CONFIRMED confirmation action
+    # (docs/PHASE2D1-R0-DECISIONS.md section 2.4: "a link exists only for
+    # a confirmed relationship... unresolved, a Task"). No
+    # ProcurementSalesLink row is ever created for this — zero link rows,
+    # a persisted Task instead. Idempotent by exact replay of the same
+    # unresolved Evidence.
+    PROCUREMENT_SALES_LINK_UNCONFIRMED = "ProcurementSalesLinkUnconfirmed"
+    # Phase 2D.1-R3a Slice 2: new Evidence conflicts with a CURRENT
+    # ProcurementSalesLink episode's assertion (section 2.4: "Conflicting
+    # Evidence — never overwrites and never silently re-points a current
+    # link. It produces a Task, and the current assertion is unchanged
+    # until a human confirms"). The current episode is left completely
+    # unchanged; only an explicit human-confirmed CORRECT/INVALIDATE
+    # changes the authoritative relationship.
+    PROCUREMENT_SALES_LINK_CONFLICT = "ProcurementSalesLinkConflict"
+    # Phase 2D.1-R3a Slice 2: one procurement Contract now has more than
+    # one CURRENT ProcurementSalesLink to different SalesContracts
+    # (section 2.4's cardinality table: "Allowed structurally, but
+    # ambiguous: which sales scope that contract's cost serves is
+    # undecidable from the link alone. Produces a Task; the system does
+    # not choose an attribution."). This never blocks the ADD that
+    # created the second link — it only surfaces the ambiguity.
+    PROCUREMENT_SALES_LINK_MULTIPLE_SCOPES = "ProcurementSalesLinkMultipleScopes"
+    # Phase 2D.1-R3a Slice 2 (correction lineage invariant): a SECOND,
+    # DIFFERENT correction was attempted against a `superseded_link_id`
+    # that already has one (docs/PHASE2D1-R0-DECISIONS.md section 2.4:
+    # "superseded_link_id is semantically unique... a different
+    # replacement for an already-corrected superseded_link_id is a
+    # conflict -> Task / reject. No second correction record is written,
+    # and the existing lineage is not altered").
+    PROCUREMENT_SALES_LINK_CORRECTION_CONFLICT = "ProcurementSalesLinkCorrectionConflict"
 
 
 class ExceptionStatus:
