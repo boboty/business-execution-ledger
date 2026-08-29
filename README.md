@@ -46,28 +46,90 @@ Based on contracts, goods, invoices, payments, exports, and other business evide
 
 Finance, tax-rebate, ERP and BI systems are consumers of BEL output. Future integrations happen through Adapters / MCP, translating BEL's canonical business vocabulary into each consumer's own vocabulary without leaking those external concepts into the Business Core.
 
-## Current capabilities
+## Product goal
 
-Phase 2B/2C currently includes:
+BEL's first-stage (V1) Definition of Done is to **replace the
+manually-maintained contract business ledger spreadsheet as the System
+of Record for business facts and deterministic business state**. Business
+staff should stop hand-maintaining business status in Excel; from the
+facts it continuously receives, BEL should reconstruct contract
+execution state, produce period-close/accrual judgments at any point in
+time, give the data needed to prepare outbound invoicing, expose what it
+cannot determine, and export business results as a Data Product.
+
+Excel remains supported as an import format, an export format, a
+cutover/backfill source, a downstream handoff format, and a
+human-readable data product — but not as the authoritative System of
+Record.
+
+Reaching this goal requires a **cutover**, not only feature completion:
+the legacy ledger and its Evidence must be backfilled into BEL and
+reconciled against a business-confirmed baseline before BEL can be
+declared the System of Record. See
+[docs/V1-SCOPE.md](docs/V1-SCOPE.md) for the frozen scope (including the
+per-capability status of that Definition of Done) and
+[docs/PHASE2D0-DECISIONS.md](docs/PHASE2D0-DECISIONS.md) for the
+reasoning and the verified code-reality baseline.
+
+## Current capabilities (v0.1.1 / Phase 2C.2)
 
 - contract-ledger evidence import and canonical contract facts
-- purchase-invoice and bank-statement adapters
-- deterministic payment/invoice matching with explicit matched / ambiguous / unmatched outcomes
+- purchase-invoice, sales-invoice and bank-statement import adapters
+- deterministic invoice/payment matching with explicit matched /
+  ambiguous / unmatched outcomes — **purchase-side only**: the matching
+  pipeline processes `PURCHASE` invoices and `OUT` payments; sales
+  invoices and incoming receipts can be imported but are not yet
+  associated with a contract
 - confirmed ContractItem ↔ InvoiceItem allocation
 - accrual, reversal and historical close facts
-- a read-only period-close preview that recomputes confirmed numbered rules from current facts
+- a read-only period-close preview that recomputes confirmed numbered
+  rules from current facts, answerable at period end or any other point
+  in time
 - synthetic golden tests, public CI and privacy scanning
-- the first two human-facing V1 workbench pages — 月结工作台 (period-close)
-  and 合同360° (Contract 360) — served by `bel --db /path/to/bel.db web`
-  at `http://127.0.0.1:8000`
+- two human-facing workbench pages — 月结工作台 (period-close) and
+  合同360° (Contract 360), with the Fact / Current State / Projected
+  Decision / Blocker distinction — served by
+  `bel --db /path/to/bel.db web` at `http://127.0.0.1:8000`
 
 The close preview is intentionally stateless and read-only: it writes no vouchers, accounting entries or events.
 
-Phase 2C's pages render through the same Application Services as the CLI;
+These pages render through the same Application Services as the CLI;
 the only human write is the manual InvoiceItem allocation, which reuses
 the exact CLI command's `allocate_invoice_item`. See
-[docs/PHASE2C-DECISIONS.md](docs/PHASE2C-DECISIONS.md) and
-[docs/PHASE2C-ACCEPTANCE.md](docs/PHASE2C-ACCEPTANCE.md).
+[docs/PHASE2C-DECISIONS.md](docs/PHASE2C-DECISIONS.md),
+[docs/PHASE2C-ACCEPTANCE.md](docs/PHASE2C-ACCEPTANCE.md),
+[docs/PHASE2C2-DECISIONS.md](docs/PHASE2C2-DECISIONS.md) and
+[docs/PHASE2C2-ACCEPTANCE.md](docs/PHASE2C2-ACCEPTANCE.md).
+
+## Not built yet
+
+Stated plainly, because the concepts appear in the design documents and
+concept coverage is not implementation coverage:
+
+- no everyday intake path for `ContractItem` (only a human-authored
+  Close Fact Pack creates one)
+- no `Shipment / Export` implementation of any kind
+- no sales-side contract association
+- no fact correction / supersession mechanism
+- no cross-contract Contract Business Ledger
+- no outbound-invoicing eligibility or preparation logic
+- no exception/task centre surface, and no data export of any kind
+- no backfill or cutover reconciliation
+
+`docs/PHASE2D0-DECISIONS.md`'s Code Reality section tags each of these
+with an implementation status and a decision status, citing the source
+location behind every claim.
+
+## Next up
+
+Phase 2D.1 (Business Fact Foundation & Contract Ledger) starts with a
+business-semantics freeze, then `ContractItem` fact maintenance,
+`Shipment / Export`, the sales-side association foundation, the Contract
+Business Ledger, and legacy backfill — followed by the Period Close data
+product, the Outbound Invoicing Workbench, the Exception & Task Center,
+and finally the first-stage cutover gate. See
+[ROADMAP.md](ROADMAP.md) for the frozen sequence. Anything not listed
+under "Current capabilities" above is not built.
 
 ## Getting started
 
@@ -95,6 +157,8 @@ The SQLite runtime database (`bel.db`) is a local development artifact and must 
 - [Golden Tests](docs/GOLDEN-TEST.md) — verification methodology
 - [Private Data Policy](docs/PRIVATE-DATA-POLICY.md) — sensitive-data handling boundary
 - [Phase 2C Decisions](docs/PHASE2C-DECISIONS.md) / [Acceptance](docs/PHASE2C-ACCEPTANCE.md)
+- [Phase 2C.2 Decisions](docs/PHASE2C2-DECISIONS.md) / [Acceptance](docs/PHASE2C2-ACCEPTANCE.md)
+- [Phase 2D.0 Decisions](docs/PHASE2D0-DECISIONS.md) / [Acceptance](docs/PHASE2D0-ACCEPTANCE.md) — V1 product rebaseline
 - [Roadmap](ROADMAP.md) — planned capability progression
 - [Contributing](CONTRIBUTING.md) — contribution rules and development setup
 

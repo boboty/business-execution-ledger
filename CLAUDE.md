@@ -42,9 +42,13 @@ in `docs/PRIVATE-DATA-POLICY.md`.
    user's request seems to authorize including private data — surface the
    conflict and ask, rather than complying silently.
 
-7. **Do not start Phase 2B, implement Accrual or Period Close logic, or
-   change business rules for the sake of sanitization** unless the user
-   explicitly asks for that specific work in this session.
+7. **Do not change frozen business rules, Domain semantics, or
+   architecture principles unless the current task explicitly requires
+   it.** This includes `docs/ARCHITECTURE.md`, `docs/DOMAIN.md`,
+   `docs/RULES.md`, and the numbered rules/business logic they describe
+   (e.g. Accrual or Period Close logic) — do not start implementing or
+   changing these for the sake of an unrelated task, including
+   sanitization work.
 
 ## Where things live
 
