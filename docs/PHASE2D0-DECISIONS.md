@@ -142,6 +142,21 @@ assumptions would silently invent a business relationship rule. The
 semantics are frozen in Phase 2D.1-R0 before implementation in
 Phase 2D.1-R3.
 
+> **Forward clarification (Phase 2D.1-R0, SCR-2D1R0-001).** The
+> paragraph above anticipated that the sales side would associate a
+> customer to `Contract.buyer`. Business confirmation obtained during
+> Phase 2D.1-R0 established that this is **not** correct: the ledger's
+> party columns describe the procurement leg, and `Contract.buyer` is
+> **our own trading/export entity**, not an external customer. The
+> sales-side customer comes from a separate object, `SalesContract`,
+> built from sales-side Evidence, bridged to the procurement contract by
+> `ProcurementSalesLink`. See
+> [PHASE2D1-R0-DECISIONS.md](PHASE2D1-R0-DECISIONS.md) and
+> [V1-SCOPE.md](V1-SCOPE.md) sections 2.5 and 3.1. The Phase 2D.0
+> conclusion that this gap is a *semantics freeze rather than a
+> parameter change* stands, and was in fact understated — the gap turned
+> out to be larger than a relationship key.
+
 ## Why the Outbound Invoicing Workbench was added, ahead of Business Cockpit
 
 The prior V1 scope covered contract facts, matching and period close but
@@ -302,6 +317,19 @@ sales side must associate customer/buyer to `Contract.buyer` (the field
 exists and is populated by the ledger importer). Which business amount
 and which relationship govern that association are unsettled. Semantics
 freeze in Phase 2D.1-R0; implementation in Phase 2D.1-R3.
+
+> **Forward clarification (Phase 2D.1-R0, SCR-2D1R0-001).** The
+> `Contract.buyer` half of the sentence above is superseded. Business
+> confirmation established that `Contract.buyer` is **our own
+> trading/export entity**; using it as a sales-side customer key would
+> attribute every sales invoice and customer receipt to our own company,
+> and it is now explicitly prohibited. The `Contract.counterparty` half
+> stands unchanged — the procurement side is correct as described. The
+> sales-side customer is carried by `SalesContract`, linked to the
+> procurement contract by `ProcurementSalesLink`; the corresponding
+> match types were added to [V1-SCOPE.md](V1-SCOPE.md) section 3 by the
+> same SCR. This item's implementation-status finding — that the
+> sales-side pipeline does not exist — is unaffected and still accurate.
 
 ## D. Shipment / Export — NOT IMPLEMENTED · semantics conceptually scoped, details DEFERRED
 

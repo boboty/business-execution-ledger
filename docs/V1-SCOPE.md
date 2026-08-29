@@ -91,8 +91,10 @@ list of what V1 must manage, not a claim that every entry is a Fact:
 
 **Business facts, and the records that attribute them**
 
-- `Contract`
+- `Contract` — the **procurement** leg only (its buyer is our own entity)
 - `ContractItem`
+- `SalesContract` — the sales leg, carrying the external customer
+- `ProcurementSalesLink` — the bridge between the two legs
 - `Invoice`
 - `Payment`
 - `PaymentAllocation`
@@ -209,30 +211,76 @@ outbound-invoicing eligibility; it does not by itself decide invoicing
 eligibility. That rule is frozen separately before Phase 2D.3 (section
 5.1).
 
-### 2.4 Fact correction / supersession semantics are not frozen
+### 2.4 Fact correction / supersession semantics — frozen in Phase 2D.1-R0
 
-`Evidence` is immutable ([DOMAIN.md](DOMAIN.md)) and remains so. There
-is today **no modeled way** to mark a Fact as corrected or superseded by
-a later one — creating an independent second Fact is the only mechanism
-that exists, with no link back to what it corrects.
-
+`Evidence` is immutable ([DOMAIN.md](DOMAIN.md)) and remains so.
 Correcting a business fact must never be implemented by overwriting
 `Evidence` or by silently mutating a canonical Fact without an audit
-trail. Freezing these semantics is a `DEFERRED IMPLEMENTATION DECISION`
-and is the first item of Phase 2D.1-R0, because both `ContractItem`
-maintenance (2.2) and legacy backfill (section 7) depend on it.
+trail.
+
+At the time this section was first written there was **no modeled way**
+to mark a Fact as corrected or superseded, and freezing those semantics
+was listed here as a deferred decision. **That freeze has since been
+completed in Phase 2D.1-R0** — see
+[PHASE2D1-R0-DECISIONS.md](PHASE2D1-R0-DECISIONS.md) section 1, which
+freezes the three-case taxonomy (supplement / correction / business
+progression), the requirement that every correction rests on new
+Evidence, a stable identity anchor with versioned revisions so existing
+references never dangle, and the recomputation response. Implementation
+is Phase 2D.1-R1.
+
+`ContractItem` maintenance (2.2) and legacy backfill (section 7) both
+depend on that freeze, which is why it was sequenced first.
+
+### 2.5 Sales-side scope and the procurement/sales bridge
+
+Added by SCR-2D1R0-001, after business confirmation that today's
+`Contract` rows describe the **procurement** leg only.
+
+**`SalesContract`** carries the sales-side business scope and is the
+only place an external customer is expressed. Its `customer` may be
+unknown at first — a sales scope is often first learned from a reference
+carried on procurement evidence, before the sales contract document
+itself has been ingested — and is supplied later from sales-side
+Evidence as a normal supplementing fact. A sales-scope reference number
+is **not** a customer identity, and neither is a customs-receiving party
+named on shipping material. Until a customer is known, that scope cannot
+support outbound invoicing; it produces a `Task`, never a guess.
+
+**`ProcurementSalesLink`** is the bridge: which procurement contract(s)
+supply which sales scope(s). It is many-to-many, and it **expresses a
+relationship only — it carries no amount and no quantity.** V1 performs
+**no apportionment of amounts or quantities across the bridge**: on a
+many-to-many edge there is no basis for spreading a value without an
+explicit allocation fact, so any such figure would be invented.
+Cross-leg apportionment requires its own confirmed business rule and is
+not in V1.
+
+`ContractItem` does not participate in the bridge, and V1 builds **no
+sales-side item object**. `Shipment / Export` is **not** the bridge and
+never creates one automatically; a shipment implying an unestablished
+link produces a `Task`. A shipment is, however, an important candidate
+fact source for the quantity a future outbound invoice would prepare —
+what that rule actually is remains Phase 2D.3's to freeze (section 5.1),
+and nothing here establishes shipped quantity as invoiceable quantity.
 
 ## 3. Matching
 
 V1 supports these match types:
 
-- `Contract ↔ Invoice`
-- `Contract ↔ Payment`
+- `Contract ↔ Invoice` — procurement leg (`PURCHASE` invoices)
+- `Contract ↔ Payment` — procurement leg (`OUT` payments)
 - `Contract ↔ Export`
 - `ContractItem ↔ InvoiceItem`
+- `SalesContract ↔ Invoice` — sales leg (`SALES` invoices)
+- `SalesContract ↔ Payment` — sales leg (`IN` receipts)
+- `Contract ↔ SalesContract` — the procurement/sales bridge, expressed
+  as `ProcurementSalesLink`
 
-No other match types are in scope for V1. This frozen list is unchanged
-by Phase 2D.0.
+No other match types are in scope for V1. The last three were added by
+SCR-2D1R0-001 (Phase 2D.1-R0) once business confirmation established
+that the sales leg is a separate business object; the first four are
+unchanged.
 
 ### 3.1 Implementation reality: the matching pipeline is purchase-side only
 
@@ -261,15 +309,31 @@ This directly limits:
   Fact already exist" judgment
 - sales-side business execution state generally
 
-**This is not merely a direction parameter.** Closing it requires first
-freezing the sales-side relationship semantics. The purchase side
-associates a supplier/seller to a contract's `counterparty`; the sales
-side must associate a customer/buyer to a contract's `buyer`, and the
-business amount and relationship used for that association are not
-settled. Reusing the purchase side's counterparty/amount assumptions is
-explicitly forbidden. This is tagged
-`REQUIRES RELATIONSHIP / BUSINESS RULE FREEZE` and is frozen in Phase
-2D.1-R0 before being implemented in Phase 2D.1-R3.
+**This is not merely a direction parameter.** Closing it required
+freezing the sales-side relationship semantics first, which Phase
+2D.1-R0 has now done (SCR-2D1R0-001).
+
+The purchase side associates a supplier/seller to a contract's
+`counterparty`, and that is unchanged. The sales side does **not**
+associate a customer to a contract's `buyer`: business confirmation
+established that the ledger's party columns describe the **procurement**
+leg, where the seller is the external supplier and the buyer is **our
+own trading/export entity**. `Contract.buyer` is therefore our own
+entity and **must never be used as a sales-side customer key** — doing
+so would attribute every sales invoice and customer receipt to our own
+company.
+
+An earlier version of this section stated the opposite. That statement
+was wrong and is corrected here; see
+[PHASE2D1-R0-DECISIONS.md](PHASE2D1-R0-DECISIONS.md).
+
+The sales-side customer instead comes from an independent fact source —
+`SalesContract`, built from sales-side Evidence (see section 2.5). A
+sales-scope reference number carried on procurement evidence identifies
+the scope but is **not** a customer identity. Reusing the purchase
+side's counterparty/amount assumptions remains explicitly forbidden; the
+sales-side matching *algorithm* is still tagged
+`REQUIRES BUSINESS RULE FREEZE` and is implemented in Phase 2D.1-R3b.
 
 ## 4. Period-Close Business Engine
 
@@ -302,12 +366,18 @@ V1's Definition of Done requires five core work surfaces. 业务驾驶舱
 
 1. **合同业务总账 Contract Business Ledger** — the direct product
    replacement for the Excel contract ledger. A cross-contract business
-   overview with filtering: contract, counterparty/supplier,
-   buyer/customer, contract amount, `ContractItem` scope, export
-   execution, purchase-invoice state, sales-invoice state, outgoing
-   payment state, incoming receipt state, current accrual state,
-   outbound invoice preparation state where determinable, and an
-   unresolved-work/exception indicator. It does not replicate the
+   overview with filtering: procurement contract, supplier
+   (`Contract.counterparty`), our own contracting entity
+   (`Contract.buyer` — **not** a customer), contract amount,
+   `ContractItem` scope, the linked sales scope(s) and their external
+   customer (`SalesContract.customer`), export execution,
+   purchase-invoice state, sales-invoice state, outgoing payment state,
+   incoming receipt state, current accrual state, outbound invoice
+   preparation state where determinable, and an
+   unresolved-work/exception indicator. The Ledger's primary axis is the
+   **procurement contract**, matching the legacy ledger it replaces;
+   linked sales scopes are projected onto that row and are never summed
+   across the bridge (see section 2.5). It does not replicate the
    spreadsheet's dozens of raw columns. **Not implemented.** It is
    sequenced *after* `ContractItem` intake (2.2), `Shipment / Export`
    (2.3), and sales-side association (3.1), because those supply columns

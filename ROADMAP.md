@@ -41,11 +41,28 @@ it displays must exist first.
 Design and rule-freeze round. At minimum:
 
 - Fact correction / supersession semantics
-- Sales-side relationship / matching semantics (a customer/buyer to
-  `Contract.buyer` association — **not** a reuse of the purchase side's
-  counterparty/amount assumptions)
-- `Shipment / Export` minimal semantics
+- Sales-side relationship / matching semantics — **not** a reuse of the
+  purchase side's counterparty/amount assumptions
+- `Shipment` minimal semantics
 - Cutover / backfill semantic rules
+
+Frozen in [docs/PHASE2D1-R0-DECISIONS.md](docs/PHASE2D1-R0-DECISIONS.md),
+verified against [docs/PHASE2D1-R0-ACCEPTANCE.md](docs/PHASE2D1-R0-ACCEPTANCE.md).
+
+The party-role question is answered: 卖方 is the domestic supplier and
+买方 is our own trading/export entity. `Contract` therefore represents
+the **procurement leg only**, and `Contract.buyer` may **never** serve
+as a sales-side customer key.
+
+That answer required a spec change, approved as **SCR-2D1R0-001**: the
+sales leg is a separate object, `SalesContract`, carrying the external
+customer, bridged to the procurement contract by `ProcurementSalesLink`.
+Both are now frozen in [docs/DOMAIN.md](docs/DOMAIN.md) and
+[docs/V1-SCOPE.md](docs/V1-SCOPE.md).
+
+R0 leaves **R1, R2, R3a and R3b ready to start**. R5's design is ready;
+its implementation additionally needs a source-account field on
+`Payment` before its business identity is sound.
 
 ### 2D.1-R1 — ContractItem Fact Maintenance
 
@@ -55,16 +72,39 @@ has none today. Not ordinary CRUD: human-supplied/confirmed Evidence →
 correction/supersession mechanism. This is the first-stage critical path
 — see [docs/V1-SCOPE.md](docs/V1-SCOPE.md) section 2.2.
 
-### 2D.1-R2 — Shipment / Export Minimum Vertical Slice
+### 2D.1-R2 — Shipment Minimum Vertical Slice
 
-Evidence → `Shipment / Export` Fact → `Contract` association →
-query/read model. Currently zero implementation exists.
+Evidence → `Shipment` Fact → `Contract` association → query/read model.
+Currently zero implementation exists. R2 also adds the explicit
+`shipment_id` provenance link that lets a `CostRecognitionFact` name the
+shipment that evidenced it — an intake change; the Rule Engine is not
+touched, and a shipment never auto-derives cost recognition.
 
-### 2D.1-R3 — Sales-side Association Foundation
+### 2D.1-R3a — Sales Scope & Procurement-Sales Bridge
 
-`SALES` invoice → business `Contract` association, and `IN`
-payment/receipt → business `Contract` association. Implemented against
-the semantics frozen in R0.
+Establishes the sales leg, which BEL has no representation of today:
+`SalesContract` intake from sales-side Evidence; the external customer
+supplied as a supplementing fact (a scope may legitimately exist before
+its customer is known); `ProcurementSalesLink` as the many-to-many
+bridge; an optional sales-side reference on `Shipment`; and the Tasks
+for an unresolved sales scope or an unconfirmed link.
+
+The bridge carries **no amount and no quantity**, and V1 performs no
+apportionment across it.
+
+### 2D.1-R3b — Sales-side Allocation
+
+`SALES` invoice → `SalesContract`, and `IN` receipt → `SalesContract`,
+through **their own allocation objects** — `SalesInvoiceAllocation` and
+`SalesPaymentAllocation`. The procurement `InvoiceAllocation`,
+`PaymentAllocation` and `MatchCandidate` keep their hard procurement
+foreign keys and are not generalised; `MatchCase` is reused with a
+separate `SalesMatchCandidate`.
+
+The first version may be **manual / human-confirmed only**.
+**No automatic amount matching** — the sales-side algorithm still
+requires a business rule freeze, and the procurement `M001` condition
+may not be reused.
 
 ### 2D.1-R4 — Contract Business Ledger
 

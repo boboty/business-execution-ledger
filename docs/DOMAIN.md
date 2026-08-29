@@ -45,6 +45,166 @@ allowed to degrade into a single amount-level object. Business
 correctness (accrual, matching, reconciliation) depends on item-level
 quantity and product identity being tracked, not just a contract total.
 
+## SalesContract
+
+The sales-leg counterpart of `Contract`. Added by SCR-2D1R0-001 after
+business confirmation that the contract ledger's party columns record
+the **procurement** leg: its seller is the external supplier and its
+buyer is our own trading/export entity. `Contract` therefore represents
+a **procurement contract only**, and it carries no external customer.
+
+`SalesContract` is the object that carries the sales-side business
+scope — the 外销合同 under which goods are sold to an external customer.
+
+```
+id
+our_entity
+sales_contract_no
+customer
+currency
+gross_amount
+contract_date
+status
+```
+
+**`customer` is the external buying party**, and it is the only place in
+the domain where an external sales customer is expressed. It must never
+be inferred from `Contract`'s own party fields: our own entity appears
+there as the procurement contract's buyer, so reusing it would attribute
+sales business to ourselves.
+
+`customer` may legitimately be **unknown at first**. A sales scope is
+often first learned from a reference on procurement evidence, before the
+sales contract document itself has been ingested. Such a `SalesContract`
+exists with no `customer` and is not yet capable of supporting outbound
+invoicing; the customer is supplied later from sales-side Evidence as a
+normal supplementing fact, never guessed. A sales-scope reference number
+identifies the scope — it is **not** a customer identity, and neither is
+a customs-receiving party named on shipping material.
+
+`our_entity` is our own contracting party on the sales leg — the same
+kind of party that appears as the buyer of a procurement `Contract`. It
+is part of the scope's business identity, and it must come from Evidence
+(the sales contract itself, or the procurement evidence that asserts
+both our entity and the sales-scope reference on one record). It is
+never guessed.
+
+`sales_contract_no` is a **business key**, not a database primary key,
+and it is a different namespace from `Contract.contract_no` — the two
+never share uniqueness. Following the same discipline `Contract` already
+applies, a sales contract number is **not assumed globally unique**: the
+business identity of a sales scope is the pair
+`(our_entity, sales_contract_no)`. `customer` deliberately takes no part
+in identity, because it is allowed to be unknown when the scope is first
+learned and supplied later. Duplicates must not be silently merged — the
+same identity presenting conflicting business facts surfaces as
+`BusinessKeyConflict` (see [RULES.md](RULES.md) R004), never as one
+scope.
+
+Sales-side invoices and receipts are attributed to a `SalesContract`
+through **their own allocation objects**, physically separate from the
+procurement ones. A procurement allocation always attributes to a
+procurement `Contract`, and a sales allocation always attributes to a
+`SalesContract`; neither can express the other's relationship. A sales
+invoice is therefore never attributable to a procurement contract, and a
+purchase invoice is never attributable to a sales scope — the separation
+is structural rather than a matter of discipline.
+
+Like every other fact object, a `SalesContract` links to the `Evidence`
+it was extracted from, and an uncertain case surfaces as a `Task` rather
+than a silently assumed customer.
+
+## ProcurementSalesLink
+
+The canonical bridge between the two legs: which procurement
+`Contract`(s) supply which `SalesContract`(s). It exists because the two
+legs are genuinely separate business objects, and without an explicit
+bridge there would be no defined way to relate purchase execution to
+sales execution for the same underlying business.
+
+```
+id
+procurement_contract_id
+sales_contract_id
+source_fragment_id
+confirmation_type
+created_at
+```
+
+**The link expresses a relationship and nothing else. It deliberately
+carries no amount and no quantity.** The relationship between the legs
+is many-to-many — one sales scope may be supplied by several procurement
+contracts, and one procurement contract may supply several sales scopes
+— and on a many-to-many edge there is no basis for apportioning a value
+without an explicit allocation fact. Any figure produced by spreading an
+amount or a quantity across this bridge would be invented. Cross-leg
+apportionment is therefore not part of the bridge and requires its own
+confirmed business rule before it can exist.
+
+`ContractItem` does not participate in the bridge. Which purchased item
+fulfils which sold line is a separate business question with no evidence
+source at this stage, and nothing in the first stage requires it.
+
+`Shipment / Export` is **not** the bridge and never creates one. A
+shipment is an execution fact that may *corroborate* a link; a shipment
+implying a link that has not been established surfaces as a `Task`, not
+as a silently created relationship.
+
+**A link exists only for a relationship that has been confirmed.**
+`confirmation_type` records how — deterministically from evidence, or by
+a human. Evidence that merely suggests a possible pairing does **not**
+create a link: it produces a candidate for human confirmation and, where
+it cannot be resolved, a `Task`. Because an unconfirmed relationship is
+never written, the link itself needs no open/resolved workflow state of
+its own.
+
+`source_fragment_id` is the direct `Evidence` trace for that confirmed
+relationship — commonly the procurement record carrying a sales-scope
+reference. A human confirmation is not exempt: it must supply its own
+manual `Evidence`, so that no link exists whose only justification is
+that somebody clicked a button.
+
+Identity has two layers. The **relationship business key** is the pair
+`(procurement_contract_id, sales_contract_id)`, and neither end may be
+empty — it says *which* business relationship this is. A
+`ProcurementSalesLink` record is one **assertion episode**: one occasion
+on which that relationship was confirmed to hold. A business key may
+therefore accumulate several episodes over time, but **at most one of
+them is current** at any moment; the rest are permanently retired.
+
+Within an episode the relationship is idempotent: the same supporting
+Evidence arriving again is the same assertion, not a new one, and no
+second record is created however many independent pieces of Evidence
+come to support it. Re-processing Evidence for a relationship that has
+since been retired never makes it current again. Evidence that
+conflicts with an existing confirmed pair never overwrites it and never
+silently re-points it — it surfaces as a `Task`, and the current link is
+unchanged until a human confirms what the conflict means.
+
+Confirming a link asserts that a relationship exists, and such an
+assertion can later be shown wrong. A confirmed assertion is therefore
+**superseded or invalidated, never deleted and never re-pointed**: the
+retired episode keeps both its endpoints and its original Evidence
+permanently, a replacement relationship becomes current where one
+exists, and where none exists the relationship is simply recorded as no
+longer holding. Only a retired episode's successor can be current; a
+retired episode is final and is never corrected a second time, and an
+episode may be superseded at most once, so a correction history never
+branches. Only current episodes take part in business projection and
+judgment; retired ones remain auditable.
+
+A relationship that was retired may later be **re-established** — with
+new Evidence and an explicit human confirmation, never automatically.
+That writes a *new* assertion episode; it does not revive the retired
+one, which stays retired permanently. Because the bridge is
+many-to-many, a further relationship for the same procurement contract
+is a legitimate *addition* rather than a correction — which of the two a
+new piece of Evidence means is a human determination, never an
+inference. Ambiguity (most notably
+one procurement contract supplying several sales scopes, where cost
+attribution becomes undecidable) likewise surfaces as a `Task`; the
+system does not choose an attribution.
+
 ## Invoice / InvoiceItem
 
 Must support all of the following simultaneously:
