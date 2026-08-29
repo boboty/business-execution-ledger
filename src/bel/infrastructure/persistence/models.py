@@ -279,6 +279,96 @@ class ShipmentRevisionModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class SalesContractModel(Base):
+    """The stable identity anchor for SalesContract (Phase 2D.1-R3a
+    Slice 1), same pattern as ContractItemModel/ShipmentModel. Carries
+    the frozen business identity (docs/PHASE2D1-R0-DECISIONS.md section
+    4.4: ``(our_entity, sales_contract_no)``) — both fields are immutable
+    after creation; correcting one is re-identification and out of this
+    round's scope, exactly like ContractItem's ``(contract_id,
+    source_item_key)`` and Shipment's ``(contract_id, external_reference,
+    execution_date)``. Unlike Shipment's identity, BOTH components here
+    are mandatory: section 4.4 requires "NO canonical anchor may be
+    created" if either is missing — there is no confirmed-anchor-with-
+    incomplete-identity case for SalesContract the way there is for
+    Shipment's nullable ``external_reference``.
+
+    ``customer`` and every other business value (``currency``,
+    ``gross_amount``, ``contract_date``) live on
+    SalesContractRevisionModel instead — this anchor deliberately carries
+    none, matching ContractItem/Shipment's separation of identity from
+    asserted value."""
+
+    __tablename__ = "sales_contracts"
+    __table_args__ = (
+        UniqueConstraint("our_entity", "sales_contract_no", name="uq_sales_contract_business_identity"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    our_entity: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    sales_contract_no: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class SalesContractRevisionModel(Base):
+    """Versioned assertions about a SalesContract anchor — same model as
+    ContractItemRevisionModel/ShipmentRevisionModel
+    (docs/PHASE2D1-R0-DECISIONS.md section 1.3), including the same three
+    DB-level backstops closed in the Phase 2D.1-R1/R2 Codex fix rounds:
+    ``uq_sales_contract_revisions_one_current`` (at most one current
+    revision per anchor), ``uq_sales_contract_revisions_one_initial`` (at
+    most one INITIAL revision per anchor — a separate invariant from "one
+    current"), and ``ck_sales_contract_revisions_revision_type`` (the
+    closed INITIAL/SUPPLEMENT/CORRECTION set, enforced even against a raw
+    INSERT or an ORM bypass).
+
+    ``source_fragment_id`` is NOT NULL here — like ShipmentRevisionModel,
+    there is no pre-R3a legacy SalesContract data to accommodate."""
+
+    __tablename__ = "sales_contract_revisions"
+    __table_args__ = (
+        Index(
+            "uq_sales_contract_revisions_one_current",
+            "sales_contract_id",
+            unique=True,
+            sqlite_where=text("superseded_by_revision_id IS NULL"),
+        ),
+        Index(
+            "uq_sales_contract_revisions_one_initial",
+            "sales_contract_id",
+            unique=True,
+            sqlite_where=text("revision_type = 'INITIAL'"),
+        ),
+        CheckConstraint(
+            "revision_type IN ('INITIAL', 'SUPPLEMENT', 'CORRECTION')",
+            name="ck_sales_contract_revisions_revision_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    sales_contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sales_contracts.id"), nullable=False, index=True)
+    revision_type: Mapped[str] = mapped_column(String, nullable=False)  # INITIAL / SUPPLEMENT / CORRECTION
+    # The ONLY place an external sales customer is expressed
+    # (docs/DOMAIN.md, docs/PHASE2D1-R0-DECISIONS.md section 2.2).
+    # Nullable: a scope may be known before its customer is (section 2.3).
+    customer: Mapped[str | None] = mapped_column(String, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    gross_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    contract_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Provenance reference — the exact Evidence for THIS revision. Never
+    # re-pointed. See docs/PHASE2D1-R0-DECISIONS.md sections 1.3 and 2.2.
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    superseded_by_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sales_contract_revisions.id"), nullable=True, index=True
+    )
+    # The exact field names the writing command actually asserted,
+    # captured verbatim — see ContractItemRevisionModel's docstring for
+    # why this must never be reconstructed later by diffing against the
+    # predecessor.
+    asserted_field_names: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class BusinessEventModel(Base):
     __tablename__ = "business_events"
 

@@ -28,6 +28,7 @@ from bel.domain.exception import TaskException
 from bel.domain.invoice import Invoice, InvoiceItem
 from bel.domain.matching import InvoiceAllocation, MatchCandidate, MatchCase, PaymentAllocation
 from bel.domain.payment import Payment
+from bel.domain.sales_contract import SalesContract, SalesContractRevision, SalesContractRevisionType
 from bel.domain.shipment import Shipment, ShipmentRevision, ShipmentRevisionType
 from bel.infrastructure.persistence.models import (
     AccrualBasisFactModel,
@@ -50,6 +51,8 @@ from bel.infrastructure.persistence.models import (
     MatchCaseModel,
     PaymentAllocationModel,
     PaymentModel,
+    SalesContractModel,
+    SalesContractRevisionModel,
     ShipmentModel,
     ShipmentRevisionModel,
     TaskExceptionModel,
@@ -165,6 +168,40 @@ def _assemble_shipment(anchor: ShipmentModel, current_revision: ShipmentRevision
         execution_date=anchor.execution_date,
         contract_item_id=current_revision.contract_item_id,
         quantity=current_revision.quantity,
+        current_source_fragment_id=current_revision.source_fragment_id,
+        created_at=anchor.created_at,
+    )
+
+
+def _sales_contract_revision_to_domain(m: SalesContractRevisionModel) -> SalesContractRevision:
+    return SalesContractRevision(
+        id=m.id,
+        sales_contract_id=m.sales_contract_id,
+        revision_type=m.revision_type,
+        customer=m.customer,
+        currency=m.currency,
+        gross_amount=m.gross_amount,
+        contract_date=m.contract_date,
+        source_fragment_id=m.source_fragment_id,
+        superseded_by_revision_id=m.superseded_by_revision_id,
+        created_at=m.created_at,
+        asserted_field_names=m.asserted_field_names,
+    )
+
+
+def _assemble_sales_contract(anchor: SalesContractModel, current_revision: SalesContractRevisionModel) -> SalesContract:
+    """The anchor + current-revision join, in ONE place, mirroring
+    ``_assemble_shipment``/``_assemble_contract_item``. See
+    docs/PHASE2D1-R0-DECISIONS.md section 1.3 — current-revision
+    resolution is defined once, in the repository layer."""
+    return SalesContract(
+        id=anchor.id,
+        our_entity=anchor.our_entity,
+        sales_contract_no=anchor.sales_contract_no,
+        customer=current_revision.customer,
+        currency=current_revision.currency,
+        gross_amount=current_revision.gross_amount,
+        contract_date=current_revision.contract_date,
         current_source_fragment_id=current_revision.source_fragment_id,
         created_at=anchor.created_at,
     )
@@ -920,6 +957,223 @@ class ShipmentRepository:
         return len(self._session.scalars(select(ShipmentModel.id)).all())
 
 
+class SalesContractRepository:
+    """Anchor + current-revision assembly for SalesContract (Phase
+    2D.1-R3a Slice 1), the same pattern as
+    ContractItemRepository/ShipmentRepository — reused deliberately, not
+    abstracted into a shared generic engine. ``get`` / ``find_by_identity``
+    / ``list_*`` join the anchor to its current (un-superseded) revision
+    and return the assembled ``SalesContract`` dataclass.
+
+    Anchor and revision writes (``create_anchor`` /
+    ``create_initial_revision`` / ``append_revision_against_current``)
+    are the primitives ``bel.application.sales_contract_facts`` composes
+    into the three Fact-maintenance operations (create / supplement /
+    correct). There is no unchecked "just insert a revision row"
+    primitive, mirroring every structural invariant closed in the Phase
+    2D.1-R1/R2 Codex fix rounds: Evidence required for every new
+    revision, at most one INITIAL and one current revision per anchor
+    (DB-backed), the closed revision_type set (DB-backed), and an
+    anchor-scoped conditional-retire-then-insert CAS that cannot cross
+    anchors.
+
+    Unlike ShipmentRepository, there is no global (non-anchor-scoped)
+    fragment lookup here: SalesContract's frozen identity null policy
+    (section 4.4) never permits creating an anchor with an incomplete
+    identity in the first place ("NO canonical anchor may be created"),
+    so the class of cross-anchor-misattribution risk that required
+    Shipment's candidate-filtering fix cannot arise for SalesContract."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def _current_revision_join(self):
+        return select(SalesContractModel, SalesContractRevisionModel).join(
+            SalesContractRevisionModel,
+            (SalesContractRevisionModel.sales_contract_id == SalesContractModel.id)
+            & (SalesContractRevisionModel.superseded_by_revision_id.is_(None)),
+        )
+
+    def create_anchor(self, *, id: uuid.UUID, our_entity: str, sales_contract_no: str, created_at) -> None:
+        """Creates the bare identity anchor only — no business values, no
+        revision. Callers (bel.application.sales_contract_facts) always
+        pair this with an immediate ``create_initial_revision`` call,
+        inside the same transaction."""
+        self._session.add(
+            SalesContractModel(id=id, our_entity=our_entity, sales_contract_no=sales_contract_no, created_at=created_at)
+        )
+
+    def create_initial_revision(self, revision: SalesContractRevision) -> None:
+        """The ONLY way to write an anchor's first (INITIAL) revision
+        through the normal repository API. Requires real Evidence: a new
+        canonical revision must never carry ``source_fragment_id=None``."""
+        if revision.source_fragment_id is None:
+            raise ValueError("SalesContractRevision.source_fragment_id is required for a new revision")
+        if revision.revision_type != SalesContractRevisionType.INITIAL:
+            raise ValueError("create_initial_revision only accepts revision_type=INITIAL")
+        if revision.superseded_by_revision_id is not None:
+            raise ValueError("a newly created current revision cannot already be superseded")
+        self._session.add(self._revision_model(revision))
+
+    def append_revision_against_current(
+        self, revision: SalesContractRevision, *, based_on_revision_id: uuid.UUID
+    ) -> bool:
+        """The ONLY way to append a SUPPLEMENT/CORRECTION revision
+        through the normal repository API. Atomically retires
+        ``based_on_revision_id`` with a single conditional
+        ``UPDATE ... WHERE id = :based_on AND sales_contract_id = :anchor
+        AND superseded_by_revision_id IS NULL`` and only inserts
+        ``revision`` as the new current row if EXACTLY one row was
+        retired.
+
+        Only ``SUPPLEMENT`` and ``CORRECTION`` may ever be appended this
+        way — an ``INITIAL`` or any unrecognised ``revision_type`` is a
+        caller bug, not a conflict, and raises ``ValueError``
+        immediately, before any UPDATE or INSERT runs.
+
+        The anchor-ownership check (``sales_contract_id ==
+        revision.sales_contract_id``) is folded into the SAME conditional
+        UPDATE as the current-revision check, not a separate SELECT
+        beforehand. Returns ``False`` — having written NOTHING — for any
+        of: ``based_on_revision_id`` does not exist, is no longer current,
+        or does not belong to ``revision.sales_contract_id`` (a
+        cross-anchor append attempt). The caller MUST treat ``False`` as
+        a conflict and never retry blindly."""
+        if revision.source_fragment_id is None:
+            raise ValueError("SalesContractRevision.source_fragment_id is required for a new revision")
+        if revision.superseded_by_revision_id is not None:
+            raise ValueError("a newly created current revision cannot already be superseded")
+        if revision.revision_type not in (SalesContractRevisionType.SUPPLEMENT, SalesContractRevisionType.CORRECTION):
+            raise ValueError(
+                "append_revision_against_current only accepts revision_type SUPPLEMENT or CORRECTION, got "
+                f"{revision.revision_type!r} — INITIAL must go through create_initial_revision, and no other "
+                "value is a legal revision_type"
+            )
+        # See ContractItemRepository.append_revision_against_current for
+        # why defer_foreign_keys is required here: the retiring UPDATE
+        # must point the old row at `revision.id` before `revision`
+        # itself is inserted, and SQLite's connect-time
+        # `PRAGMA foreign_keys=ON` would otherwise reject a reference to
+        # a row that does not exist yet.
+        self._session.execute(text("PRAGMA defer_foreign_keys = ON"))
+        result = self._session.execute(
+            update(SalesContractRevisionModel)
+            .where(
+                SalesContractRevisionModel.id == based_on_revision_id,
+                SalesContractRevisionModel.sales_contract_id == revision.sales_contract_id,
+                SalesContractRevisionModel.superseded_by_revision_id.is_(None),
+            )
+            .values(superseded_by_revision_id=revision.id)
+        )
+        if result.rowcount != 1:
+            return False
+        self._session.add(self._revision_model(revision))
+        self._session.flush()
+        return True
+
+    def _revision_model(self, revision: SalesContractRevision) -> SalesContractRevisionModel:
+        return SalesContractRevisionModel(
+            id=revision.id,
+            sales_contract_id=revision.sales_contract_id,
+            revision_type=revision.revision_type,
+            customer=revision.customer,
+            currency=revision.currency,
+            gross_amount=revision.gross_amount,
+            contract_date=revision.contract_date,
+            source_fragment_id=revision.source_fragment_id,
+            superseded_by_revision_id=revision.superseded_by_revision_id,
+            created_at=revision.created_at,
+            asserted_field_names=revision.asserted_field_names,
+        )
+
+    def get_current_revision(self, sales_contract_id: uuid.UUID) -> SalesContractRevision | None:
+        m = self._session.scalar(
+            select(SalesContractRevisionModel).where(
+                SalesContractRevisionModel.sales_contract_id == sales_contract_id,
+                SalesContractRevisionModel.superseded_by_revision_id.is_(None),
+            )
+        )
+        return _sales_contract_revision_to_domain(m) if m else None
+
+    def get_initial_revision(self, sales_contract_id: uuid.UUID) -> SalesContractRevision | None:
+        m = self._session.scalar(
+            select(SalesContractRevisionModel).where(
+                SalesContractRevisionModel.sales_contract_id == sales_contract_id,
+                SalesContractRevisionModel.revision_type == SalesContractRevisionType.INITIAL,
+            )
+        )
+        return _sales_contract_revision_to_domain(m) if m else None
+
+    def find_predecessor(self, revision_id: uuid.UUID) -> SalesContractRevision | None:
+        m = self._session.scalar(
+            select(SalesContractRevisionModel).where(SalesContractRevisionModel.superseded_by_revision_id == revision_id)
+        )
+        return _sales_contract_revision_to_domain(m) if m else None
+
+    def find_revision_by_fragment(
+        self, sales_contract_id: uuid.UUID, source_fragment_id: uuid.UUID
+    ) -> SalesContractRevision | None:
+        """The replay/reuse lookup: the same Evidence fragment already
+        asserted SOMETHING against this anchor. Callers must not treat a
+        hit as an automatic replay — see
+        ``bel.application.sales_contract_facts._apply_revision``, which
+        compares ``revision_type`` and the actual asserted field/value
+        content before deciding replay vs. conflict."""
+        m = self._session.scalar(
+            select(SalesContractRevisionModel).where(
+                SalesContractRevisionModel.sales_contract_id == sales_contract_id,
+                SalesContractRevisionModel.source_fragment_id == source_fragment_id,
+            )
+        )
+        return _sales_contract_revision_to_domain(m) if m else None
+
+    def list_revisions(self, sales_contract_id: uuid.UUID) -> list[SalesContractRevision]:
+        """Full audit history, oldest first — walked along the
+        append-only ``superseded_by_revision_id`` chain from the INITIAL
+        revision forward, NOT sorted by ``created_at``."""
+        rows = {
+            m.id: m
+            for m in self._session.scalars(
+                select(SalesContractRevisionModel).where(SalesContractRevisionModel.sales_contract_id == sales_contract_id)
+            )
+        }
+        if not rows:
+            return []
+        current = next(m for m in rows.values() if m.revision_type == SalesContractRevisionType.INITIAL)
+        ordered = [current]
+        while current.superseded_by_revision_id is not None:
+            current = rows[current.superseded_by_revision_id]
+            ordered.append(current)
+        return [_sales_contract_revision_to_domain(m) for m in ordered]
+
+    def get(self, sales_contract_id: uuid.UUID) -> SalesContract | None:
+        row = self._session.execute(
+            self._current_revision_join().where(SalesContractModel.id == sales_contract_id)
+        ).first()
+        return _assemble_sales_contract(*row) if row else None
+
+    def find_by_identity(self, our_entity: str, sales_contract_no: str) -> SalesContract | None:
+        """Resolves the frozen business identity
+        (docs/PHASE2D1-R0-DECISIONS.md section 4.4:
+        ``(our_entity, sales_contract_no)``)."""
+        row = self._session.execute(
+            self._current_revision_join().where(
+                SalesContractModel.our_entity == our_entity,
+                SalesContractModel.sales_contract_no == sales_contract_no,
+            )
+        ).first()
+        return _assemble_sales_contract(*row) if row else None
+
+    def list_all(self) -> list[SalesContract]:
+        rows = self._session.execute(
+            self._current_revision_join().order_by(SalesContractModel.created_at, SalesContractModel.id)
+        )
+        return [_assemble_sales_contract(anchor, rev) for anchor, rev in rows]
+
+    def count(self) -> int:
+        return len(self._session.scalars(select(SalesContractModel.id)).all())
+
+
 class ExceptionRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -943,6 +1197,19 @@ class ExceptionRepository:
     def list_open(self) -> list[TaskException]:
         rows = self._session.scalars(select(TaskExceptionModel).where(TaskExceptionModel.status == "OPEN"))
         return [_exception_to_domain(m) for m in rows]
+
+    def update_status(self, exception_id: uuid.UUID, status: str) -> None:
+        """Minimal status transition (e.g. OPEN -> RESOLVED), mirroring
+        AccrualRepository.update_status / MatchCaseRepository.update_status
+        — not a workflow engine, just the existing TaskException.status
+        field the domain model already has. Used by
+        bel.application.sales_contract_facts to close an
+        unresolved-customer Task once a SUPPLEMENT fills in the customer
+        (docs/V1-SCOPE.md section 5.2's closed loop: "Task resolves")."""
+        m = self._session.get(TaskExceptionModel, exception_id)
+        if m is None:
+            raise KeyError(f"TaskException {exception_id} not found")
+        m.status = status
 
 
 class EventRepository:

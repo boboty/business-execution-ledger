@@ -30,6 +30,16 @@ from bel.application.list_matches import list_match_cases
 from bel.application.matching import confirm_match, match_invoices, match_payments
 from bel.application.period_close import build_period_close_preview
 from bel.application.search_contracts import search_contracts_by_no
+from bel.application.sales_contract_facts import (
+    SalesContractFactError,
+    execute_correct_sales_contract_fact,
+    execute_create_sales_contract_fact,
+    execute_supplement_sales_contract_fact,
+    find_sales_contract_by_identity,
+    get_sales_contract,
+    get_sales_contract_history,
+    list_sales_contracts,
+)
 from bel.application.shipment_facts import (
     ShipmentFactError,
     execute_correct_shipment_fact,
@@ -1043,6 +1053,228 @@ def shipment_list(ctx: click.Context, contract_id) -> None:
         click.echo(
             f"  {s.id} external_reference={s.external_reference!r} execution_date={s.execution_date} "
             f"item={s.contract_item_id} quantity={s.quantity}"
+        )
+
+
+_SALES_CONTRACT_FIELD_OPTIONS = (
+    click.option(
+        "--customer",
+        "customer",
+        default=None,
+        help="External sales customer, from sales-side Evidence only. Never Contract.buyer, never a "
+        "sales-scope reference number, never a customs/shipping party.",
+    ),
+    click.option("--currency", "currency", default=None, help="Currency."),
+    click.option("--gross-amount", "gross_amount", default=None, help="Gross amount."),
+    click.option("--contract-date", "contract_date", default=None, help="Contract date, YYYY-MM-DD."),
+)
+
+
+def _sales_contract_field_options(f):
+    for option in reversed(_SALES_CONTRACT_FIELD_OPTIONS):
+        f = option(f)
+    return f
+
+
+def _sales_contract_fields_from_options(customer, currency, gross_amount, contract_date) -> dict:
+    """Only options the caller actually passed become dict entries — an
+    omitted --flag is "not asserted this call", not "assert NULL"."""
+    raw = {"customer": customer, "currency": currency, "gross_amount": gross_amount, "contract_date": contract_date}
+    fields = {k: v for k, v in raw.items() if v is not None}
+    if "gross_amount" in fields:
+        fields["gross_amount"] = Decimal(fields["gross_amount"])
+    if "contract_date" in fields:
+        fields["contract_date"] = date.fromisoformat(fields["contract_date"])
+    return fields
+
+
+@cli.group("sales-contract")
+def sales_contract_group() -> None:
+    """SalesContract Fact maintenance (Phase 2D.1-R3a Slice 1): create,
+    supplement, correct and inspect the sales-side twin of Contract — the
+    only place an external sales customer is expressed. A human
+    confirmation IS Evidence (docs/DOMAIN.md), traceable exactly like an
+    imported one. Never creates a ProcurementSalesLink (Slice 2)."""
+
+
+@sales_contract_group.command("create")
+@click.option("--our-entity", "our_entity", default=None, help="Our own contracting entity on the sales leg.")
+@click.option("--sales-contract-no", "sales_contract_no", default=None, help="Sales contract number.")
+@_sales_contract_field_options
+@click.pass_context
+def sales_contract_create(ctx: click.Context, our_entity, sales_contract_no, **field_options) -> None:
+    """Assert a new SalesContract (case A — it did not exist before).
+    Omitting --our-entity or --sales-contract-no raises a
+    SalesContractIdentityIncomplete Task — NO anchor is created (there is
+    no confirmation override, unlike Shipment). Omitting --customer is
+    fine: the anchor IS created, with an unresolved-customer Task.
+    A duplicate (our-entity, sales-contract-no) asserting the SAME values
+    is an exact replay or corroborating Evidence (no new anchor);
+    asserting DIFFERENT values is an explicit conflict (a
+    BusinessKeyConflict Task is raised; the existing SalesContract is
+    unchanged)."""
+    fields = _sales_contract_fields_from_options(**field_options)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_create_sales_contract_fact(
+                session, our_entity=our_entity, sales_contract_no=sales_contract_no, fields=fields
+            )
+    except SalesContractFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    if result.created:
+        outcome = "created"
+    elif result.replay:
+        outcome = "already exists (exact replay — same Evidence, same content)"
+    elif result.corroborating:
+        outcome = "already exists (corroborating Evidence — different fragment, same content)"
+    else:
+        outcome = "already exists"
+    click.echo(
+        f"SalesContract {result.sales_contract.id} {outcome}: our_entity={result.sales_contract.our_entity!r} "
+        f"sales_contract_no={result.sales_contract.sales_contract_no!r} customer={result.sales_contract.customer!r} "
+        f"currency={result.sales_contract.currency} gross_amount={result.sales_contract.gross_amount}"
+    )
+
+
+@sales_contract_group.command("supplement")
+@click.option("--sales-contract-id", "sales_contract_id", type=click.UUID, required=True, help="SalesContract id (the anchor).")
+@click.option(
+    "--based-on", "based_on_revision_id", type=click.UUID, required=True, help="Revision id believed to be current."
+)
+@_sales_contract_field_options
+@click.pass_context
+def sales_contract_supplement(ctx: click.Context, sales_contract_id, based_on_revision_id, **field_options) -> None:
+    """Fill in a previously-unknown field (case B-supplement), most
+    commonly --customer once sales-side Evidence identifies it — this
+    resolves the anchor's unresolved-customer Task. Rejected if any given
+    field already holds a DIFFERENT known value — that is a correction,
+    not a supplement."""
+    fields = _sales_contract_fields_from_options(**field_options)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_supplement_sales_contract_fact(
+                session, sales_contract_id=sales_contract_id, based_on_revision_id=based_on_revision_id, fields=fields
+            )
+    except SalesContractFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    click.echo(
+        f"SalesContract {result.sales_contract.id} supplemented"
+        f"{' (idempotent replay — no new revision)' if not result.revision_written else ''}: "
+        f"customer={result.sales_contract.customer!r}"
+    )
+
+
+@sales_contract_group.command("correct")
+@click.option("--sales-contract-id", "sales_contract_id", type=click.UUID, required=True, help="SalesContract id (the anchor).")
+@click.option(
+    "--based-on", "based_on_revision_id", type=click.UUID, required=True, help="Revision id believed to be current."
+)
+@_sales_contract_field_options
+@click.pass_context
+def sales_contract_correct(ctx: click.Context, sales_contract_id, based_on_revision_id, **field_options) -> None:
+    """Correct a previously-asserted value that was wrong (case
+    B-correction). Rejected if any given field currently has no value —
+    that is a supplement, not a correction."""
+    fields = _sales_contract_fields_from_options(**field_options)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_correct_sales_contract_fact(
+                session, sales_contract_id=sales_contract_id, based_on_revision_id=based_on_revision_id, fields=fields
+            )
+    except SalesContractFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    click.echo(
+        f"SalesContract {result.sales_contract.id} corrected"
+        f"{' (idempotent replay — no new revision)' if not result.revision_written else ''}: "
+        f"customer={result.sales_contract.customer!r}"
+    )
+
+
+@sales_contract_group.command("show")
+@click.argument("sales_contract_id", type=click.UUID)
+@click.pass_context
+def sales_contract_show(ctx: click.Context, sales_contract_id) -> None:
+    """Show the current authoritative SalesContract state."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        sales_contract = get_sales_contract(session, sales_contract_id)
+    if sales_contract is None:
+        click.echo(f"Error: SalesContract {sales_contract_id} not found")
+        raise SystemExit(1)
+
+    click.echo(f"SalesContract {sales_contract.id}")
+    click.echo(f"  our_entity:                 {sales_contract.our_entity}")
+    click.echo(f"  sales_contract_no:          {sales_contract.sales_contract_no}")
+    click.echo(f"  customer:                   {sales_contract.customer}")
+    click.echo(f"  currency:                   {sales_contract.currency}")
+    click.echo(f"  gross_amount:               {sales_contract.gross_amount}")
+    click.echo(f"  contract_date:              {sales_contract.contract_date}")
+    click.echo(f"  current_source_fragment_id: {sales_contract.current_source_fragment_id}")
+    click.echo(f"  created_at:                 {sales_contract.created_at}")
+
+
+@sales_contract_group.command("history")
+@click.argument("sales_contract_id", type=click.UUID)
+@click.pass_context
+def sales_contract_history(ctx: click.Context, sales_contract_id) -> None:
+    """List every revision ever asserted for this SalesContract, oldest
+    first — the full audit trail, including superseded revisions."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        revisions = get_sales_contract_history(session, sales_contract_id)
+    if not revisions:
+        click.echo(f"SalesContract {sales_contract_id} has no revisions (not found, or anchor with no history)")
+        return
+
+    click.echo(f"SalesContract {sales_contract_id} — {len(revisions)} revision(s):")
+    for r in revisions:
+        current_marker = " [CURRENT]" if r.superseded_by_revision_id is None else f" [superseded by {r.superseded_by_revision_id}]"
+        click.echo(
+            f"  {r.id} [{r.revision_type}]{current_marker} customer={r.customer!r} currency={r.currency} "
+            f"source_fragment={r.source_fragment_id} created_at={r.created_at}"
+        )
+
+
+@sales_contract_group.command("list")
+@click.pass_context
+def sales_contract_list(ctx: click.Context) -> None:
+    """List every SalesContract, oldest first."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        sales_contracts = list_sales_contracts(session)
+    if not sales_contracts:
+        click.echo("No SalesContracts")
+        return
+
+    click.echo(f"SalesContracts — {len(sales_contracts)}:")
+    for sc in sales_contracts:
+        click.echo(
+            f"  {sc.id} our_entity={sc.our_entity!r} sales_contract_no={sc.sales_contract_no!r} "
+            f"customer={sc.customer!r}"
         )
 
 

@@ -40,6 +40,19 @@ class ExceptionType:
     # left completely unchanged; a human must resolve the conflict via an
     # explicit supplement or correction.
     SHIPMENT_IDENTITY_CONFLICT = "ShipmentIdentityConflict"
+    # Phase 2D.1-R3a Slice 1: a SalesContract create is missing
+    # `our_entity` and/or `sales_contract_no` (docs/PHASE2D1-R0-DECISIONS.md
+    # section 4.4: "NO canonical anchor may be created"). Unlike Shipment,
+    # there is no confirmation override for this — the identity is
+    # genuinely required, not merely "incomplete but usable". Evidence is
+    # preserved and this Task is raised instead of any anchor.
+    SALES_CONTRACT_IDENTITY_INCOMPLETE = "SalesContractIdentityIncomplete"
+    # Phase 2D.1-R3a Slice 1: a SalesContract was created (or currently
+    # stands) with `customer = NULL` (section 2.3: "A SalesContract may
+    # legitimately exist before its customer is known... the scope
+    # carries an unresolved-customer Task. It is never guessed."). Closed
+    # (ExceptionStatus.RESOLVED) once a SUPPLEMENT fills in `customer`.
+    SALES_CONTRACT_CUSTOMER_UNRESOLVED = "SalesContractCustomerUnresolved"
 
 
 class ExceptionStatus:
