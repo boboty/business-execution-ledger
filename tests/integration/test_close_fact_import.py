@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -17,6 +17,7 @@ from bel.application.contract_item_facts import get_contract_item_history
 from bel.application.import_close_facts import CloseFactPackError, import_close_facts
 from bel.application.import_contract_ledger import import_contract_ledger
 from bel.application.import_invoices import import_invoices
+from bel.application.shipment_facts import create_shipment_fact
 from bel.domain.accrual import AccrualStatus
 from bel.domain.invoice import InvoiceDirection
 from bel.domain.matching import (
@@ -41,11 +42,13 @@ from bel.infrastructure.persistence.repositories import (
     AccrualRepository,
     ContractItemRepository,
     ContractRepository,
+    CostRecognitionFactRepository,
     EvidenceRepository,
     InvoiceAllocationRepository,
     InvoiceItemAllocationRepository,
     InvoiceRepository,
     MatchCaseRepository,
+    ShipmentRepository,
 )
 
 NOW = datetime.now(timezone.utc)
@@ -380,3 +383,71 @@ def test_close_fact_pack_corroborating_reimport_is_silent(
     )
     assert item.quantity == Decimal("100")
     assert len(get_contract_item_history(db_session, item.id)) == 1
+
+
+def test_cost_recognition_fact_can_carry_explicit_shipment_provenance(
+    db_session, phase2b_ledger_path, phase2b_invoices_path, tmp_path
+):
+    """Phase 2D.1-R2, section 11: a cost_recognition_facts entry MAY name
+    an existing Shipment by its frozen identity — the Close Fact Pack
+    never creates one itself."""
+    import_contract_ledger(db_session, phase2b_ledger_path)
+    contract = next(c for c in ContractRepository(db_session).list_all() if c.contract_no == "PO-CLOSE-001")
+
+    shipment = create_shipment_fact(
+        db_session,
+        contract_id=contract.id,
+        external_reference="EXP-CLOSE-001-A",
+        execution_date=date(2031, 3, 5),
+        fields={},
+        source_fragment_id=contract.current_source_fragment_id,
+        created_at=NOW,
+    ).shipment
+    db_session.commit()
+
+    pack = {
+        "version": 1,
+        "cost_recognition_facts": [
+            {
+                "contract_selector": {"contract_no": "PO-CLOSE-001", "counterparty": "SupplierCloseAlpha"},
+                "recognition_date": "2031-03-05",
+                "basis": "EXPORT_EXECUTION_CONFIRMED",
+                "shipment": {"external_reference": "EXP-CLOSE-001-A", "execution_date": "2031-03-05"},
+            }
+        ],
+    }
+    pack_path = tmp_path / "shipment-provenance.json"
+    pack_path.write_text(json.dumps(pack))
+    result = import_close_facts(db_session, pack_path)
+
+    assert result.cost_recognition_facts_created == 1
+    facts = CostRecognitionFactRepository(db_session).list_for_shipment(shipment.id)
+    assert len(facts) == 1
+    assert facts[0].basis == "EXPORT_EXECUTION_CONFIRMED"
+
+
+def test_cost_recognition_fact_shipment_reference_never_auto_creates(
+    db_session, phase2b_ledger_path, phase2b_invoices_path, tmp_path
+):
+    """An unresolvable shipment reference is rejected outright — never
+    silently ignored, and never auto-creates the missing Shipment."""
+    import_contract_ledger(db_session, phase2b_ledger_path)
+
+    pack = {
+        "version": 1,
+        "cost_recognition_facts": [
+            {
+                "contract_selector": {"contract_no": "PO-CLOSE-001", "counterparty": "SupplierCloseAlpha"},
+                "recognition_date": "2031-03-05",
+                "basis": "EXPORT_EXECUTION_CONFIRMED",
+                "shipment": {"external_reference": "NO-SUCH-SHIPMENT", "execution_date": "2031-03-05"},
+            }
+        ],
+    }
+    pack_path = tmp_path / "unresolvable-shipment.json"
+    pack_path.write_text(json.dumps(pack))
+    with pytest.raises(CloseFactPackError):
+        import_close_facts(db_session, pack_path)
+
+    assert CostRecognitionFactRepository(db_session).list_all() == []
+    assert ShipmentRepository(db_session).list_all() == []  # never auto-created

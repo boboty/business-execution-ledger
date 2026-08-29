@@ -55,7 +55,19 @@ class CostRecognitionFact:
     """Answers: has this contract reached the current period's
     cost-recognition condition? Phase 2B does not auto-judge which
     business behavior implies cost recognition — the Fact Pack states it
-    and the Rule Engine consumes the fact. See section 4 of the spec."""
+    and the Rule Engine consumes the fact. See section 4 of the spec.
+
+    ``shipment_id`` (Phase 2D.1-R2) is a provenance reference under
+    docs/PHASE2D1-R0-DECISIONS.md section 3.4 — it names the Shipment
+    anchor that evidenced this cost recognition, recorded once and never
+    re-pointed. It records *which* shipment evidenced the recognition; it
+    never creates the fact automatically (a human assertion is still
+    required to create a CostRecognitionFact at all — 3.4's frozen
+    "does NOT decide which business behavior means cost recognition"
+    stands unchanged), and it is nullable because a CostRecognitionFact
+    need not always be shipment-evidenced (MANUAL_CONFIRMED,
+    SALES_EXECUTION_CONFIRMED) and because pre-R2 facts have no shipment
+    to name."""
 
     id: UUID
     contract_id: UUID
@@ -63,6 +75,7 @@ class CostRecognitionFact:
     basis: str
     source_fragment_id: UUID
     created_at: datetime
+    shipment_id: UUID | None = None
 
 
 @dataclass(frozen=True)

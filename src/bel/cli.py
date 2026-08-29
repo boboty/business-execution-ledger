@@ -30,6 +30,15 @@ from bel.application.list_matches import list_match_cases
 from bel.application.matching import confirm_match, match_invoices, match_payments
 from bel.application.period_close import build_period_close_preview
 from bel.application.search_contracts import search_contracts_by_no
+from bel.application.shipment_facts import (
+    ShipmentFactError,
+    execute_correct_shipment_fact,
+    execute_create_shipment_fact,
+    execute_supplement_shipment_fact,
+    get_shipment,
+    get_shipment_history,
+    list_shipments_for_contract,
+)
 from bel.domain.invoice import InvoiceDirection
 from bel.infrastructure.persistence.database import is_database_busy, make_engine, make_session_factory
 
@@ -801,6 +810,239 @@ def contract_item_history(ctx: click.Context, item_id) -> None:
         click.echo(
             f"  {r.id} [{r.revision_type}]{current_marker} product={r.product_name!r} quantity={r.quantity} "
             f"source_fragment={r.source_fragment_id} created_at={r.created_at}"
+        )
+
+
+_SHIPMENT_FIELD_OPTIONS = (
+    click.option("--item", "contract_item_id", type=click.UUID, default=None, help="ContractItem id (item scope, where known)."),
+    click.option("--quantity", "quantity", default=None, help="Quantity."),
+)
+
+
+def _shipment_field_options(f):
+    for option in reversed(_SHIPMENT_FIELD_OPTIONS):
+        f = option(f)
+    return f
+
+
+def _shipment_fields_from_options(contract_item_id, quantity) -> dict:
+    """Only options the caller actually passed become dict entries — an
+    omitted --flag is "not asserted this call", not "assert NULL"."""
+    raw = {"contract_item_id": contract_item_id, "quantity": quantity}
+    fields = {k: v for k, v in raw.items() if v is not None}
+    if "quantity" in fields:
+        fields["quantity"] = Decimal(fields["quantity"])
+    return fields
+
+
+@cli.group("shipment")
+def shipment_group() -> None:
+    """Shipment Fact maintenance (Phase 2D.1-R2): create, supplement,
+    correct and inspect the everyday intake path for Shipment — a human
+    confirmation IS Evidence (docs/DOMAIN.md), traceable exactly like an
+    imported one. Records export EXECUTION only — never invoice
+    eligibility, and never a ProcurementSalesLink."""
+
+
+@shipment_group.command("create")
+@click.option("--contract", "contract_id", type=click.UUID, required=True, help="Contract id (procurement leg).")
+@click.option("--execution-date", "execution_date", required=True, help="Execution date, YYYY-MM-DD.")
+@click.option(
+    "--external-ref",
+    "external_reference",
+    default=None,
+    help="Declaration/booking reference as recorded. Omitting it leaves the business identity incomplete "
+    "(docs/PHASE2D1-R0-DECISIONS.md section 4.4): no anchor is created and no dedup is attempted — a Task "
+    "is raised instead, unless --confirm-incomplete-identity is also given.",
+)
+@click.option(
+    "--confirm-incomplete-identity",
+    "identity_confirmed",
+    is_flag=True,
+    default=False,
+    help="Explicit human confirmation to create a Shipment anchor despite having no --external-ref. Without "
+    "this flag, an omitted --external-ref only raises a SHIPMENT_IDENTITY_INCOMPLETE Task — no anchor is created.",
+)
+@_shipment_field_options
+@click.pass_context
+def shipment_create(
+    ctx: click.Context, contract_id, execution_date, external_reference, identity_confirmed, **field_options
+) -> None:
+    """Assert a new Shipment (case A — it did not exist before). A
+    duplicate (contract, external-ref, execution-date) asserting the SAME
+    values is an exact replay or corroborating Evidence (no new anchor);
+    asserting DIFFERENT values is an explicit conflict (a
+    ShipmentIdentityConflict Task is raised; the existing Shipment is
+    unchanged) — this never guesses whether the caller meant supplement
+    or correction."""
+    fields = _shipment_fields_from_options(**field_options)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_create_shipment_fact(
+                session,
+                contract_id=contract_id,
+                external_reference=external_reference,
+                execution_date=date.fromisoformat(execution_date),
+                fields=fields,
+                identity_confirmed=identity_confirmed,
+            )
+    except ShipmentFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    if result.created:
+        outcome = "created"
+    elif result.replay:
+        outcome = "already exists (exact replay — same Evidence, same content)"
+    elif result.corroborating:
+        outcome = "already exists (corroborating Evidence — different fragment, same content)"
+    else:
+        outcome = "already exists"
+    click.echo(
+        f"Shipment {result.shipment.id} {outcome}: contract={result.shipment.contract_id} "
+        f"external_reference={result.shipment.external_reference!r} execution_date={result.shipment.execution_date} "
+        f"item={result.shipment.contract_item_id} quantity={result.shipment.quantity}"
+    )
+
+
+@shipment_group.command("supplement")
+@click.option("--shipment-id", "shipment_id", type=click.UUID, required=True, help="Shipment id (the anchor).")
+@click.option(
+    "--based-on", "based_on_revision_id", type=click.UUID, required=True, help="Revision id believed to be current."
+)
+@_shipment_field_options
+@click.pass_context
+def shipment_supplement(ctx: click.Context, shipment_id, based_on_revision_id, **field_options) -> None:
+    """Fill in a previously-unknown field (case B-supplement). Rejected
+    if any given field already holds a DIFFERENT known value — that is a
+    correction, not a supplement."""
+    fields = _shipment_fields_from_options(**field_options)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_supplement_shipment_fact(
+                session, shipment_id=shipment_id, based_on_revision_id=based_on_revision_id, fields=fields
+            )
+    except ShipmentFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    click.echo(
+        f"Shipment {result.shipment.id} supplemented"
+        f"{' (idempotent replay — no new revision)' if not result.revision_written else ''}: "
+        f"item={result.shipment.contract_item_id} quantity={result.shipment.quantity}"
+    )
+
+
+@shipment_group.command("correct")
+@click.option("--shipment-id", "shipment_id", type=click.UUID, required=True, help="Shipment id (the anchor).")
+@click.option(
+    "--based-on", "based_on_revision_id", type=click.UUID, required=True, help="Revision id believed to be current."
+)
+@_shipment_field_options
+@click.pass_context
+def shipment_correct(ctx: click.Context, shipment_id, based_on_revision_id, **field_options) -> None:
+    """Correct a previously-asserted value that was wrong (case
+    B-correction). Rejected if any given field currently has no value —
+    that is a supplement, not a correction. If a persisted
+    CostRecognitionFact still references this Shipment, a
+    ShipmentFactSuperseded Task is raised naming it."""
+    fields = _shipment_fields_from_options(**field_options)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_correct_shipment_fact(
+                session, shipment_id=shipment_id, based_on_revision_id=based_on_revision_id, fields=fields
+            )
+    except ShipmentFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    click.echo(
+        f"Shipment {result.shipment.id} corrected"
+        f"{' (idempotent replay — no new revision)' if not result.revision_written else ''}: "
+        f"item={result.shipment.contract_item_id} quantity={result.shipment.quantity}"
+    )
+
+
+@shipment_group.command("show")
+@click.argument("shipment_id", type=click.UUID)
+@click.pass_context
+def shipment_show(ctx: click.Context, shipment_id) -> None:
+    """Show the current authoritative Shipment state."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        shipment = get_shipment(session, shipment_id)
+    if shipment is None:
+        click.echo(f"Error: Shipment {shipment_id} not found")
+        raise SystemExit(1)
+
+    click.echo(f"Shipment {shipment.id}")
+    click.echo(f"  contract_id:                {shipment.contract_id}")
+    click.echo(f"  external_reference:         {shipment.external_reference}")
+    click.echo(f"  execution_date:             {shipment.execution_date}")
+    click.echo(f"  contract_item_id:           {shipment.contract_item_id}")
+    click.echo(f"  quantity:                   {shipment.quantity}")
+    click.echo(f"  current_source_fragment_id: {shipment.current_source_fragment_id}")
+    click.echo(f"  created_at:                 {shipment.created_at}")
+
+
+@shipment_group.command("history")
+@click.argument("shipment_id", type=click.UUID)
+@click.pass_context
+def shipment_history(ctx: click.Context, shipment_id) -> None:
+    """List every revision ever asserted for this Shipment, oldest first
+    — the full audit trail, including superseded revisions."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        revisions = get_shipment_history(session, shipment_id)
+    if not revisions:
+        click.echo(f"Shipment {shipment_id} has no revisions (not found, or anchor with no history)")
+        return
+
+    click.echo(f"Shipment {shipment_id} — {len(revisions)} revision(s):")
+    for r in revisions:
+        current_marker = " [CURRENT]" if r.superseded_by_revision_id is None else f" [superseded by {r.superseded_by_revision_id}]"
+        click.echo(
+            f"  {r.id} [{r.revision_type}]{current_marker} item={r.contract_item_id} quantity={r.quantity} "
+            f"source_fragment={r.source_fragment_id} created_at={r.created_at}"
+        )
+
+
+@shipment_group.command("list")
+@click.option("--contract", "contract_id", type=click.UUID, required=True, help="Contract id.")
+@click.pass_context
+def shipment_list(ctx: click.Context, contract_id) -> None:
+    """List every Shipment for a Contract, oldest first — one Contract
+    may have many Shipments (docs/PHASE2D1-R0-DECISIONS.md section 3.3)."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        shipments = list_shipments_for_contract(session, contract_id)
+    if not shipments:
+        click.echo(f"No Shipments for contract {contract_id}")
+        return
+
+    click.echo(f"Shipments for contract {contract_id} — {len(shipments)}:")
+    for s in shipments:
+        click.echo(
+            f"  {s.id} external_reference={s.external_reference!r} execution_date={s.execution_date} "
+            f"item={s.contract_item_id} quantity={s.quantity}"
         )
 
 

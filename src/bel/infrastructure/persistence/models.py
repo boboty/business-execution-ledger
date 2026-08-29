@@ -186,6 +186,99 @@ class ContractItemRevisionModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class ShipmentModel(Base):
+    """The stable identity anchor for Shipment (Phase 2D.1-R2), same
+    pattern as ContractItemModel. Carries the frozen business identity
+    (docs/PHASE2D1-R0-DECISIONS.md section 4.4:
+    ``(contract_id, external_reference, execution_date)``) — these three
+    fields are immutable after creation; correcting one is
+    re-identification and out of R2's scope (section 4.4's "always
+    produces a Task", deferred to R5), exactly like ContractItem's
+    ``(contract_id, source_item_key)``. All other business values
+    (``contract_item_id``, ``quantity``) live on ShipmentRevisionModel
+    instead.
+
+    ``external_reference`` is nullable (section 3.2: "optional"). SQLite
+    (like standard SQL) treats NULL as distinct from any other NULL under
+    a UNIQUE constraint, so two Shipments sharing
+    ``(contract_id, execution_date)`` with no ``external_reference`` never
+    collide — matching section 4.4's "external_reference null -> identity
+    incomplete -> requires human confirmation": there is no reliable key
+    to auto-dedupe against, so none is attempted (bel.application.
+    shipment_facts never looks up by identity when external_reference is
+    None; every such create is unconditionally new)."""
+
+    __tablename__ = "shipments"
+    __table_args__ = (
+        UniqueConstraint(
+            "contract_id", "external_reference", "execution_date", name="uq_shipment_business_identity"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    external_reference: Mapped[str | None] = mapped_column(String, nullable=True)
+    execution_date: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ShipmentRevisionModel(Base):
+    """Versioned assertions about a Shipment anchor — same model as
+    ContractItemRevisionModel (docs/PHASE2D1-R0-DECISIONS.md section
+    1.3), including the same three DB-level backstops closed in the
+    Phase 2D.1-R1 Codex fix rounds: ``uq_shipment_revisions_one_current``
+    (at most one current revision per anchor),
+    ``uq_shipment_revisions_one_initial`` (at most one INITIAL revision
+    per anchor — a separate invariant from "one current"), and
+    ``ck_shipment_revisions_revision_type`` (the closed
+    INITIAL/SUPPLEMENT/CORRECTION set, enforced even against a raw
+    INSERT or an ORM bypass).
+
+    ``source_fragment_id`` is NOT NULL here — unlike
+    ContractItemRevisionModel, there is no pre-R2 legacy Shipment data to
+    accommodate, so section 3.2's "source_fragment_id required — Evidence
+    trace, never nullable" is enforced as a real schema constraint, not
+    only at the application layer."""
+
+    __tablename__ = "shipment_revisions"
+    __table_args__ = (
+        Index(
+            "uq_shipment_revisions_one_current",
+            "shipment_id",
+            unique=True,
+            sqlite_where=text("superseded_by_revision_id IS NULL"),
+        ),
+        Index(
+            "uq_shipment_revisions_one_initial",
+            "shipment_id",
+            unique=True,
+            sqlite_where=text("revision_type = 'INITIAL'"),
+        ),
+        CheckConstraint(
+            "revision_type IN ('INITIAL', 'SUPPLEMENT', 'CORRECTION')",
+            name="ck_shipment_revisions_revision_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    shipment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("shipments.id"), nullable=False, index=True)
+    revision_type: Mapped[str] = mapped_column(String, nullable=False)  # INITIAL / SUPPLEMENT / CORRECTION
+    contract_item_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("contract_items.id"), nullable=True)
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    # Provenance reference — the exact Evidence for THIS revision. Never
+    # re-pointed. See docs/PHASE2D1-R0-DECISIONS.md sections 1.3 and 3.2.
+    source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    superseded_by_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("shipment_revisions.id"), nullable=True, index=True
+    )
+    # The exact field names the writing command actually asserted,
+    # captured verbatim — see ContractItemRevisionModel's docstring for
+    # why this must never be reconstructed later by diffing against the
+    # predecessor.
+    asserted_field_names: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class BusinessEventModel(Base):
     __tablename__ = "business_events"
 
@@ -374,6 +467,11 @@ class CostRecognitionFactModel(Base):
     recognition_date: Mapped[date] = mapped_column(Date, nullable=False)
     basis: Mapped[str] = mapped_column(String, nullable=False)
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
+    # Provenance reference (Phase 2D.1-R2, docs/PHASE2D1-R0-DECISIONS.md
+    # section 3.4) — names the Shipment anchor that evidenced this cost
+    # recognition. Nullable: pre-R2 facts have none, and not every basis
+    # is shipment-evidenced. Never re-pointed once set.
+    shipment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("shipments.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 

@@ -65,6 +65,7 @@ from bel.infrastructure.persistence.repositories import (
     InvoiceItemAllocationRepository,
     InvoiceItemRepository,
     InvoiceRepository,
+    ShipmentRepository,
 )
 
 SOURCE_TYPE = "close_fact_pack_json"
@@ -146,6 +147,46 @@ def _selector_from(entry: dict, section: str) -> dict:
     if "counterparty" not in selector:
         raise CloseFactPackError(f"{section}: every entry needs contract_selector.counterparty")
     return selector
+
+
+def _resolve_shipment_reference(session: Session, contract: Contract, entry: dict, section: str) -> uuid.UUID | None:
+    """Phase 2D.1-R2: an OPTIONAL ``shipment`` reference on a
+    ``cost_recognition_facts`` entry, resolved against the frozen
+    Shipment business identity (docs/PHASE2D1-R0-DECISIONS.md section
+    4.4: ``(contract_id, external_reference, execution_date)``).
+
+    This is explicit provenance the caller supplies, never a guess: a
+    reference that does not resolve to an EXISTING Shipment is rejected
+    outright (section 3.4 forbids auto-creating a Shipment from a cost
+    recognition entry), and an entry with no ``shipment`` key at all is
+    fully backward-compatible — ``shipment_id`` stays ``None``, exactly
+    as every ``cost_recognition_facts`` entry behaved before this
+    round."""
+    shipment_ref = entry.get("shipment")
+    if shipment_ref is None:
+        return None
+    if (
+        not isinstance(shipment_ref, dict)
+        or "execution_date" not in shipment_ref
+        or not shipment_ref.get("external_reference")
+    ):
+        # external_reference is required HERE even though it is optional
+        # on Shipment itself (section 3.2): a NULL external_reference
+        # means "identity incomplete" (section 4.4) — there is no
+        # reliable key to resolve a reference against, so this generic
+        # textual selector can never safely name such a Shipment. No
+        # lookup is attempted; the caller must supply a real reference.
+        raise CloseFactPackError(f"{section}: shipment reference needs external_reference and execution_date")
+    execution_date = _date(shipment_ref["execution_date"], section)
+    external_reference = shipment_ref["external_reference"]
+    shipment = ShipmentRepository(session).find_by_identity(contract.id, external_reference, execution_date)
+    if shipment is None:
+        raise CloseFactPackError(
+            f"{section}: no Shipment found for contract {contract.contract_no!r} with "
+            f"external_reference={external_reference!r} execution_date={execution_date} — Shipments must "
+            "already exist (e.g. via `bel shipment create`); this entry never creates one"
+        )
+    return shipment.id
 
 
 class _ContractResolver:
@@ -350,7 +391,9 @@ def _import_close_facts(session: Session, file_path: Path) -> CloseFactImportRes
                 f"{source_item_key!r} in this pack"
             ) from exc
 
-    # Pass 3 — cost recognition facts.
+    # Pass 3 — cost recognition facts. `shipment` is an OPTIONAL explicit
+    # provenance reference (Phase 2D.1-R2, section 3.4) — an entry with
+    # no `shipment` key behaves exactly as before this round.
     for index, entry in enumerate(entry_lists["cost_recognition_facts"]):
         fragment_id = fragment_ids[("cost_recognition_facts", index)]
         contract = resolver.resolve(_selector_from(entry, "cost_recognition_facts"), "cost_recognition_facts")
@@ -358,6 +401,7 @@ def _import_close_facts(session: Session, file_path: Path) -> CloseFactImportRes
         if basis not in _VALID_COST_RECOGNITION_BASIS:
             raise CloseFactPackError(f"cost_recognition_facts: unsupported basis {basis!r}")
         recognition_date = _date(entry["recognition_date"], "cost_recognition_facts")
+        shipment_id = _resolve_shipment_reference(session, contract, entry, "cost_recognition_facts")
         if cost_rec_repo.find_duplicate(contract.id, recognition_date, basis) is not None:
             result.cost_recognition_facts_skipped += 1
             continue
@@ -369,6 +413,7 @@ def _import_close_facts(session: Session, file_path: Path) -> CloseFactImportRes
                 basis=basis,
                 source_fragment_id=fragment_id,
                 created_at=now,
+                shipment_id=shipment_id,
             )
         )
         result.cost_recognition_facts_created += 1

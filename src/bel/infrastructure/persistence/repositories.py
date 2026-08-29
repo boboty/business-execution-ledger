@@ -28,6 +28,7 @@ from bel.domain.exception import TaskException
 from bel.domain.invoice import Invoice, InvoiceItem
 from bel.domain.matching import InvoiceAllocation, MatchCandidate, MatchCase, PaymentAllocation
 from bel.domain.payment import Payment
+from bel.domain.shipment import Shipment, ShipmentRevision, ShipmentRevisionType
 from bel.infrastructure.persistence.models import (
     AccrualBasisFactModel,
     AccrualModel,
@@ -49,6 +50,8 @@ from bel.infrastructure.persistence.models import (
     MatchCaseModel,
     PaymentAllocationModel,
     PaymentModel,
+    ShipmentModel,
+    ShipmentRevisionModel,
     TaskExceptionModel,
 )
 
@@ -131,6 +134,37 @@ def _assemble_contract_item(anchor: ContractItemModel, current_revision: Contrac
         gross_amount=current_revision.gross_amount,
         tax_rate=current_revision.tax_rate,
         net_amount=current_revision.net_amount,
+        current_source_fragment_id=current_revision.source_fragment_id,
+        created_at=anchor.created_at,
+    )
+
+
+def _shipment_revision_to_domain(m: ShipmentRevisionModel) -> ShipmentRevision:
+    return ShipmentRevision(
+        id=m.id,
+        shipment_id=m.shipment_id,
+        revision_type=m.revision_type,
+        contract_item_id=m.contract_item_id,
+        quantity=m.quantity,
+        source_fragment_id=m.source_fragment_id,
+        superseded_by_revision_id=m.superseded_by_revision_id,
+        created_at=m.created_at,
+        asserted_field_names=m.asserted_field_names,
+    )
+
+
+def _assemble_shipment(anchor: ShipmentModel, current_revision: ShipmentRevisionModel) -> Shipment:
+    """The anchor + current-revision join, in ONE place, mirroring
+    ``_assemble_contract_item``. See docs/PHASE2D1-R0-DECISIONS.md
+    section 1.3 — current-revision resolution is defined once, in the
+    repository layer."""
+    return Shipment(
+        id=anchor.id,
+        contract_id=anchor.contract_id,
+        external_reference=anchor.external_reference,
+        execution_date=anchor.execution_date,
+        contract_item_id=current_revision.contract_item_id,
+        quantity=current_revision.quantity,
         current_source_fragment_id=current_revision.source_fragment_id,
         created_at=anchor.created_at,
     )
@@ -628,6 +662,264 @@ class ContractItemRepository:
         return len(self._session.scalars(select(ContractItemModel.id)).all())
 
 
+class ShipmentRepository:
+    """Anchor + current-revision assembly for Shipment (Phase 2D.1-R2),
+    the same pattern as ContractItemRepository — reused deliberately,
+    not abstracted into a shared generic engine. ``get`` /
+    ``find_by_identity`` / ``list_*`` join the anchor to its current
+    (un-superseded) revision and return the assembled ``Shipment``
+    dataclass.
+
+    Anchor and revision writes (``create_anchor`` /
+    ``create_initial_revision`` / ``append_revision_against_current``)
+    are the primitives ``bel.application.shipment_facts`` composes into
+    the three Fact-maintenance operations (create / supplement /
+    correct). There is no unchecked "just insert a revision row"
+    primitive, mirroring every structural invariant closed in the Phase
+    2D.1-R1 Codex fix rounds: Evidence required for every new revision,
+    at most one INITIAL and one current revision per anchor (DB-backed),
+    the closed revision_type set (DB-backed), and an anchor-scoped
+    conditional-retire-then-insert CAS that cannot cross anchors."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def _current_revision_join(self):
+        return select(ShipmentModel, ShipmentRevisionModel).join(
+            ShipmentRevisionModel,
+            (ShipmentRevisionModel.shipment_id == ShipmentModel.id)
+            & (ShipmentRevisionModel.superseded_by_revision_id.is_(None)),
+        )
+
+    def create_anchor(
+        self, *, id: uuid.UUID, contract_id: uuid.UUID, external_reference: str | None, execution_date, created_at
+    ) -> None:
+        """Creates the bare identity anchor only — no business values, no
+        revision. Callers (bel.application.shipment_facts) always pair
+        this with an immediate ``create_initial_revision`` call, inside
+        the same transaction."""
+        self._session.add(
+            ShipmentModel(
+                id=id,
+                contract_id=contract_id,
+                external_reference=external_reference,
+                execution_date=execution_date,
+                created_at=created_at,
+            )
+        )
+
+    def create_initial_revision(self, revision: ShipmentRevision) -> None:
+        """The ONLY way to write an anchor's first (INITIAL) revision
+        through the normal repository API. Requires real Evidence: a new
+        canonical revision must never carry ``source_fragment_id=None``
+        (there is no pre-R2 legacy Shipment data to accommodate a
+        looser rule for, unlike ContractItem)."""
+        if revision.source_fragment_id is None:
+            raise ValueError("ShipmentRevision.source_fragment_id is required for a new revision")
+        if revision.revision_type != ShipmentRevisionType.INITIAL:
+            raise ValueError("create_initial_revision only accepts revision_type=INITIAL")
+        if revision.superseded_by_revision_id is not None:
+            raise ValueError("a newly created current revision cannot already be superseded")
+        self._session.add(self._revision_model(revision))
+
+    def append_revision_against_current(self, revision: ShipmentRevision, *, based_on_revision_id: uuid.UUID) -> bool:
+        """The ONLY way to append a SUPPLEMENT/CORRECTION revision
+        through the normal repository API. Atomically retires
+        ``based_on_revision_id`` with a single conditional
+        ``UPDATE ... WHERE id = :based_on AND shipment_id = :anchor AND
+        superseded_by_revision_id IS NULL`` and only inserts ``revision``
+        as the new current row if EXACTLY one row was retired.
+
+        Only ``SUPPLEMENT`` and ``CORRECTION`` may ever be appended this
+        way — an ``INITIAL`` or any unrecognised ``revision_type`` is a
+        caller bug, not a conflict, and raises ``ValueError`` immediately,
+        before any UPDATE or INSERT runs.
+
+        The anchor-ownership check (``shipment_id ==
+        revision.shipment_id``) is folded into the SAME conditional
+        UPDATE as the current-revision check, not a separate SELECT
+        beforehand — a check-then-act split would reopen the exact race
+        this method exists to close, just on ownership instead of
+        currency. Returns ``False`` — having written NOTHING — for any
+        of: ``based_on_revision_id`` does not exist, is no longer current
+        (someone else already superseded it), or does not belong to
+        ``revision.shipment_id`` (a cross-anchor append attempt). The
+        caller MUST treat ``False`` as a conflict and never retry
+        blindly. The ``uq_shipment_revisions_one_current`` partial unique
+        index is the DB-level backstop behind the current-revision half
+        of this guarantee, not a substitute for it."""
+        if revision.source_fragment_id is None:
+            raise ValueError("ShipmentRevision.source_fragment_id is required for a new revision")
+        if revision.superseded_by_revision_id is not None:
+            raise ValueError("a newly created current revision cannot already be superseded")
+        if revision.revision_type not in (ShipmentRevisionType.SUPPLEMENT, ShipmentRevisionType.CORRECTION):
+            raise ValueError(
+                "append_revision_against_current only accepts revision_type SUPPLEMENT or CORRECTION, got "
+                f"{revision.revision_type!r} — INITIAL must go through create_initial_revision, and no other "
+                "value is a legal revision_type"
+            )
+        # See ContractItemRepository.append_revision_against_current for
+        # why defer_foreign_keys is required here: the retiring UPDATE
+        # must point the old row at `revision.id` before `revision`
+        # itself is inserted, and SQLite's connect-time
+        # `PRAGMA foreign_keys=ON` would otherwise reject a reference to
+        # a row that does not exist yet.
+        self._session.execute(text("PRAGMA defer_foreign_keys = ON"))
+        result = self._session.execute(
+            update(ShipmentRevisionModel)
+            .where(
+                ShipmentRevisionModel.id == based_on_revision_id,
+                ShipmentRevisionModel.shipment_id == revision.shipment_id,
+                ShipmentRevisionModel.superseded_by_revision_id.is_(None),
+            )
+            .values(superseded_by_revision_id=revision.id)
+        )
+        if result.rowcount != 1:
+            return False
+        self._session.add(self._revision_model(revision))
+        self._session.flush()
+        return True
+
+    def _revision_model(self, revision: ShipmentRevision) -> ShipmentRevisionModel:
+        return ShipmentRevisionModel(
+            id=revision.id,
+            shipment_id=revision.shipment_id,
+            revision_type=revision.revision_type,
+            contract_item_id=revision.contract_item_id,
+            quantity=revision.quantity,
+            source_fragment_id=revision.source_fragment_id,
+            superseded_by_revision_id=revision.superseded_by_revision_id,
+            created_at=revision.created_at,
+            asserted_field_names=revision.asserted_field_names,
+        )
+
+    def get_current_revision(self, shipment_id: uuid.UUID) -> ShipmentRevision | None:
+        m = self._session.scalar(
+            select(ShipmentRevisionModel).where(
+                ShipmentRevisionModel.shipment_id == shipment_id,
+                ShipmentRevisionModel.superseded_by_revision_id.is_(None),
+            )
+        )
+        return _shipment_revision_to_domain(m) if m else None
+
+    def get_initial_revision(self, shipment_id: uuid.UUID) -> ShipmentRevision | None:
+        m = self._session.scalar(
+            select(ShipmentRevisionModel).where(
+                ShipmentRevisionModel.shipment_id == shipment_id,
+                ShipmentRevisionModel.revision_type == ShipmentRevisionType.INITIAL,
+            )
+        )
+        return _shipment_revision_to_domain(m) if m else None
+
+    def find_predecessor(self, revision_id: uuid.UUID) -> ShipmentRevision | None:
+        m = self._session.scalar(
+            select(ShipmentRevisionModel).where(ShipmentRevisionModel.superseded_by_revision_id == revision_id)
+        )
+        return _shipment_revision_to_domain(m) if m else None
+
+    def find_revision_by_fragment(self, shipment_id: uuid.UUID, source_fragment_id: uuid.UUID) -> ShipmentRevision | None:
+        """The replay/reuse lookup: the same Evidence fragment already
+        asserted SOMETHING against this anchor. Callers must not treat a
+        hit as an automatic replay — see
+        ``bel.application.shipment_facts._apply_revision``, which
+        compares ``revision_type`` and the actual asserted field/value
+        content before deciding replay vs. conflict."""
+        m = self._session.scalar(
+            select(ShipmentRevisionModel).where(
+                ShipmentRevisionModel.shipment_id == shipment_id,
+                ShipmentRevisionModel.source_fragment_id == source_fragment_id,
+            )
+        )
+        return _shipment_revision_to_domain(m) if m else None
+
+    def find_revisions_by_fragment_id(self, source_fragment_id: uuid.UUID) -> list[ShipmentRevision]:
+        """The GLOBAL (not anchor-scoped) lookup — for the one case where
+        no business identity exists to scope a lookup by: a confirmed
+        create with no ``external_reference`` (Phase 2D.1-R2 Codex fix
+        round, BLOCKER 1). There is no ``(contract_id, external_reference,
+        execution_date)`` to look this up by, so this searches
+        ``shipment_revisions`` directly by fragment alone.
+
+        Returns EVERY match, never just one (Phase 2D.1-R2 second Codex
+        fix round): an earlier version used ``session.scalar()``, which
+        silently returns an arbitrary first row when more than one
+        revision happens to share a ``source_fragment_id`` — risking a
+        cross-contract misattribution if the SAME fragment id is ever
+        reused for an unrelated Shipment. The caller
+        (``bel.application.shipment_facts.create_shipment_fact``) must
+        verify every returned candidate's anchor identity, revision type
+        and asserted content before treating any of them as a genuine
+        replay, and must reject rather than guess when zero or more than
+        one candidate is an exact match."""
+        rows = self._session.scalars(
+            select(ShipmentRevisionModel).where(ShipmentRevisionModel.source_fragment_id == source_fragment_id)
+        )
+        return [_shipment_revision_to_domain(m) for m in rows]
+
+    def list_revisions(self, shipment_id: uuid.UUID) -> list[ShipmentRevision]:
+        """Full audit history, oldest first — walked along the
+        append-only ``superseded_by_revision_id`` chain from the INITIAL
+        revision forward, NOT sorted by ``created_at`` (two revisions
+        written in the same transaction can share an identical
+        timestamp). The chain itself is the model's own intrinsic,
+        always-unambiguous order."""
+        rows = {
+            m.id: m
+            for m in self._session.scalars(
+                select(ShipmentRevisionModel).where(ShipmentRevisionModel.shipment_id == shipment_id)
+            )
+        }
+        if not rows:
+            return []
+        current = next(m for m in rows.values() if m.revision_type == ShipmentRevisionType.INITIAL)
+        ordered = [current]
+        while current.superseded_by_revision_id is not None:
+            current = rows[current.superseded_by_revision_id]
+            ordered.append(current)
+        return [_shipment_revision_to_domain(m) for m in ordered]
+
+    def get(self, shipment_id: uuid.UUID) -> Shipment | None:
+        row = self._session.execute(self._current_revision_join().where(ShipmentModel.id == shipment_id)).first()
+        return _assemble_shipment(*row) if row else None
+
+    def find_by_identity(
+        self, contract_id: uuid.UUID, external_reference: str, execution_date
+    ) -> Shipment | None:
+        """Resolves the frozen business identity
+        (docs/PHASE2D1-R0-DECISIONS.md section 4.4:
+        ``(contract_id, external_reference, execution_date)``).
+        ``external_reference`` must be a real (non-None) value here —
+        callers must never look up by identity when it is None (section
+        4.4's "identity incomplete"); see
+        ``bel.application.shipment_facts.create_shipment_fact``, which
+        skips this lookup entirely in that case rather than passing
+        None through to an ``IS NULL`` match that would collide
+        unrelated Shipments."""
+        row = self._session.execute(
+            self._current_revision_join().where(
+                ShipmentModel.contract_id == contract_id,
+                ShipmentModel.external_reference == external_reference,
+                ShipmentModel.execution_date == execution_date,
+            )
+        ).first()
+        return _assemble_shipment(*row) if row else None
+
+    def list_for_contract(self, contract_id: uuid.UUID) -> list[Shipment]:
+        rows = self._session.execute(
+            self._current_revision_join()
+            .where(ShipmentModel.contract_id == contract_id)
+            .order_by(ShipmentModel.created_at, ShipmentModel.id)
+        )
+        return [_assemble_shipment(anchor, rev) for anchor, rev in rows]
+
+    def list_all(self) -> list[Shipment]:
+        rows = self._session.execute(self._current_revision_join())
+        return [_assemble_shipment(anchor, rev) for anchor, rev in rows]
+
+    def count(self) -> int:
+        return len(self._session.scalars(select(ShipmentModel.id)).all())
+
+
 class ExceptionRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -959,6 +1251,7 @@ def _cost_recognition_fact_to_domain(m: CostRecognitionFactModel) -> CostRecogni
         basis=m.basis,
         source_fragment_id=m.source_fragment_id,
         created_at=m.created_at,
+        shipment_id=m.shipment_id,
     )
 
 
@@ -1083,8 +1376,13 @@ class CostRecognitionFactRepository:
                 basis=fact.basis,
                 source_fragment_id=fact.source_fragment_id,
                 created_at=fact.created_at,
+                shipment_id=fact.shipment_id,
             )
         )
+
+    def list_for_shipment(self, shipment_id: uuid.UUID) -> list[CostRecognitionFact]:
+        rows = self._session.scalars(select(CostRecognitionFactModel).where(CostRecognitionFactModel.shipment_id == shipment_id))
+        return [_cost_recognition_fact_to_domain(m) for m in rows]
 
     def list_all(self) -> list[CostRecognitionFact]:
         rows = self._session.scalars(select(CostRecognitionFactModel))
