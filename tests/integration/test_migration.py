@@ -10,6 +10,7 @@ EXPECTED_TABLES = {
     "evidence_fragments",
     "contracts",
     "contract_items",
+    "contract_item_revisions",
     "business_events",
     "task_exceptions",
     "import_runs",

@@ -103,6 +103,11 @@ def _make_contract(session, fragment_id, counterparty="Supplier", contract_no=No
 
 
 def _make_contract_item(session, contract, source_item_key="ITEM-A", quantity="100", fragment_id=None):
+    # Every ContractItemRevision requires real Evidence (Phase 2D.1-R1
+    # fix round, BLOCKER 3): a fixture omitting fragment_id gets a fresh
+    # synthetic fragment rather than a NULL provenance reference.
+    if fragment_id is None:
+        fragment_id = _make_fragment(session).id
     item = ContractItem(
         id=uuid.uuid4(),
         contract_id=contract.id,

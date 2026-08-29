@@ -13,6 +13,7 @@ from decimal import Decimal
 
 import pytest
 
+from bel.application.contract_item_facts import get_contract_item_history
 from bel.application.import_close_facts import CloseFactPackError, import_close_facts
 from bel.application.import_contract_ledger import import_contract_ledger
 from bel.application.import_invoices import import_invoices
@@ -288,3 +289,94 @@ def test_item_allocation_requires_contract_level_confirmation(
     with pytest.raises(CloseFactPackError):
         import_close_facts(db_session, path)
     assert db_session.query(InvoiceItemAllocationModel).count() == 0
+
+
+def test_close_fact_pack_conflicting_reimport_is_rejected(
+    db_session, phase2b_ledger_path, phase2b_invoices_path, phase2b_close_facts_path
+):
+    """Phase 2D.1-R1 Codex fix round, section 6: a SECOND, byte-different
+    Close Fact Pack asserting a DIFFERENT quantity for an item that
+    already has one on record must not be silently skipped as "the item
+    already exists" — it is a genuine business-value conflict and must
+    surface as an explicit CloseFactPackError, never swallowed."""
+    _setup_base(db_session, phase2b_ledger_path, phase2b_invoices_path)
+    for external_key, contract_no in [
+        ("DIGITAL-CLOSE-002", "PO-CLOSE-002"),
+        ("DIGITAL-CLOSE-005", "PO-CLOSE-005"),
+        ("DIGITAL-CLOSE-006", "PO-CLOSE-006"),
+    ]:
+        invoice = InvoiceRepository(db_session).find_by_external_key(external_key)
+        contract = next(c for c in ContractRepository(db_session).list_all() if c.contract_no == contract_no)
+        _confirm_invoice_contract(db_session, invoice, contract)
+    db_session.commit()
+    import_close_facts(db_session, phase2b_close_facts_path)
+
+    conflicting_pack = {
+        "version": 1,
+        "contract_items": [
+            {
+                "contract_selector": {"contract_no": "PO-CLOSE-001", "counterparty": "SupplierCloseAlpha"},
+                "source_item_key": "ITEM-A",
+                "product_name": "Alpha Widget",
+                "quantity": 999,  # PO-CLOSE-001/ITEM-A is already on record with quantity=100
+                "unit": "件",
+            }
+        ],
+    }
+    path = phase2b_close_facts_path.with_name("conflicting-quantity.json")
+    path.write_text(json.dumps(conflicting_pack))
+    with pytest.raises(CloseFactPackError):
+        import_close_facts(db_session, path)
+
+    # The original, correct assertion is untouched.
+    item = next(
+        i
+        for i in ContractItemRepository(db_session).list_all()
+        if i.contract_id == next(c.id for c in ContractRepository(db_session).list_all() if c.contract_no == "PO-CLOSE-001")
+    )
+    assert item.quantity == Decimal("100")
+
+
+def test_close_fact_pack_corroborating_reimport_is_silent(
+    db_session, phase2b_ledger_path, phase2b_invoices_path, phase2b_close_facts_path
+):
+    """A byte-different pack that re-asserts the SAME contract-item values
+    (e.g. a re-generated file with different JSON formatting) is
+    corroborating Evidence, not a conflict — it must not raise and must
+    not create a second ContractItem revision."""
+    _setup_base(db_session, phase2b_ledger_path, phase2b_invoices_path)
+    for external_key, contract_no in [
+        ("DIGITAL-CLOSE-002", "PO-CLOSE-002"),
+        ("DIGITAL-CLOSE-005", "PO-CLOSE-005"),
+        ("DIGITAL-CLOSE-006", "PO-CLOSE-006"),
+    ]:
+        invoice = InvoiceRepository(db_session).find_by_external_key(external_key)
+        contract = next(c for c in ContractRepository(db_session).list_all() if c.contract_no == contract_no)
+        _confirm_invoice_contract(db_session, invoice, contract)
+    db_session.commit()
+    import_close_facts(db_session, phase2b_close_facts_path)
+
+    corroborating_pack = {
+        "version": 1,
+        "contract_items": [
+            {
+                "contract_selector": {"contract_no": "PO-CLOSE-001", "counterparty": "SupplierCloseAlpha"},
+                "source_item_key": "ITEM-A",
+                "product_name": "Alpha Widget",
+                "quantity": 100,  # same value, different file bytes (extra whitespace below)
+                "unit": "件",
+            }
+        ],
+    }
+    path = phase2b_close_facts_path.with_name("corroborating-quantity.json")
+    path.write_text(json.dumps(corroborating_pack, indent=4))  # different formatting -> different sha256
+    result = import_close_facts(db_session, path)  # must not raise
+
+    assert result.contract_items_created == 0
+    item = next(
+        i
+        for i in ContractItemRepository(db_session).list_all()
+        if i.contract_id == next(c.id for c in ContractRepository(db_session).list_all() if c.contract_no == "PO-CLOSE-001")
+    )
+    assert item.quantity == Decimal("100")
+    assert len(get_contract_item_history(db_session, item.id)) == 1

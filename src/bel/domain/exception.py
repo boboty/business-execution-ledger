@@ -11,6 +11,13 @@ class ExceptionType:
     # Phase 2A: a unique M001 candidate would push confirmed allocations
     # past the contract's gross_amount. See spec section 24.
     ALLOCATION_CAPACITY_EXCEEDED = "AllocationCapacityExceeded"
+    # Phase 2D.1-R1: a ContractItem CORRECTION superseded a revision that
+    # persisted derived records (InvoiceItemAllocation, Accrual,
+    # AccrualBasisFact, HistoricalAccrualFact) still identity-reference.
+    # Per docs/PHASE2D1-R0-DECISIONS.md section 1.5, none of those
+    # records is edited or invalidated automatically — this Task is
+    # raised so a human decides what, if anything, must be redone.
+    CONTRACT_ITEM_FACT_SUPERSEDED = "ContractItemFactSuperseded"
 
 
 class ExceptionStatus:

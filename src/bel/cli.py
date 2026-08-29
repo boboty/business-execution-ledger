@@ -6,9 +6,18 @@ from decimal import Decimal
 from pathlib import Path
 
 import click
+from sqlalchemy.exc import OperationalError
 
 from bel.application.accrual_queries import get_accrual_view, list_accrual_views
 from bel.application.allocate_invoice_item import execute_manual_item_allocation
+from bel.application.contract_item_facts import (
+    ContractItemFactError,
+    execute_correct_contract_item_fact,
+    execute_create_contract_item_fact,
+    execute_supplement_contract_item_fact,
+    get_contract_item,
+    get_contract_item_history,
+)
 from bel.application.get_contract import get_contract
 from bel.application.get_invoice import get_invoice
 from bel.application.get_payment import get_payment
@@ -22,7 +31,7 @@ from bel.application.matching import confirm_match, match_invoices, match_paymen
 from bel.application.period_close import build_period_close_preview
 from bel.application.search_contracts import search_contracts_by_no
 from bel.domain.invoice import InvoiceDirection
-from bel.infrastructure.persistence.database import make_engine, make_session_factory
+from bel.infrastructure.persistence.database import is_database_busy, make_engine, make_session_factory
 
 DEFAULT_DB_PATH = "bel.db"
 
@@ -571,6 +580,228 @@ def invoice_item_allocate(
         f"contract_item={allocation.contract_item_id} qty={allocation.allocated_quantity} "
         f"net={allocation.allocated_net_amount} [{allocation.confirmation_type}]"
     )
+
+
+_CONTRACT_ITEM_FIELD_OPTIONS = (
+    click.option("--sku", "sku", default=None, help="Product SKU."),
+    click.option("--product-name", "product_name", default=None, help="Product name."),
+    click.option("--specification", "specification", default=None, help="Specification."),
+    click.option("--quantity", "quantity", default=None, help="Quantity."),
+    click.option("--unit", "unit", default=None, help="Unit."),
+    click.option("--unit-price", "unit_price", default=None, help="Unit price."),
+    click.option("--gross-amount", "gross_amount", default=None, help="Gross amount."),
+    click.option("--tax-rate", "tax_rate", default=None, help="Tax rate."),
+    click.option("--net-amount", "net_amount", default=None, help="Net amount."),
+)
+
+
+def _contract_item_field_options(f):
+    for option in reversed(_CONTRACT_ITEM_FIELD_OPTIONS):
+        f = option(f)
+    return f
+
+
+_DECIMAL_FIELDS = ("quantity", "unit_price", "gross_amount", "tax_rate", "net_amount")
+
+
+def _fields_from_options(
+    sku, product_name, specification, quantity, unit, unit_price, gross_amount, tax_rate, net_amount
+) -> dict:
+    """Only options the caller actually passed become dict entries — an
+    omitted --flag is "not asserted this call", not "assert NULL"."""
+    raw = {
+        "sku": sku,
+        "product_name": product_name,
+        "specification": specification,
+        "quantity": quantity,
+        "unit": unit,
+        "unit_price": unit_price,
+        "gross_amount": gross_amount,
+        "tax_rate": tax_rate,
+        "net_amount": net_amount,
+    }
+    fields = {k: v for k, v in raw.items() if v is not None}
+    for key in _DECIMAL_FIELDS:
+        if key in fields:
+            fields[key] = Decimal(fields[key])
+    return fields
+
+
+@cli.group("contract-item")
+def contract_item_group() -> None:
+    """ContractItem Fact maintenance (Phase 2D.1-R1): create, supplement,
+    correct and inspect the everyday intake path for ContractItem — a
+    human confirmation IS Evidence (docs/DOMAIN.md), traceable exactly
+    like an imported one."""
+
+
+@contract_item_group.command("create")
+@click.option("--contract", "contract_id", type=click.UUID, required=True, help="Contract id.")
+@click.option("--item", "source_item_key", required=True, help="ContractItem source_item_key.")
+@_contract_item_field_options
+@click.pass_context
+def contract_item_create(ctx: click.Context, contract_id, source_item_key, **field_options) -> None:
+    """Assert a new ContractItem (case A — it did not exist before). A
+    duplicate (contract, item) asserting the SAME values is an exact
+    replay or corroborating Evidence (no new anchor); asserting
+    DIFFERENT values is an explicit conflict — this never guesses
+    whether the caller meant supplement or correction; use those
+    commands explicitly."""
+    fields = _fields_from_options(**field_options)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_create_contract_item_fact(
+                session, contract_id=contract_id, source_item_key=source_item_key, fields=fields
+            )
+    except ContractItemFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    if result.created:
+        outcome = "created"
+    elif result.replay:
+        outcome = "already exists (exact replay — same Evidence, same content)"
+    elif result.corroborating:
+        outcome = "already exists (corroborating Evidence — different fragment, same content)"
+    else:
+        outcome = "already exists"
+    click.echo(
+        f"ContractItem {result.item.id} {outcome}: "
+        f"contract={result.item.contract_id} item={result.item.source_item_key} "
+        f"product={result.item.product_name!r} quantity={result.item.quantity}"
+    )
+
+
+@contract_item_group.command("supplement")
+@click.option("--item-id", "contract_item_id", type=click.UUID, required=True, help="ContractItem id (the anchor).")
+@click.option(
+    "--based-on", "based_on_revision_id", type=click.UUID, required=True, help="Revision id believed to be current."
+)
+@_contract_item_field_options
+@click.pass_context
+def contract_item_supplement(ctx: click.Context, contract_item_id, based_on_revision_id, **field_options) -> None:
+    """Fill in a previously-unknown field (case B-supplement). Rejected
+    if any given field already holds a DIFFERENT known value — that is a
+    correction, not a supplement."""
+    fields = _fields_from_options(**field_options)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_supplement_contract_item_fact(
+                session,
+                contract_item_id=contract_item_id,
+                based_on_revision_id=based_on_revision_id,
+                fields=fields,
+            )
+    except ContractItemFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    click.echo(
+        f"ContractItem {result.item.id} supplemented"
+        f"{' (idempotent replay — no new revision)' if not result.revision_written else ''}: "
+        f"product={result.item.product_name!r} quantity={result.item.quantity}"
+    )
+
+
+@contract_item_group.command("correct")
+@click.option("--item-id", "contract_item_id", type=click.UUID, required=True, help="ContractItem id (the anchor).")
+@click.option(
+    "--based-on", "based_on_revision_id", type=click.UUID, required=True, help="Revision id believed to be current."
+)
+@_contract_item_field_options
+@click.pass_context
+def contract_item_correct(ctx: click.Context, contract_item_id, based_on_revision_id, **field_options) -> None:
+    """Correct a previously-asserted value that was wrong (case
+    B-correction). Rejected if any given field currently has no value —
+    that is a supplement, not a correction. If persisted derived records
+    (allocations/accruals) still reference this item, a
+    ContractItemFactSuperseded Task is raised naming them."""
+    fields = _fields_from_options(**field_options)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = execute_correct_contract_item_fact(
+                session,
+                contract_item_id=contract_item_id,
+                based_on_revision_id=based_on_revision_id,
+                fields=fields,
+            )
+    except ContractItemFactError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+
+    click.echo(
+        f"ContractItem {result.item.id} corrected"
+        f"{' (idempotent replay — no new revision)' if not result.revision_written else ''}: "
+        f"product={result.item.product_name!r} quantity={result.item.quantity}"
+    )
+
+
+@contract_item_group.command("show")
+@click.argument("item_id", type=click.UUID)
+@click.pass_context
+def contract_item_show(ctx: click.Context, item_id) -> None:
+    """Show the current authoritative ContractItem state."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        item = get_contract_item(session, item_id)
+    if item is None:
+        click.echo(f"Error: ContractItem {item_id} not found")
+        raise SystemExit(1)
+
+    click.echo(f"ContractItem {item.id}")
+    click.echo(f"  contract_id:                {item.contract_id}")
+    click.echo(f"  source_item_key:            {item.source_item_key}")
+    click.echo(f"  sku:                        {item.sku}")
+    click.echo(f"  product_name:               {item.product_name}")
+    click.echo(f"  specification:              {item.specification}")
+    click.echo(f"  quantity:                   {item.quantity}")
+    click.echo(f"  unit:                       {item.unit}")
+    click.echo(f"  unit_price:                 {item.unit_price}")
+    click.echo(f"  gross_amount:               {item.gross_amount}")
+    click.echo(f"  tax_rate:                   {item.tax_rate}")
+    click.echo(f"  net_amount:                 {item.net_amount}")
+    click.echo(f"  current_source_fragment_id: {item.current_source_fragment_id}")
+    click.echo(f"  created_at:                 {item.created_at}")
+
+
+@contract_item_group.command("history")
+@click.argument("item_id", type=click.UUID)
+@click.pass_context
+def contract_item_history(ctx: click.Context, item_id) -> None:
+    """List every revision ever asserted for this ContractItem, oldest
+    first — the full audit trail, including superseded revisions."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        revisions = get_contract_item_history(session, item_id)
+    if not revisions:
+        click.echo(f"ContractItem {item_id} has no revisions (not found, or anchor with no history)")
+        return
+
+    click.echo(f"ContractItem {item_id} — {len(revisions)} revision(s):")
+    for r in revisions:
+        current_marker = " [CURRENT]" if r.superseded_by_revision_id is None else f" [superseded by {r.superseded_by_revision_id}]"
+        click.echo(
+            f"  {r.id} [{r.revision_type}]{current_marker} product={r.product_name!r} quantity={r.quantity} "
+            f"source_fragment={r.source_fragment_id} created_at={r.created_at}"
+        )
 
 
 @cli.group("period-close")

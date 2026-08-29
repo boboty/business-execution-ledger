@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
 from bel.domain.accrual import (
@@ -15,7 +15,13 @@ from bel.domain.accrual import (
     HistoricalAccrualFact,
     InvoiceItemAllocation,
 )
-from bel.domain.contract import Contract, ContractItem
+from bel.domain.contract import (
+    CONTRACT_ITEM_FACT_FIELDS,
+    Contract,
+    ContractItem,
+    ContractItemRevision,
+    ContractItemRevisionType,
+)
 from bel.domain.event import BusinessEvent
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment
 from bel.domain.exception import TaskException
@@ -28,6 +34,7 @@ from bel.infrastructure.persistence.models import (
     AccrualReversalModel,
     BusinessEventModel,
     ContractItemModel,
+    ContractItemRevisionModel,
     ContractModel,
     CostRecognitionFactModel,
     EvidenceDocumentModel,
@@ -81,11 +88,11 @@ def _contract_to_domain(m: ContractModel) -> Contract:
     )
 
 
-def _contract_item_to_domain(m: ContractItemModel) -> ContractItem:
-    return ContractItem(
+def _contract_item_revision_to_domain(m: ContractItemRevisionModel) -> ContractItemRevision:
+    return ContractItemRevision(
         id=m.id,
-        contract_id=m.contract_id,
-        source_item_key=m.source_item_key,
+        contract_item_id=m.contract_item_id,
+        revision_type=m.revision_type,
         sku=m.sku,
         product_name=m.product_name,
         specification=m.specification,
@@ -95,8 +102,37 @@ def _contract_item_to_domain(m: ContractItemModel) -> ContractItem:
         gross_amount=m.gross_amount,
         tax_rate=m.tax_rate,
         net_amount=m.net_amount,
-        current_source_fragment_id=m.current_source_fragment_id,
+        source_fragment_id=m.source_fragment_id,
+        superseded_by_revision_id=m.superseded_by_revision_id,
         created_at=m.created_at,
+        asserted_field_names=m.asserted_field_names,
+    )
+
+
+def _assemble_contract_item(anchor: ContractItemModel, current_revision: ContractItemRevisionModel) -> ContractItem:
+    """The anchor + current-revision join, in ONE place, per
+    docs/PHASE2D1-R0-DECISIONS.md section 1.3 ("current-revision
+    resolution is defined once, in the repository layer"). Returns the
+    ContractItem dataclass of exactly its pre-R1 shape, so every existing
+    consumer (period_close.py, contract_360.py, ...) is unaffected.
+    ``current_source_fragment_id`` now resolves to the CURRENT revision's
+    Evidence rather than the pre-R1 field of the same name, which was
+    documented as never updated after creation."""
+    return ContractItem(
+        id=anchor.id,
+        contract_id=anchor.contract_id,
+        source_item_key=anchor.source_item_key,
+        sku=current_revision.sku,
+        product_name=current_revision.product_name,
+        specification=current_revision.specification,
+        quantity=current_revision.quantity,
+        unit=current_revision.unit,
+        unit_price=current_revision.unit_price,
+        gross_amount=current_revision.gross_amount,
+        tax_rate=current_revision.tax_rate,
+        net_amount=current_revision.net_amount,
+        current_source_fragment_id=current_revision.source_fragment_id,
+        created_at=anchor.created_at,
     )
 
 
@@ -249,6 +285,17 @@ class EvidenceRepository:
         m = self._session.get(EvidenceFragmentModel, fragment_id)
         return _fragment_to_domain(m) if m else None
 
+    def find_fragment_by_document(self, document_id: uuid.UUID) -> EvidenceFragment | None:
+        """For the manual-Fact 1-document-to-1-fragment pattern shared by
+        allocate_invoice_item.py and contract_item_facts.py: after a
+        sha256 document-dedup hit, look up the fragment that document
+        already carries so a replay reuses it instead of writing a
+        second one."""
+        m = self._session.scalar(
+            select(EvidenceFragmentModel).where(EvidenceFragmentModel.evidence_document_id == document_id)
+        )
+        return _fragment_to_domain(m) if m else None
+
 
 class ContractRepository:
     def __init__(self, session: Session) -> None:
@@ -288,15 +335,67 @@ class ContractRepository:
 
 
 class ContractItemRepository:
+    """Anchor + current-revision assembly (docs/PHASE2D1-R0-DECISIONS.md
+    section 1.3). ``get`` / ``find_by_contract_and_key`` / ``list_*``
+    join the anchor to its current (un-superseded) revision and return
+    the pre-R1-shaped ``ContractItem`` dataclass — the single seam every
+    consumer (period_close.py, contract_360.py, import_close_facts.py,
+    allocate_invoice_item.py) reads through, unaware anything changed.
+
+    Anchor and revision writes (``create_anchor`` /
+    ``create_initial_revision`` / ``append_revision_against_current``)
+    are the primitives ``bel.application.contract_item_facts`` composes
+    into the three Fact-maintenance operations (create / supplement /
+    correct). There is no unchecked "just insert a revision row"
+    primitive — every write path either creates the one INITIAL
+    revision an anchor is allowed, or atomically retires the current
+    revision before installing its replacement, so a caller cannot
+    silently create a second current revision or a NULL-provenance Fact
+    (Phase 2D.1-R1 Codex fix round, BLOCKER 3). This repository never
+    guesses which revision is current by timestamp — only
+    ``superseded_by_revision_id IS NULL`` decides that, in the query
+    below and nowhere else, backed by the
+    ``uq_contract_item_revisions_one_current`` partial unique index
+    (BLOCKER 4)."""
+
     def __init__(self, session: Session) -> None:
         self._session = session
 
+    def _current_revision_join(self):
+        return select(ContractItemModel, ContractItemRevisionModel).join(
+            ContractItemRevisionModel,
+            (ContractItemRevisionModel.contract_item_id == ContractItemModel.id)
+            & (ContractItemRevisionModel.superseded_by_revision_id.is_(None)),
+        )
+
     def add(self, item: ContractItem) -> None:
-        self._session.add(
-            ContractItemModel(
-                id=item.id,
-                contract_id=item.contract_id,
-                source_item_key=item.source_item_key,
+        """Back-compat convenience over create_anchor + create_initial_revision:
+        builds the anchor and one INITIAL revision from a fully-populated
+        ContractItem in a single call, for callers (tests, simple
+        fixtures) that don't need the explicit create/supplement/correct
+        Fact-maintenance commands in bel.application.contract_item_facts.
+        Not a second write mechanism — it composes the same safe
+        primitives every other writer uses, so it is subject to the same
+        Evidence-required invariant (Phase 2D.1-R1 Codex fix round,
+        BLOCKER 3): ``item.current_source_fragment_id`` must be a real
+        fragment id. A fixture that has no Evidence to cite must create
+        one first (see the ``_make_fragment``-style helpers throughout
+        tests/) — it is never acceptable to fabricate a NULL-provenance
+        Fact just because a test finds that convenient."""
+        if item.current_source_fragment_id is None:
+            raise ValueError(
+                "ContractItemRepository.add() requires a real current_source_fragment_id — "
+                "create a synthetic EvidenceFragment first; NULL provenance is only ever "
+                "tolerated for legacy pre-R1 data carried forward by the migration"
+            )
+        self.create_anchor(
+            id=item.id, contract_id=item.contract_id, source_item_key=item.source_item_key, created_at=item.created_at
+        )
+        self.create_initial_revision(
+            ContractItemRevision(
+                id=uuid.uuid4(),
+                contract_item_id=item.id,
+                revision_type=ContractItemRevisionType.INITIAL,
                 sku=item.sku,
                 product_name=item.product_name,
                 specification=item.specification,
@@ -306,32 +405,224 @@ class ContractItemRepository:
                 gross_amount=item.gross_amount,
                 tax_rate=item.tax_rate,
                 net_amount=item.net_amount,
-                current_source_fragment_id=item.current_source_fragment_id,
+                source_fragment_id=item.current_source_fragment_id,
+                superseded_by_revision_id=None,
                 created_at=item.created_at,
             )
         )
 
-    def get(self, item_id: uuid.UUID) -> ContractItem | None:
-        m = self._session.get(ContractItemModel, item_id)
-        return _contract_item_to_domain(m) if m else None
+    def create_anchor(self, *, id: uuid.UUID, contract_id: uuid.UUID, source_item_key: str, created_at) -> None:
+        """Creates the bare identity anchor only — no business values, no
+        revision. Callers (bel.application.contract_item_facts) always
+        pair this with an immediate ``create_initial_revision`` call,
+        inside the same transaction."""
+        self._session.add(
+            ContractItemModel(id=id, contract_id=contract_id, source_item_key=source_item_key, created_at=created_at)
+        )
 
-    def find_by_contract_and_key(self, contract_id: uuid.UUID, source_item_key: str) -> ContractItem | None:
+    def create_initial_revision(self, revision: ContractItemRevision) -> None:
+        """The ONLY way to write an anchor's first (INITIAL) revision
+        through the normal repository API (Phase 2D.1-R1 Codex fix
+        round, BLOCKER 3). Requires real Evidence: a NEW canonical
+        revision created through this repository must never carry
+        ``source_fragment_id=None``. The one place a NULL provenance
+        reference legitimately exists — a row carried forward from
+        pre-R1 data whose original provenance was already unknown —
+        is written directly by the
+        db1c3258569e_contract_item_fact_revisions migration's raw SQL,
+        which does not go through this repository at all."""
+        if revision.source_fragment_id is None:
+            raise ValueError("ContractItemRevision.source_fragment_id is required for a new revision")
+        if revision.revision_type != ContractItemRevisionType.INITIAL:
+            raise ValueError("create_initial_revision only accepts revision_type=INITIAL")
+        if revision.superseded_by_revision_id is not None:
+            raise ValueError("a newly created current revision cannot already be superseded")
+        self._session.add(self._revision_model(revision))
+
+    def append_revision_against_current(self, revision: ContractItemRevision, *, based_on_revision_id: uuid.UUID) -> bool:
+        """The ONLY way to append a SUPPLEMENT/CORRECTION revision
+        through the normal repository API (Phase 2D.1-R1 Codex fix
+        round, BLOCKERs 2-4). Atomically retires ``based_on_revision_id``
+        with a single conditional ``UPDATE ... WHERE id = :based_on AND
+        contract_item_id = :anchor AND superseded_by_revision_id IS NULL``
+        and only inserts ``revision`` as the new current row if EXACTLY
+        one row was retired.
+
+        Only ``SUPPLEMENT`` and ``CORRECTION`` may ever be appended this
+        way (Phase 2D.1-R1 Codex fix round #3, FIX 1) — an ``INITIAL`` or
+        any unrecognised ``revision_type`` is a caller bug, not a
+        conflict, and raises ``ValueError`` immediately, before any
+        UPDATE or INSERT runs. Confusing that with a CAS failure would
+        let a malformed call silently do nothing instead of surfacing
+        the bug.
+
+        The anchor-ownership check (``contract_item_id ==
+        revision.contract_item_id``) is folded into the SAME conditional
+        UPDATE as the current-revision check (FIX 2), not a separate
+        SELECT beforehand — a check-then-act split would reopen exactly
+        the race this method exists to close, just on ownership instead
+        of currency. Returns ``False`` — having written NOTHING — for
+        any of: ``based_on_revision_id`` does not exist, is no longer
+        current (someone else already superseded it), or does not
+        belong to ``revision.contract_item_id`` (a cross-anchor append
+        attempt). The caller MUST treat ``False`` as a conflict and
+        never retry blindly; it must never fall back to inserting a
+        second current row. The ``uq_contract_item_revisions_one_current``
+        partial unique index is the DB-level backstop behind the
+        current-revision half of this guarantee, not a substitute for
+        it — the conditional UPDATE is what actually closes the
+        check-then-act race between two independent sessions."""
+        if revision.source_fragment_id is None:
+            raise ValueError("ContractItemRevision.source_fragment_id is required for a new revision")
+        if revision.superseded_by_revision_id is not None:
+            raise ValueError("a newly created current revision cannot already be superseded")
+        if revision.revision_type not in (ContractItemRevisionType.SUPPLEMENT, ContractItemRevisionType.CORRECTION):
+            raise ValueError(
+                "append_revision_against_current only accepts revision_type SUPPLEMENT or CORRECTION, got "
+                f"{revision.revision_type!r} — INITIAL must go through create_initial_revision, and no other "
+                "value is a legal revision_type"
+            )
+        # The old row's superseded_by_revision_id must point at `revision.id`
+        # before `revision` itself is inserted, and the new row must be
+        # inserted while it is still the anchor's ONLY current row — the
+        # retire-then-insert order the partial unique index requires. That
+        # makes the retiring UPDATE momentarily reference a row that does
+        # not exist yet, which SQLite's (session-scoped, connect-time)
+        # `PRAGMA foreign_keys=ON` would otherwise reject outright.
+        # `defer_foreign_keys` defers the REFERENTIAL check to this
+        # transaction's commit — by which point the insert below has
+        # happened — without weakening the FK constraint itself; SQLite
+        # resets it automatically at the end of every transaction, so it
+        # is set fresh here rather than once at connect time.
+        self._session.execute(text("PRAGMA defer_foreign_keys = ON"))
+        result = self._session.execute(
+            update(ContractItemRevisionModel)
+            .where(
+                ContractItemRevisionModel.id == based_on_revision_id,
+                ContractItemRevisionModel.contract_item_id == revision.contract_item_id,
+                ContractItemRevisionModel.superseded_by_revision_id.is_(None),
+            )
+            .values(superseded_by_revision_id=revision.id)
+        )
+        if result.rowcount != 1:
+            return False
+        self._session.add(self._revision_model(revision))
+        self._session.flush()
+        return True
+
+    def _revision_model(self, revision: ContractItemRevision) -> ContractItemRevisionModel:
+        return ContractItemRevisionModel(
+            id=revision.id,
+            contract_item_id=revision.contract_item_id,
+            revision_type=revision.revision_type,
+            sku=revision.sku,
+            product_name=revision.product_name,
+            specification=revision.specification,
+            quantity=revision.quantity,
+            unit=revision.unit,
+            unit_price=revision.unit_price,
+            gross_amount=revision.gross_amount,
+            tax_rate=revision.tax_rate,
+            net_amount=revision.net_amount,
+            source_fragment_id=revision.source_fragment_id,
+            superseded_by_revision_id=revision.superseded_by_revision_id,
+            created_at=revision.created_at,
+            asserted_field_names=revision.asserted_field_names,
+        )
+
+    def get_current_revision(self, contract_item_id: uuid.UUID) -> ContractItemRevision | None:
         m = self._session.scalar(
-            select(ContractItemModel).where(
-                ContractItemModel.contract_id == contract_id, ContractItemModel.source_item_key == source_item_key
+            select(ContractItemRevisionModel).where(
+                ContractItemRevisionModel.contract_item_id == contract_item_id,
+                ContractItemRevisionModel.superseded_by_revision_id.is_(None),
             )
         )
-        return _contract_item_to_domain(m) if m else None
+        return _contract_item_revision_to_domain(m) if m else None
+
+    def get_initial_revision(self, contract_item_id: uuid.UUID) -> ContractItemRevision | None:
+        m = self._session.scalar(
+            select(ContractItemRevisionModel).where(
+                ContractItemRevisionModel.contract_item_id == contract_item_id,
+                ContractItemRevisionModel.revision_type == ContractItemRevisionType.INITIAL,
+            )
+        )
+        return _contract_item_revision_to_domain(m) if m else None
+
+    def find_predecessor(self, revision_id: uuid.UUID) -> ContractItemRevision | None:
+        """The revision that ``revision_id`` superseded, if any — the
+        reverse direction of ``superseded_by_revision_id``. Used by
+        ``bel.application.contract_item_facts._asserted_fields`` to
+        compute exactly which fields a revision actually asserted,
+        without a separate assertion-metadata column."""
+        m = self._session.scalar(
+            select(ContractItemRevisionModel).where(ContractItemRevisionModel.superseded_by_revision_id == revision_id)
+        )
+        return _contract_item_revision_to_domain(m) if m else None
+
+    def find_revision_by_fragment(
+        self, contract_item_id: uuid.UUID, source_fragment_id: uuid.UUID
+    ) -> ContractItemRevision | None:
+        """The replay/reuse lookup: the same Evidence fragment already
+        asserted SOMETHING against this anchor. Callers must not treat a
+        hit as an automatic replay — see
+        ``bel.application.contract_item_facts._apply_revision``, which
+        compares ``revision_type`` and the actual asserted field/value
+        content before deciding replay vs. conflict (Phase 2D.1-R1 Codex
+        fix round, BLOCKER 2)."""
+        m = self._session.scalar(
+            select(ContractItemRevisionModel).where(
+                ContractItemRevisionModel.contract_item_id == contract_item_id,
+                ContractItemRevisionModel.source_fragment_id == source_fragment_id,
+            )
+        )
+        return _contract_item_revision_to_domain(m) if m else None
+
+    def list_revisions(self, contract_item_id: uuid.UUID) -> list[ContractItemRevision]:
+        """Full audit history, oldest first — walked along the
+        append-only ``superseded_by_revision_id`` chain from the INITIAL
+        revision forward, NOT sorted by ``created_at`` (Phase 2D.1-R1
+        Codex fix round, WARNING: two revisions written in the same
+        transaction can share an identical timestamp, which made
+        ``ORDER BY created_at`` alone non-deterministic). The chain
+        itself is the model's own intrinsic, always-unambiguous order."""
+        rows = {
+            m.id: m
+            for m in self._session.scalars(
+                select(ContractItemRevisionModel).where(ContractItemRevisionModel.contract_item_id == contract_item_id)
+            )
+        }
+        if not rows:
+            return []
+        current = next(m for m in rows.values() if m.revision_type == ContractItemRevisionType.INITIAL)
+        ordered = [current]
+        while current.superseded_by_revision_id is not None:
+            current = rows[current.superseded_by_revision_id]
+            ordered.append(current)
+        return [_contract_item_revision_to_domain(m) for m in ordered]
+
+    def get(self, item_id: uuid.UUID) -> ContractItem | None:
+        row = self._session.execute(self._current_revision_join().where(ContractItemModel.id == item_id)).first()
+        return _assemble_contract_item(*row) if row else None
+
+    def find_by_contract_and_key(self, contract_id: uuid.UUID, source_item_key: str) -> ContractItem | None:
+        row = self._session.execute(
+            self._current_revision_join().where(
+                ContractItemModel.contract_id == contract_id, ContractItemModel.source_item_key == source_item_key
+            )
+        ).first()
+        return _assemble_contract_item(*row) if row else None
 
     def list_for_contract(self, contract_id: uuid.UUID) -> list[ContractItem]:
-        rows = self._session.scalars(
-            select(ContractItemModel).where(ContractItemModel.contract_id == contract_id).order_by(ContractItemModel.created_at)
+        rows = self._session.execute(
+            self._current_revision_join()
+            .where(ContractItemModel.contract_id == contract_id)
+            .order_by(ContractItemModel.created_at)
         )
-        return [_contract_item_to_domain(m) for m in rows]
+        return [_assemble_contract_item(anchor, rev) for anchor, rev in rows]
 
     def list_all(self) -> list[ContractItem]:
-        rows = self._session.scalars(select(ContractItemModel))
-        return [_contract_item_to_domain(m) for m in rows]
+        rows = self._session.execute(self._current_revision_join())
+        return [_assemble_contract_item(anchor, rev) for anchor, rev in rows]
 
     def count(self) -> int:
         return len(self._session.scalars(select(ContractItemModel.id)).all())
@@ -836,6 +1127,12 @@ class AccrualBasisFactRepository:
         rows = self._session.scalars(select(AccrualBasisFactModel))
         return [_accrual_basis_fact_to_domain(m) for m in rows]
 
+    def list_for_contract_item(self, contract_item_id: uuid.UUID) -> list[AccrualBasisFact]:
+        rows = self._session.scalars(
+            select(AccrualBasisFactModel).where(AccrualBasisFactModel.contract_item_id == contract_item_id)
+        )
+        return [_accrual_basis_fact_to_domain(m) for m in rows]
+
     def find_duplicate(
         self,
         contract_id: uuid.UUID,
@@ -878,6 +1175,12 @@ class HistoricalAccrualFactRepository:
 
     def list_all(self) -> list[HistoricalAccrualFact]:
         rows = self._session.scalars(select(HistoricalAccrualFactModel))
+        return [_historical_accrual_fact_to_domain(m) for m in rows]
+
+    def list_for_contract_item(self, contract_item_id: uuid.UUID) -> list[HistoricalAccrualFact]:
+        rows = self._session.scalars(
+            select(HistoricalAccrualFactModel).where(HistoricalAccrualFactModel.contract_item_id == contract_item_id)
+        )
         return [_historical_accrual_fact_to_domain(m) for m in rows]
 
     def find_duplicate(
@@ -940,6 +1243,10 @@ class AccrualRepository:
 
     def list_for_period(self, period: str) -> list[Accrual]:
         rows = self._session.scalars(select(AccrualModel).where(AccrualModel.period == period))
+        return [_accrual_to_domain(m) for m in rows]
+
+    def list_for_contract_item(self, contract_item_id: uuid.UUID) -> list[Accrual]:
+        rows = self._session.scalars(select(AccrualModel).where(AccrualModel.contract_item_id == contract_item_id))
         return [_accrual_to_domain(m) for m in rows]
 
     def count(self) -> int:

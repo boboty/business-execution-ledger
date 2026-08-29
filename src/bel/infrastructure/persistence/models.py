@@ -5,7 +5,19 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, Date, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -70,6 +82,13 @@ class ContractModel(Base):
 
 
 class ContractItemModel(Base):
+    """The stable identity anchor (docs/PHASE2D1-R0-DECISIONS.md section
+    1.3). All foreign keys in the system point at this row's id, which
+    is never superseded and never deleted. Business values live on
+    ContractItemRevisionModel instead — this anchor deliberately carries
+    none, so there is nothing here to get out of sync with the current
+    revision."""
+
     __tablename__ = "contract_items"
     __table_args__ = (
         # source_item_key is an implementation-level stable reference for
@@ -81,6 +100,62 @@ class ContractItemModel(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
     source_item_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ContractItemRevisionModel(Base):
+    """Versioned assertions about a ContractItem anchor
+    (docs/PHASE2D1-R0-DECISIONS.md section 1.3). The current revision is
+    the one row per anchor with ``superseded_by_revision_id IS NULL`` —
+    resolved only in the repository layer (ContractItemRepository), never
+    re-derived by a rule or an application service.
+
+    ``uq_contract_item_revisions_one_current`` is a database-level
+    partial unique index enforcing "at most one current revision per
+    anchor" — the backstop behind ContractItemRepository's own
+    conditional-retire-then-insert primitives
+    (``append_revision_against_current``), per the Phase 2D.1-R1 Codex
+    fix round (BLOCKER 4). Application logic already prevents two
+    current rows under normal operation; this index is what makes a
+    violation impossible even under a race or a future direct writer,
+    rather than merely undocumented.
+
+    ``uq_contract_item_revisions_one_initial`` solves a DIFFERENT
+    problem (Phase 2D.1-R1 Codex fix round #3, FIX 3B): "at most one
+    current revision" does not by itself stop a second INITIAL revision
+    from existing on the same anchor. It deliberately does NOT enforce
+    "an anchor must always have an INITIAL" — no trigger for that exists
+    or is intended here.
+
+    ``ck_contract_item_revisions_revision_type`` closes the same gap
+    from the other side (FIX 3A): the closed set of legal
+    ``revision_type`` values is enforced at the database level, not only
+    by ContractItemRepository's own validation — a raw INSERT or an ORM
+    bypass cannot write an unrecognised value either."""
+
+    __tablename__ = "contract_item_revisions"
+    __table_args__ = (
+        Index(
+            "uq_contract_item_revisions_one_current",
+            "contract_item_id",
+            unique=True,
+            sqlite_where=text("superseded_by_revision_id IS NULL"),
+        ),
+        Index(
+            "uq_contract_item_revisions_one_initial",
+            "contract_item_id",
+            unique=True,
+            sqlite_where=text("revision_type = 'INITIAL'"),
+        ),
+        CheckConstraint(
+            "revision_type IN ('INITIAL', 'SUPPLEMENT', 'CORRECTION')",
+            name="ck_contract_item_revisions_revision_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    contract_item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contract_items.id"), nullable=False, index=True)
+    revision_type: Mapped[str] = mapped_column(String, nullable=False)  # INITIAL / SUPPLEMENT / CORRECTION
     sku: Mapped[str | None] = mapped_column(String, nullable=True)
     product_name: Mapped[str | None] = mapped_column(String, nullable=True)
     specification: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -90,9 +165,24 @@ class ContractItemModel(Base):
     gross_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     tax_rate: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
     net_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
-    current_source_fragment_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("evidence_fragments.id"), nullable=True
+    # Provenance reference — the exact Evidence for THIS revision. Never
+    # re-pointed. See docs/PHASE2D1-R0-DECISIONS.md section 1.3.
+    # Nullable at the schema level for the same reason the pre-R1
+    # current_source_fragment_id was nullable (no DB-level Evidence
+    # enforcement, section 1.2); bel.application.contract_item_facts
+    # requires a real fragment for every revision it writes.
+    source_fragment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=True)
+    superseded_by_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("contract_item_revisions.id"), nullable=True, index=True
     )
+    # The exact field names the writing command actually asserted,
+    # captured verbatim (Phase 2D.1-R1 Codex fix round #2) — NOT
+    # reconstructed later by diffing against the predecessor, which
+    # cannot distinguish "not asserted" from "re-asserted with its
+    # already-current value". NULL for revisions with no captured
+    # intent: pre-R1 data carried forward by the migration, and the
+    # ContractItemRepository.add() test convenience.
+    asserted_field_names: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 

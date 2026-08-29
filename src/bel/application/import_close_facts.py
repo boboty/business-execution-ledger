@@ -32,6 +32,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from bel.adapters.common import compute_sha256
+from bel.application.contract_item_facts import create_contract_item_fact
 from bel.application.item_allocation import validate_item_allocation
 from bel.infrastructure.persistence.database import is_database_busy
 from bel.domain.accrual import (
@@ -49,7 +50,7 @@ from bel.domain.accrual import (
     get_accrual_balance,
     get_projected_accrual_status,
 )
-from bel.domain.contract import Contract, ContractItem
+from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
 from bel.domain.normalize import normalize_counterparty
 from bel.infrastructure.persistence.repositories import (
@@ -287,7 +288,19 @@ def _import_close_facts(session: Session, file_path: Path) -> CloseFactImportRes
     invoice_item_ids = _invoice_item_lookup(session)
 
     # Pass 2 — contract items. (contract_id, source_item_key) is the
-    # stable reference; skipping an existing key keeps re-import safe.
+    # stable business identity (docs/PHASE2D1-R0-DECISIONS.md section
+    # 4.4). Routed through create_contract_item_fact so the Close Fact
+    # Pack and the Phase 2D.1-R1 CLI/Web commands share ONE authoritative
+    # ContractItem write path (anchor + INITIAL revision) rather than
+    # two. A duplicate key is NOT a blind skip (Phase 2D.1-R1 Codex fix
+    # round, BLOCKER 1): a re-import that agrees with the existing
+    # INITIAL assertion is silently corroborating (this pass's pre-fix
+    # skip-if-exists behaviour, preserved for that case only); a
+    # re-import whose file asserts DIFFERENT values under the SAME
+    # business identity now surfaces as a ContractItemFactConflict ->
+    # CloseFactPackError, exactly per section 6 of the fix round — the
+    # importer must not silently swallow a genuinely conflicting business
+    # value under cover of "the item already exists".
     contract_item_ids: dict[tuple[uuid.UUID, str], uuid.UUID] = {}
     for index, entry in enumerate(entry_lists["contract_items"]):
         fragment_id = fragment_ids[("contract_items", index)]
@@ -296,30 +309,33 @@ def _import_close_facts(session: Session, file_path: Path) -> CloseFactImportRes
         source_item_key = entry.get("source_item_key")
         if not source_item_key:
             raise CloseFactPackError("contract_items: source_item_key is required")
-        existing = item_repo.find_by_contract_and_key(contract.id, source_item_key)
-        if existing is not None:
-            contract_item_ids[(contract.id, source_item_key)] = existing.id
+        fact_fields = {
+            "sku": entry.get("sku"),
+            "product_name": entry.get("product_name"),
+            "specification": entry.get("specification"),
+            "quantity": _d(entry["quantity"]) if entry.get("quantity") is not None else None,
+            "unit": entry.get("unit"),
+            "unit_price": _d(entry["unit_price"]) if entry.get("unit_price") is not None else None,
+            "gross_amount": _d(entry["gross_amount"]) if entry.get("gross_amount") is not None else None,
+            "tax_rate": _d(entry["tax_rate"]) if entry.get("tax_rate") is not None else None,
+            "net_amount": _d(entry["net_amount"]) if entry.get("net_amount") is not None else None,
+        }
+        try:
+            fact_result = create_contract_item_fact(
+                session,
+                contract_id=contract.id,
+                source_item_key=source_item_key,
+                fields=fact_fields,
+                source_fragment_id=fragment_id,
+                created_at=now,
+            )
+        except ValueError as exc:
+            raise CloseFactPackError(f"contract_items: {exc}") from exc
+        contract_item_ids[(contract.id, source_item_key)] = fact_result.item.id
+        if fact_result.created:
+            result.contract_items_created += 1
+        else:
             result.contract_items_skipped += 1
-            continue
-        item = ContractItem(
-            id=uuid.uuid4(),
-            contract_id=contract.id,
-            source_item_key=source_item_key,
-            sku=entry.get("sku"),
-            product_name=entry.get("product_name"),
-            specification=entry.get("specification"),
-            quantity=_d(entry["quantity"]) if entry.get("quantity") is not None else None,
-            unit=entry.get("unit"),
-            unit_price=_d(entry["unit_price"]) if entry.get("unit_price") is not None else None,
-            gross_amount=_d(entry["gross_amount"]) if entry.get("gross_amount") is not None else None,
-            tax_rate=_d(entry["tax_rate"]) if entry.get("tax_rate") is not None else None,
-            net_amount=_d(entry["net_amount"]) if entry.get("net_amount") is not None else None,
-            current_source_fragment_id=fragment_id,
-            created_at=now,
-        )
-        item_repo.add(item)
-        contract_item_ids[(contract.id, source_item_key)] = item.id
-        result.contract_items_created += 1
     session.flush()
 
     def _item_id(contract: Contract, entry: dict, section: str) -> uuid.UUID:
