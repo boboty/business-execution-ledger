@@ -563,3 +563,77 @@ def test_backfill_task_resolution_clears_reconciliation_block(db_session):
     db_session.commit()
     result_after = reconcile(db_session, {"entries": []})
     assert not any(e.key.startswith("unresolved:backfill_task") for e in result_after.entries)
+
+
+# ---------------------------------------------------------------------------
+# Gate-fix round 3 — duplicate/pseudo-key baseline entries are never
+# resolved by "last one wins" dict construction; both must FAIL.
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_baseline_key_unresolved_then_match_fails(db_session):
+    """A. The SAME key appears twice: once UNRESOLVED, once MATCH. A
+    dict-comprehension would let the later MATCH entry silently win and
+    could even PASS if it happens to agree with actual — that must never
+    happen. Any duplicate key is an invalid/ambiguous baseline: FAIL."""
+    contract = _make_contract(db_session)
+    db_session.commit()
+    key = _contract_key(contract)
+    entries = [
+        {"key": key, "expected": {}, "outcome": OUTCOME_UNRESOLVED},
+        {"key": key, "expected": _expected_contract_value(contract), "outcome": OUTCOME_MATCH},
+        {"key": _unresolved_indicator_key(contract), "expected": {"has_unresolved": False}, "outcome": OUTCOME_MATCH},
+    ]
+    result = reconcile(db_session, {"entries": entries})
+    assert not result.passed
+    assert any(e.key == key and e.outcome == OUTCOME_UNRESOLVED for e in result.entries)
+
+
+def test_duplicate_baseline_key_match_expected_a_then_match_expected_b_fails(db_session):
+    """B. The SAME key appears twice, both claiming MATCH, but with
+    CONFLICTING ``expected`` payloads. Whichever one BEL's actual state
+    happens to agree with, the baseline itself is ambiguous — FAIL."""
+    contract = _make_contract(db_session)
+    db_session.commit()
+    key = _contract_key(contract)
+    conflicting_expected = dict(_expected_contract_value(contract))
+    conflicting_expected["gross_amount"] = "1.00"
+    entries = [
+        {"key": key, "expected": _expected_contract_value(contract), "outcome": OUTCOME_MATCH},
+        {"key": key, "expected": conflicting_expected, "outcome": OUTCOME_MATCH},
+        {"key": _unresolved_indicator_key(contract), "expected": {"has_unresolved": False}, "outcome": OUTCOME_MATCH},
+    ]
+    result = reconcile(db_session, {"entries": entries})
+    assert not result.passed
+    assert any(e.key == key and e.outcome == OUTCOME_UNRESOLVED for e in result.entries)
+
+
+def test_duplicate_baseline_key_not_double_reported(db_session):
+    """A duplicate baseline key produces exactly ONE UNRESOLVED
+    reconciliation entry for that key — never also a second "actual key
+    the baseline never adjudicated" entry for the same key."""
+    contract = _make_contract(db_session)
+    db_session.commit()
+    key = _contract_key(contract)
+    entries = [
+        {"key": key, "expected": _expected_contract_value(contract), "outcome": OUTCOME_MATCH},
+        {"key": key, "expected": _expected_contract_value(contract), "outcome": OUTCOME_MATCH},
+        {"key": _unresolved_indicator_key(contract), "expected": {"has_unresolved": False}, "outcome": OUTCOME_MATCH},
+    ]
+    result = reconcile(db_session, {"entries": entries})
+    matching_entries = [e for e in result.entries if e.key == key]
+    assert len(matching_entries) == 1
+    assert matching_entries[0].outcome == OUTCOME_UNRESOLVED
+
+
+def test_baseline_key_prefixed_unresolved_is_never_silently_skipped(db_session):
+    """A baseline entry naming its OWN key with the ``unresolved:``
+    prefix must never simply vanish via a silent ``continue`` — it
+    surfaces as its own UNRESOLVED entry and fails the run."""
+    contract = _make_contract(db_session)
+    db_session.commit()
+    entries = _contract_entries(contract, OUTCOME_MATCH)
+    entries.append({"key": "unresolved:smuggled:1", "expected": {}, "outcome": OUTCOME_MATCH})
+    result = reconcile(db_session, {"entries": entries})
+    assert not result.passed
+    assert any(e.key == "unresolved:smuggled:1" and e.outcome == OUTCOME_UNRESOLVED for e in result.entries)

@@ -502,6 +502,80 @@ def test_cost_recognition_fact_supersede_rejects_shipment_of_another_contract(db
     assert ShipmentRepository(db_session).get(other_shipment.id).contract_id == other_contract.id  # untouched
 
 
+# ---------------------------------------------------------------------------
+# Round-3 gate fix — insert-new-fact + CAS-mark-old is one SAVEPOINT: a CAS
+# loss must write ZERO new fact rows, even once the caller catches the
+# error and explicitly commits its own (otherwise unrelated) transaction.
+# Two independent Sessions over a real file-backed database (the same
+# idiom as tests/integration/test_contract_item_facts.py's
+# test_two_independent_sessions_stale_correction_is_rejected).
+# ---------------------------------------------------------------------------
+
+
+def test_cost_recognition_fact_stale_session_supersession_leaves_no_orphan_fact(tmp_path):
+    db_path = tmp_path / "wfs-concurrency.db"
+    engine = make_engine(str(db_path))
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+
+    with session_factory() as setup_session:
+        frag = _make_fragment(setup_session)
+        contract = _make_contract(setup_session, frag.id)
+        old = CostRecognitionFact(
+            id=uuid.uuid4(), contract_id=contract.id, recognition_date=date(2025, 12, 1),
+            basis=CostRecognitionBasis.MANUAL_CONFIRMED, source_fragment_id=frag.id, created_at=NOW,
+            shipment_id=None,
+        )
+        CostRecognitionFactRepository(setup_session).add(old)
+        setup_session.commit()
+        old_id = old.id
+
+    session_a = session_factory()
+    session_b = session_factory()
+    try:
+        # Session A preloads the old fact — establishing A's own view
+        # before B ever touches it.
+        preloaded_for_a = CostRecognitionFactRepository(session_a).get(old_id)
+        assert preloaded_for_a is not None
+
+        # Session B supersedes the SAME old fact and commits — a genuine
+        # concurrent writer winning the race.
+        frag_b = _make_fragment(session_b)
+        result_b = supersede_cost_recognition_fact(
+            session_b, superseded_fact_id=old_id, recognition_date=date(2025, 12, 10),
+            basis=CostRecognitionBasis.EXPORT_EXECUTION_CONFIRMED, source_fragment_id=frag_b.id, shipment_id=None,
+            created_at=NOW,
+        )
+        session_b.commit()
+
+        # Session A, unaware of B's already-committed win, attempts its
+        # own supersession of the SAME old fact — it must fail, and MUST
+        # NOT leave a new fact row pending in A's transaction.
+        frag_a = _make_fragment(session_a)
+        with pytest.raises(WholeFactSupersessionError):
+            supersede_cost_recognition_fact(
+                session_a, superseded_fact_id=old_id, recognition_date=date(2025, 12, 20),
+                basis=CostRecognitionBasis.MANUAL_CONFIRMED, source_fragment_id=frag_a.id, shipment_id=None,
+                created_at=NOW,
+            )
+        # Session A explicitly COMMITS (not rollback) after catching the
+        # error — proving the SAVEPOINT already discarded A's own
+        # attempted new fact, so there is nothing left for this commit to
+        # persist as an orphan.
+        session_a.commit()
+    finally:
+        session_a.close()
+        session_b.close()
+
+    with session_factory() as verify_session:
+        repo = CostRecognitionFactRepository(verify_session)
+        current = repo.list_all()
+        assert len(current) == 1
+        assert current[0].id == result_b.id  # only B's replacement is current
+        all_facts = repo.list_all_including_superseded()
+        assert {f.id for f in all_facts} == {old_id, result_b.id}  # no orphan from A
+
+
 def test_cost_recognition_fact_supersede_rejects_unsupported_basis(db_session):
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id)

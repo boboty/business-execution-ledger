@@ -22,6 +22,16 @@ Not a generic temporal/fact framework: no shared "Fact" superclass, no
 polymorphic dispatch, no persistence beyond the narrow per-object
 mechanics ``mark_superseded`` already established.
 
+Gate-fix (Phase 2D.1-R5 round 3), HARD: insert-new-fact + CAS-mark-old
+happens inside one SAVEPOINT (``Session.begin_nested()``) per function.
+A CAS loss (a concurrent supersession already won) raises
+``WholeFactSupersessionError`` from INSIDE that SAVEPOINT block, which
+rolls the SAVEPOINT back before the error propagates — the just-inserted
+new fact is discarded at the database level, never merely left pending
+for an unwary caller's later ``commit()`` to persist as an orphan
+current fact. The CAS loser writes ZERO new fact rows, for all four
+whole-fact types.
+
 Gate-fix (Phase 2D.1-R5 round 2), HARD: supersession is a SECOND WRITER
 for a fact type, not a way around that fact type's safety constraints.
 Every function here reuses the SAME validation its fact type's ordinary
@@ -105,6 +115,22 @@ def _require_same_contract_shipment(
         )
 
 
+def _insert_and_mark_superseded(session: Session, repo, old_id: uuid.UUID, new_fact, error_message: str):
+    """Insert ``new_fact`` and CAS-mark ``old_id`` superseded inside one
+    SAVEPOINT: a CAS loss raises from within the block, so the SAVEPOINT
+    rollback (``Session.begin_nested()``'s own exception handling)
+    discards the just-inserted row before the error ever reaches the
+    caller — write-nothing-on-CAS-failure, not merely raise-and-hope the
+    caller rolls back too."""
+    with session.begin_nested():
+        repo.add(new_fact)
+        session.flush()
+        if not repo.mark_superseded(old_id, superseded_by_fact_id=new_fact.id):
+            raise WholeFactSupersessionError(error_message)
+    session.flush()
+    return new_fact
+
+
 def _require_valid_item_allocation(
     session: Session,
     *,
@@ -167,14 +193,10 @@ def supersede_cost_recognition_fact(
         id=uuid.uuid4(), contract_id=old.contract_id, recognition_date=recognition_date, basis=basis,
         source_fragment_id=source_fragment_id, created_at=created_at, shipment_id=shipment_id,
     )
-    repo.add(new_fact)
-    session.flush()
-    if not repo.mark_superseded(old.id, superseded_by_fact_id=new_fact.id):
-        raise WholeFactSupersessionError(
-            f"CostRecognitionFact {superseded_fact_id} was superseded concurrently — refusing a second supersession"
-        )
-    session.flush()
-    return new_fact
+    return _insert_and_mark_superseded(
+        session, repo, old.id, new_fact,
+        f"CostRecognitionFact {superseded_fact_id} was superseded concurrently — refusing a second supersession",
+    )
 
 
 def supersede_accrual_basis_fact(
@@ -207,14 +229,10 @@ def supersede_accrual_basis_fact(
         contract_item_id=old.contract_item_id, quantity=quantity, estimated_cost=estimated_cost, basis=basis,
         source_fragment_id=source_fragment_id, created_at=created_at,
     )
-    repo.add(new_fact)
-    session.flush()
-    if not repo.mark_superseded(old.id, superseded_by_fact_id=new_fact.id):
-        raise WholeFactSupersessionError(
-            f"AccrualBasisFact {superseded_fact_id} was superseded concurrently — refusing a second supersession"
-        )
-    session.flush()
-    return new_fact
+    return _insert_and_mark_superseded(
+        session, repo, old.id, new_fact,
+        f"AccrualBasisFact {superseded_fact_id} was superseded concurrently — refusing a second supersession",
+    )
 
 
 def supersede_historical_accrual_fact(
@@ -246,15 +264,10 @@ def supersede_historical_accrual_fact(
         id=uuid.uuid4(), source_period=old.source_period, contract_item_id=old.contract_item_id, quantity=quantity,
         estimated_cost=estimated_cost, basis=basis, source_fragment_id=source_fragment_id, confirmed_at=confirmed_at,
     )
-    repo.add(new_fact)
-    session.flush()
-    if not repo.mark_superseded(old.id, superseded_by_fact_id=new_fact.id):
-        raise WholeFactSupersessionError(
-            f"HistoricalAccrualFact {superseded_fact_id} was superseded concurrently — refusing a second "
-            "supersession"
-        )
-    session.flush()
-    return new_fact
+    return _insert_and_mark_superseded(
+        session, repo, old.id, new_fact,
+        f"HistoricalAccrualFact {superseded_fact_id} was superseded concurrently — refusing a second supersession",
+    )
 
 
 def supersede_invoice_item_allocation(
@@ -320,12 +333,7 @@ def supersede_invoice_item_allocation(
         allocated_quantity=allocated_quantity, allocated_net_amount=allocated_net_amount,
         confirmation_type=confirmation_type, source_fragment_id=source_fragment_id, created_at=created_at,
     )
-    repo.add(new_fact)
-    session.flush()
-    if not repo.mark_superseded(old.id, superseded_by_fact_id=new_fact.id):
-        raise WholeFactSupersessionError(
-            f"InvoiceItemAllocation {superseded_fact_id} was superseded concurrently — refusing a second "
-            "supersession"
-        )
-    session.flush()
-    return new_fact
+    return _insert_and_mark_superseded(
+        session, repo, old.id, new_fact,
+        f"InvoiceItemAllocation {superseded_fact_id} was superseded concurrently — refusing a second supersession",
+    )

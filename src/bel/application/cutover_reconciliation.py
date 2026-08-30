@@ -40,6 +40,17 @@ Gate-fix (Phase 2D.1-R5 round 2) HARD invariants:
   compares as an exact string — ``"00123"`` and ``"123"`` are NEVER
   treated as equal.
 
+Gate-fix (Phase 2D.1-R5 round 3) HARD invariants:
+
+- A Cutover Baseline naming the SAME key more than once is an invalid/
+  ambiguous baseline, never resolved by "last entry wins" dict
+  construction — every duplicated key becomes its own unconditional
+  UNRESOLVED entry, whatever outcome or ``expected`` any of the
+  colliding baseline entries claimed.
+- A baseline entry whose OWN key starts with ``unresolved:`` can never
+  pre-adjudicate anything and is never silently skipped either — it
+  surfaces as its own UNRESOLVED entry.
+
 Gate-fix (Phase 2D.1-R5 round 2) M:N duplicate observation: the R4
 primary axis emits ONE row per PROCUREMENT Contract and nests every
 linked sales scope inside it (docs/V1-SCOPE.md section 5 item 1), so one
@@ -423,10 +434,24 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
     in the first place, so there is nothing to special-case here — the
     snapshot's own key set already IS the in-scope set."""
     actual = build_contract_execution_snapshot(session)
-    baseline_entries = {e["key"]: e for e in baseline.get("entries", [])}
+    raw_entries = baseline.get("entries", [])
 
     results: list[ReconciliationEntry] = []
     unresolved = 0
+
+    # A duplicate baseline key is an invalid/ambiguous baseline — never
+    # resolved by dict-construction's "last entry wins". Every duplicated
+    # key becomes exactly ONE unconditional UNRESOLVED entry here, and is
+    # then excluded entirely from the per-key adjudication below (so it
+    # is never ALSO reported a second time as "an actual key the
+    # baseline never adjudicated").
+    key_counts = Counter(e["key"] for e in raw_entries)
+    duplicate_keys = {key for key, count in key_counts.items() if count > 1}
+    for key in sorted(duplicate_keys):
+        results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=None))
+        unresolved += 1
+
+    baseline_entries = {e["key"]: e for e in raw_entries if e["key"] not in duplicate_keys}
 
     resolvable_actual_keys: set[str] = set()
     for key in actual:
@@ -438,7 +463,14 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
 
     for key, entry in baseline_entries.items():
         if key.startswith(_UNRESOLVED_PREFIX):
-            continue  # never a baseline-adjudicatable key
+            # Never a baseline-adjudicatable key — and never silently
+            # dropped either. A baseline naming one is itself an
+            # unadjudicated discrepancy.
+            results.append(
+                ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=entry.get("outcome"))
+            )
+            unresolved += 1
+            continue
         recorded_outcome = entry.get("outcome")
         actual_value = actual.get(key)
         if recorded_outcome not in _RECORDABLE_BASELINE_OUTCOMES:
@@ -457,6 +489,8 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
             unresolved += 1
 
     for key in resolvable_actual_keys:
+        if key in duplicate_keys:
+            continue  # already reported once, above — never double-counted
         if key not in baseline_entries:
             # BEL holds an in-scope Fact the baseline never adjudicated.
             results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=None))
