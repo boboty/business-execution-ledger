@@ -6,6 +6,7 @@ from sqlalchemy import pool
 
 from alembic import context
 
+from bel.infrastructure.env_bootstrap import load_local_dotenv
 from bel.infrastructure.persistence.models import Base
 
 # this is the Alembic Config object, which provides
@@ -16,6 +17,14 @@ config = context.config
 # This line sets up loggers basically.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# Development convenience only (see env_bootstrap.py) — populates
+# BEL_DATABASE_URL (and nothing else) from a source-checkout .env file
+# BEFORE it's read below, without ever overriding an already-exported
+# process environment variable. A no-op outside a real BEL source
+# checkout, so production/CI behavior (which always injects
+# BEL_DATABASE_URL directly) is unaffected.
+load_local_dotenv()
 
 # BEL_DATABASE_URL is BEL's ONE runtime configuration contract (see
 # docs/PERSISTENCE-MIGRATION-POLICY.md) — read directly from the

@@ -217,10 +217,34 @@ it's unset — it never falls back to `alembic.ini`'s own `sqlalchemy.url`
 key, which is a deliberately unresolvable placeholder, never a usable
 local/default connection string. CLI: `--database-url` or the
 `BEL_DATABASE_URL` environment variable, required. Web: same, via
-`create_app(database_url=...)`. A local `.env` (gitignored, never
-committed — see `.env.example` for the placeholder template) or a plain
-exported shell variable are both sufficient; no dotenv dependency is
-required.
+`create_app(database_url=...)`.
+
+**Local development `.env` loading** (`src/bel/infrastructure/env_bootstrap.py`)
+is a SOURCE-CHECKOUT DEVELOPMENT convenience only, never a second
+runtime configuration protocol or a general production discovery
+mechanism. A repo-root `.env` (gitignored, never committed — see
+`.env.example` for the placeholder template) containing
+`BEL_DATABASE_URL` is auto-loaded by both the CLI and Alembic
+(`migrations/env.py`), via the SAME shared helper so the two paths
+cannot drift, before either reads the variable. Precedence, highest
+first:
+
+1. an explicit `--database-url` CLI flag (Click's own native
+   flag-over-envvar behavior, untouched by this mechanism)
+2. an already-exported process `BEL_DATABASE_URL`
+3. this repo's `.env` file
+4. the controlled `MissingDatabaseUrlError` / CLI "missing option" error
+
+`.env`'s value NEVER overrides an already-set process variable
+(`python-dotenv`'s `load_dotenv(..., override=False)`). Discovery is
+anchored to `env_bootstrap.py`'s own installed location (walking up to
+find a directory carrying BOTH `pyproject.toml` and `alembic.ini`
+together — not a generic "search upward from cwd for any `.env`"), so it
+is cwd-independent and structurally cannot mistake an unrelated parent
+directory for a BEL checkout: a packaged/production install carries
+neither marker, so the loader silently no-ops and production/CI continue
+to require `BEL_DATABASE_URL` injected by their own deployment
+environment exactly as before this mechanism existed.
 
 Concurrency: `serialized_write_transaction` (SQLite: `BEGIN IMMEDIATE`;
 PostgreSQL: `SET LOCAL lock_timeout` + `pg_advisory_xact_lock` on one

@@ -70,8 +70,17 @@ from bel.application.shipment_facts import (
     list_shipments_for_contract,
 )
 from bel.domain.invoice import InvoiceDirection
+from bel.infrastructure.env_bootstrap import load_local_dotenv
 from bel.infrastructure.persistence.database import is_database_busy, make_engine, make_session_factory
 from bel.infrastructure.persistence.schema_gate import SchemaNotAtHeadError, assert_schema_at_head
+
+# Development convenience only (see env_bootstrap.py) — populates
+# BEL_DATABASE_URL (and nothing else) from a source-checkout .env file
+# BEFORE the --database-url option below reads it via envvar=, without
+# ever overriding an already-exported process environment variable. A
+# no-op outside a real BEL source checkout (e.g. a packaged/production
+# install), so production/CI behavior is unaffected.
+load_local_dotenv()
 
 
 def _session_factory(database_url: str):

@@ -30,8 +30,13 @@ git config core.hooksPath .githooks
 
 # A local PostgreSQL 18 instance (BEL's V1 production target) is needed
 # for anything touching the migration chain or PostgreSQL-marked tests —
-# createdb, then:
+# createdb, then either export BEL_DATABASE_URL directly:
 export BEL_DATABASE_URL=postgresql+psycopg://localhost/bel_dev
+# ...or copy .env.example to a repo-root .env and fill it in — both `bel`
+# and `alembic` auto-load it from within this checkout (development
+# convenience only, never a production mechanism; see
+# docs/PERSISTENCE-MIGRATION-POLICY.md's "Runtime contract" section for
+# the exact precedence rule).
 .venv/bin/alembic upgrade head
 
 .venv/bin/pytest   # PostgreSQL-marked tests auto-skip if BEL_DATABASE_URL isn't set
