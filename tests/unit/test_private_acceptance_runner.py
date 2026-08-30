@@ -119,6 +119,107 @@ def test_report_rejects_scenario_identifier_path_escape(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# resolve_period_dir — explicit --period boundary (Phase 2D.1-R5 final gate
+# fix). A period must be a closed YYYY-MM identifier resolving, after
+# symlink resolution, strictly inside the private root.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_period_dir_valid_explicit_period_accepted(tmp_path):
+    period_dir = tmp_path / "2026-01"
+    period_dir.mkdir()
+
+    result = runner.resolve_period_dir(tmp_path, "2026-01")
+
+    assert result == period_dir.resolve(strict=True)
+
+
+def test_resolve_period_dir_rejects_dotdot(tmp_path):
+    with pytest.raises(runner.AcceptanceError) as exc_info:
+        runner.resolve_period_dir(tmp_path, "..")
+    assert exc_info.value.reason_code == runner.REASON_PERIOD_NOT_FOUND
+
+
+def test_resolve_period_dir_rejects_relative_escape(tmp_path):
+    outside = tmp_path.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    with pytest.raises(runner.AcceptanceError) as exc_info:
+        runner.resolve_period_dir(tmp_path, "../outside")
+    assert exc_info.value.reason_code == runner.REASON_PERIOD_NOT_FOUND
+
+
+def test_resolve_period_dir_rejects_absolute_path(tmp_path):
+    external = tmp_path.parent / "external-2026-02"
+    external.mkdir()
+
+    with pytest.raises(runner.AcceptanceError) as exc_info:
+        runner.resolve_period_dir(tmp_path, str(external))
+    assert exc_info.value.reason_code == runner.REASON_PERIOD_NOT_FOUND
+
+
+def test_resolve_period_dir_rejects_nested_path(tmp_path):
+    nested = tmp_path / "2026-01" / "sub"
+    nested.mkdir(parents=True)
+    with pytest.raises(runner.AcceptanceError) as exc_info:
+        runner.resolve_period_dir(tmp_path, "2026-01/sub")
+    assert exc_info.value.reason_code == runner.REASON_PERIOD_NOT_FOUND
+
+
+def test_resolve_period_dir_rejects_symlink_outside_private_root(tmp_path):
+    outside = tmp_path.parent / "outside-2026-01"
+    outside.mkdir()
+    (tmp_path / "2026-01").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(runner.AcceptanceError) as exc_info:
+        runner.resolve_period_dir(tmp_path, "2026-01")
+    assert exc_info.value.reason_code == runner.REASON_PERIOD_NOT_FOUND
+
+
+def test_resolve_period_dir_rejects_symlink_into_repository(tmp_path):
+    repo_root = Path(runner.__file__).resolve().parents[2]
+    (tmp_path / "2026-01").symlink_to(repo_root, target_is_directory=True)
+
+    with pytest.raises(runner.AcceptanceError) as exc_info:
+        runner.resolve_period_dir(tmp_path, "2026-01")
+    assert exc_info.value.reason_code == runner.REASON_PERIOD_NOT_FOUND
+
+
+def test_run_scenario_period_escape_never_invokes_scenario_function(monkeypatch, tmp_path, capsys):
+    """An escape attempt through --period must be rejected by
+    resolve_period_dir BEFORE run_scenario ever calls the scenario
+    function (which is what would read backfill-plan.json / expected
+    material and execute backfill) — and stdout stays exactly the
+    redacted PASS/FAIL line, never the rejected path."""
+    called: list[Path] = []
+
+    def spy(period_dir):
+        called.append(period_dir)
+        return {"scenario": "P1_IMPORT"}
+
+    monkeypatch.setitem(runner.SCENARIOS, "P1_IMPORT", spy)
+
+    result = runner.run_scenario(tmp_path, "..", "P1_IMPORT")
+
+    assert result is False
+    assert called == []  # the scenario function was never invoked
+    captured = capsys.readouterr()
+    assert captured.out == "P1_IMPORT: FAIL\n"
+    assert captured.err == ""
+    assert ".." not in captured.out
+    assert str(tmp_path) not in captured.out
+
+
+def test_resolve_period_dir_autodiscovery_still_finds_latest(tmp_path):
+    (tmp_path / "2025-11").mkdir()
+    (tmp_path / "2026-01").mkdir()
+    (tmp_path / "not-a-period").mkdir()
+
+    result = runner.resolve_period_dir(tmp_path, None)
+
+    assert result == (tmp_path / "2026-01").resolve(strict=True)
+
+
+# ---------------------------------------------------------------------------
 # P2D_CUTOVER_RECONCILIATION — synthetic end-to-end, public-safe throughout.
 # ---------------------------------------------------------------------------
 

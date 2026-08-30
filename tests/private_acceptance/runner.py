@@ -147,16 +147,33 @@ def resolve_private_root() -> Path:
 
 
 def resolve_period_dir(root: Path, period: str | None) -> Path:
+    """Resolve one period directory strictly inside *root*.
+
+    Gate-fix (Phase 2D.1-R5 final round), HARD: an explicit --period is a
+    closed YYYY-MM identifier, never an arbitrary path string — ``..``,
+    ``../escape``, and an absolute path are all rejected by the regex
+    alone, before the filesystem is ever touched. The resolved candidate
+    is then required to be a real directory that, AFTER symlink
+    resolution, is still contained within the resolved private root —
+    closing the remaining escape a same-looking symlinked YYYY-MM entry
+    could otherwise provide (into the repository or anywhere else
+    outside BEL_PRIVATE_DATA_ROOT)."""
+    resolved_root = root.resolve(strict=True)
     if period:
-        candidate = root / period
-        if not candidate.is_dir():
+        if not PERIOD_DIR_RE.match(period):
+            raise AcceptanceError(REASON_PERIOD_NOT_FOUND, {"root": str(root), "period": period})
+        try:
+            candidate = (resolved_root / period).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise AcceptanceError(REASON_PERIOD_NOT_FOUND, {"root": str(root), "period": period}) from exc
+        if not candidate.is_dir() or not _is_within(candidate, resolved_root):
             raise AcceptanceError(REASON_PERIOD_NOT_FOUND, {"root": str(root), "period": period})
         return candidate
 
-    periods = sorted(p.name for p in root.iterdir() if p.is_dir() and PERIOD_DIR_RE.match(p.name))
+    periods = sorted(p.name for p in resolved_root.iterdir() if p.is_dir() and PERIOD_DIR_RE.match(p.name))
     if not periods:
         raise AcceptanceError(REASON_PERIOD_NOT_FOUND, {"root": str(root)})
-    return root / periods[-1]
+    return resolved_root / periods[-1]
 
 
 def _assert_equal(diagnostic: dict[str, Any], label: str, actual: Any, expected: Any) -> None:
