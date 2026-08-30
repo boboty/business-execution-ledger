@@ -266,12 +266,20 @@ def import_invoices_cmd(ctx: click.Context, xlsx_path: Path, direction: str) -> 
 @cli.command("import-bank")
 @click.argument("pdf_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--profile", type=click.Choice(["cmb"], case_sensitive=False), required=True, help="Bank statement layout profile.")
+@click.option(
+    "--source-account-id",
+    "source_account_id",
+    default=None,
+    help="Stable identifier of the source BANK ACCOUNT this statement belongs to — recorded on every "
+    "Payment created here (docs/PHASE2D1-R0-DECISIONS.md section 4.4). Never guessed from the file, its "
+    "name, or the profile; omitted means NULL, exactly as before this option existed.",
+)
 @click.pass_context
-def import_bank_cmd(ctx: click.Context, pdf_path: Path, profile: str) -> None:
+def import_bank_cmd(ctx: click.Context, pdf_path: Path, profile: str, source_account_id: str | None) -> None:
     """Import a bank statement PDF (deterministic text-layer parsing, no OCR)."""
     session_factory = _session_factory(ctx.obj["db_path"])
     with session_factory() as session:
-        result = import_bank_statement(session, pdf_path, profile.lower())
+        result = import_bank_statement(session, pdf_path, profile.lower(), source_account_id=source_account_id)
 
     if result.is_reimport:
         click.echo("Import completed (re-import — same file already on record, 0 new facts)")
@@ -284,6 +292,7 @@ def import_bank_cmd(ctx: click.Context, pdf_path: Path, profile: str) -> None:
     click.echo("")
     click.echo("Records:")
     click.echo(f"  payments created: {result.payments_created}")
+    click.echo(f"  source account:   {result.source_account_id if result.source_account_id else '(not supplied)'}")
     click.echo("")
     click.echo("Reconciliation:")
     click.echo(f"  opening balance: {result.opening_balance:,.2f}" if result.opening_balance is not None else "  opening balance: (not found)")

@@ -35,6 +35,15 @@ removed. What replaces each:
   available as a direct-call primitive for a FUTURE genuine-Evidence
   caller, but this plan never wires it to a bare manifest assertion.
 
+Gate-fix (Phase 2D.1-R5 round 2), HARD: no source path in the plan may
+name ``<period>/expected/`` — that directory holds reconciliation's OWN
+independently-supplied acceptance material (the Cutover Baseline), never
+a backfill Fact source (section 47). The rejection happens at the path
+boundary, BEFORE the file is ever opened, and AFTER symlink resolution,
+so a literal ``expected/ledger.xlsx`` and a symlink whose resolved target
+sits inside ``expected/`` are rejected identically — even when the file
+named is a perfectly valid source workbook.
+
 Shared by the CLI seam (``bel cutover backfill``) and the private
 acceptance runner (``P2D_CUTOVER_RECONCILIATION``) — one execution path,
 not two.
@@ -61,6 +70,9 @@ CLOSED_PLAN_SECTIONS = (
     "cutover_fact_pack",
 )
 
+# Reconciliation's own acceptance material, never a backfill Fact source.
+_EXPECTED_DIR_NAME = "expected"
+
 
 class CutoverPlanError(ValueError):
     """A rejected backfill plan — unknown section, malformed entry, or a
@@ -71,6 +83,15 @@ class CutoverPlanPathEscape(CutoverPlanError):
     """A plan path attempted to escape the period directory (``../``, an
     absolute path, or a symlink pointing outside it). This is a HARD
     security boundary, not a business-logic conflict."""
+
+
+class CutoverPlanExpectedPath(CutoverPlanPathEscape):
+    """A plan path named ``<period>/expected/`` — either literally, or
+    through a symlink whose resolved target sits inside it. That
+    directory is reconciliation's own independently-supplied acceptance
+    material, never a Fact source (section 47, HARD), so it is rejected
+    at the path boundary whether or not the file it names would
+    otherwise parse as a valid source."""
 
 
 @dataclass
@@ -85,6 +106,15 @@ def _resolve_plan_path(period_dir: Path, relative: str) -> Path:
         raise CutoverPlanPathEscape(f"plan path must be relative to the period directory, got {relative!r}")
     if ".." in Path(relative).parts:
         raise CutoverPlanPathEscape(f"plan path must not contain '..', got {relative!r}")
+    # expected/ is rejected both lexically and after resolution: a plan
+    # naming it is never a Fact source, and the resolved check also
+    # catches a symlink whose TARGET sits inside expected/ even though
+    # the plan's own path string does not mention it.
+    if Path(relative).parts[0] == _EXPECTED_DIR_NAME:
+        raise CutoverPlanExpectedPath(
+            f"plan path {relative!r} names {_EXPECTED_DIR_NAME}/ — reconciliation's acceptance material, "
+            "never a backfill source"
+        )
     # Containment is checked against the non-strict resolution first (so
     # a merely-nonexistent target reports a normal file-not-found, never
     # masked as a path-escape finding), THEN existence is required —
@@ -93,11 +123,19 @@ def _resolve_plan_path(period_dir: Path, relative: str) -> Path:
     resolved_period_dir = period_dir.resolve(strict=True)
     candidate = (period_dir / relative).resolve(strict=False)
     try:
-        candidate.relative_to(resolved_period_dir)
+        relative_to_period = candidate.relative_to(resolved_period_dir)
     except ValueError as exc:
         raise CutoverPlanPathEscape(
             f"plan path {relative!r} resolves outside the period directory {resolved_period_dir}"
         ) from exc
+    # A symlink (or a symlinked subdirectory) whose RESOLVED target sits
+    # inside expected/ is the same violation as naming expected/
+    # literally — rejected at the boundary, before the file is opened.
+    if relative_to_period.parts and relative_to_period.parts[0] == _EXPECTED_DIR_NAME:
+        raise CutoverPlanExpectedPath(
+            f"plan path {relative!r} resolves inside {_EXPECTED_DIR_NAME}/ — reconciliation's acceptance "
+            "material, never a backfill source"
+        )
     if not candidate.exists():
         raise CutoverPlanError(f"plan path {relative!r} does not exist under the period directory")
     return candidate

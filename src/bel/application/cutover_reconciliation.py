@@ -39,6 +39,24 @@ Gate-fix (Phase 2D.1-R5 round 2) HARD invariants:
   field (business strings like a contract/sales-contract number) always
   compares as an exact string — ``"00123"`` and ``"123"`` are NEVER
   treated as equal.
+
+Gate-fix (Phase 2D.1-R5 round 2) M:N duplicate observation: the R4
+primary axis emits ONE row per PROCUREMENT Contract and nests every
+linked sales scope inside it (docs/V1-SCOPE.md section 5 item 1), so one
+SalesContract legitimately linked to N procurement Contracts projects its
+SAME scope-level facts N times — identical business key AND identical
+fact content. That is a projection artifact, never a duplicate business
+identity: those keys are collapsed to ONE observation here
+(``_MANY_TO_ONE_DEDUPE_PREFIXES``), so a legal many-to-one bridge never
+misfires ``duplicate_identity``. Two things are deliberately NOT
+deduped, so a genuine collision still fails the Gate unconditionally:
+
+- the same key carrying DIFFERENT content anywhere (never a silent
+  "first one wins" overwrite);
+- every procurement-axis namespace (contract / contract_item /
+  shipment / procurement invoice / outgoing payment / accrual) — two
+  Contracts sharing a business key is a real identity collision even
+  when their content happens to agree.
 """
 
 from __future__ import annotations
@@ -61,6 +79,18 @@ OUTCOME_UNRESOLVED = "UNRESOLVED"
 _RECORDABLE_BASELINE_OUTCOMES = (OUTCOME_MATCH, OUTCOME_BEL_CORRECTED_LEGACY)
 
 _UNRESOLVED_PREFIX = "unresolved:"
+
+# The SALES-SCOPE-level namespaces only. Each is keyed by the
+# SalesContract's own business identity alone (never by the procurement
+# Contract it was reached through), so the R4 primary axis legitimately
+# emits the very same (key, content) pair once per linked procurement
+# Contract — see the module docstring. Everything else (the procurement
+# axis) keeps the unconditional duplicate_identity rule.
+_MANY_TO_ONE_DEDUPE_PREFIXES = (
+    "sales_contract:",
+    "sales_invoice_allocation:",
+    "incoming_receipt_allocation:",
+)
 
 # R5 backfill's own unresolved-work producers (docs/ROADMAP.md 2D.1-R5
 # gate fix) — the ONLY exception types this module treats as
@@ -160,7 +190,14 @@ class _SnapshotBuilder:
     second pass — a silent dict-assignment can never let a later
     colliding key overwrite an earlier one. Every entry with an
     incomplete business identity is routed straight to an unconditional
-    ``unresolved:`` marker and never attempts the normal key at all."""
+    ``unresolved:`` marker and never attempts the normal key at all.
+
+    A repeated key is collapsed ONLY when it is one of the
+    sales-scope-level namespaces AND every one of its occurrences
+    carries identical fact content (``_dedupe_eligible_keys``) — the
+    legal many-to-one bridge's projection artifact. Any other repeat,
+    and any content disagreement, stays an unconditional
+    ``duplicate_identity`` entry."""
 
     def __init__(self) -> None:
         self._entries: list[tuple[str, dict[str, Any]]] = []
@@ -174,15 +211,36 @@ class _SnapshotBuilder:
         key = f"{_UNRESOLVED_PREFIX}{category}:{self._unresolved_ordinal}"
         self._entries.append((key, {"reason": reason, **context}))
 
+    def _dedupe_eligible_keys(self) -> set[str]:
+        """Repeated sales-scope-level keys whose EVERY occurrence carries
+        identical fact content — the same fact observed once per linked
+        procurement Contract, never two different facts under one
+        business identity. Compared NORMALIZED (so Decimal formatting
+        differences do not manufacture a collision) and with ``==``
+        (never ``repr``, so ``Decimal("5.0")`` and ``Decimal("5.00")``
+        still compare equal)."""
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for key, value in self._entries:
+            grouped.setdefault(key, []).append(value)
+        eligible: set[str] = set()
+        for key, values in grouped.items():
+            if len(values) < 2 or not key.startswith(_MANY_TO_ONE_DEDUPE_PREFIXES):
+                continue
+            first = _normalize(values[0])
+            if all(_normalize(v) == first for v in values[1:]):
+                eligible.add(key)
+        return eligible
+
     def build(self) -> dict[str, dict[str, Any]]:
         counts = Counter(k for k, _ in self._entries)
+        dedupe_eligible = self._dedupe_eligible_keys()
         snapshot: dict[str, dict[str, Any]] = {}
         collision_ordinal = 0
         for key, value in self._entries:
             if key.startswith(_UNRESOLVED_PREFIX):
                 snapshot[key] = value
                 continue
-            if counts[key] > 1:
+            if counts[key] > 1 and key not in dedupe_eligible:
                 collision_ordinal += 1
                 # Duplicate business identity — never a silent dict
                 # overwrite. BOTH/ALL colliding occurrences become their

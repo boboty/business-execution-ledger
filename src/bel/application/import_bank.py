@@ -31,9 +31,30 @@ class BankImportResult:
     closing_balance: Decimal | None
     total_in: Decimal
     total_out: Decimal
+    # Phase 2D.1-R5 round 2: the ordinary intake now carries the same
+    # source-account identifier R5's backfill seam already required
+    # (docs/PHASE2D1-R0-DECISIONS.md section 4.4) — recorded on every
+    # Payment created by this import, never inferred from the file, the
+    # filename or the profile. Backward-compatible: the parameter and
+    # this field both default to None, so existing callers and existing
+    # matching semantics are unchanged.
+    source_account_id: str | None = None
 
 
-def import_bank_statement(session: Session, file_path: Path, profile: str) -> BankImportResult:
+def import_bank_statement(
+    session: Session, file_path: Path, profile: str, *, source_account_id: str | None = None
+) -> BankImportResult:
+    """Import one bank statement PDF.
+
+    ``source_account_id`` is the R4/R5 Payment business identity seam
+    (docs/PHASE2D1-R0-DECISIONS.md section 4.4): the stable identifier
+    of the source BANK ACCOUNT this statement belongs to. It is a
+    caller-supplied input, never parsed from the PDF text layer (the CMB
+    adapter cannot determine one deterministically) and never guessed
+    from the filename, a counterparty, or the profile name. Omitting it
+    behaves exactly as before this round: Payments are created with a
+    NULL source_account_id, and nothing about matching changes.
+    """
     if profile not in SUPPORTED_PROFILES:
         raise ValueError(f"unsupported bank profile {profile!r}; supported: {sorted(SUPPORTED_PROFILES)}")
 
@@ -66,6 +87,7 @@ def import_bank_statement(session: Session, file_path: Path, profile: str) -> Ba
             closing_balance=None,
             total_in=Decimal("0"),
             total_out=Decimal("0"),
+            source_account_id=source_account_id,
         )
 
     parsed = parse_cmb_bank_statement(file_path)
@@ -118,6 +140,7 @@ def import_bank_statement(session: Session, file_path: Path, profile: str) -> Ba
                 running_balance=txn.running_balance,
                 source_fragment_id=transaction_fragment_ids[txn.transaction_index],
                 created_at=now,
+                source_account_id=source_account_id,
             )
         )
 
@@ -148,4 +171,5 @@ def import_bank_statement(session: Session, file_path: Path, profile: str) -> Ba
         closing_balance=parsed.closing_balance,
         total_in=total_in,
         total_out=total_out,
+        source_account_id=source_account_id,
     )

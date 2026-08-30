@@ -14,18 +14,36 @@ from decimal import Decimal
 
 import pytest
 
+from bel.application.contract_business_ledger import get_contract_business_ledger
 from bel.application.cutover_reconciliation import (
     OUTCOME_BEL_CORRECTED_LEGACY,
     OUTCOME_MATCH,
     OUTCOME_UNRESOLVED,
+    _SnapshotBuilder,
     build_contract_execution_snapshot,
     reconcile,
 )
+from bel.application.procurement_sales_link import add_procurement_sales_link
+from bel.application.sales_contract_facts import create_sales_contract_fact
+from bel.application.sales_matching import (
+    confirm_sales_invoice_match,
+    confirm_sales_payment_match,
+    propose_sales_invoice_match,
+    propose_sales_payment_match,
+)
 from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
+from bel.domain.invoice import Invoice, InvoiceDirection
+from bel.domain.payment import Payment, PaymentDirection
+from bel.domain.procurement_sales_link import ConfirmationType as LinkConfirmationType
 from bel.infrastructure.persistence.database import make_engine, make_session_factory
 from bel.infrastructure.persistence.models import Base
-from bel.infrastructure.persistence.repositories import ContractRepository, EvidenceRepository
+from bel.infrastructure.persistence.repositories import (
+    ContractRepository,
+    EvidenceRepository,
+    InvoiceRepository,
+    PaymentRepository,
+)
 
 NOW = datetime.now(timezone.utc)
 
@@ -89,6 +107,97 @@ def _expected_contract_value(contract):
         "gross_amount": str(contract.gross_amount), "currency": contract.currency,
         "contract_date": contract.contract_date.isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Gate-fix round 2 — the M:N sales scope (P1 -> S1 and P2 -> S1)
+# ---------------------------------------------------------------------------
+
+
+def _make_sales_contract(session, sales_contract_no="S1"):
+    frag = _make_fragment(session)
+    return create_sales_contract_fact(
+        session, our_entity="Buyer", sales_contract_no=sales_contract_no,
+        fields={
+            "customer": "Customer One", "currency": "CNY", "gross_amount": Decimal("500.00"),
+            "contract_date": date(2026, 1, 1),
+        },
+        source_fragment_id=frag.id, created_at=NOW,
+    ).sales_contract
+
+
+def _link_procurement_to_sales(session, contract, sales_contract) -> None:
+    frag = _make_fragment(session)
+    add_procurement_sales_link(
+        session, procurement_contract_id=contract.id, sales_contract_id=sales_contract.id,
+        source_fragment_id=frag.id, confirmation_type=LinkConfirmationType.HUMAN_CONFIRMED, created_at=NOW,
+    )
+
+
+def _allocate_sales_invoice(session, sales_contract, amount):
+    """A genuine R3b confirmation: SALES invoice -> SalesInvoiceAllocation
+    -> this SalesContract. Never written through a repository bypass."""
+    frag = _make_fragment(session)
+    invoice = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.SALES, invoice_type=None, invoice_no="INV-S1",
+        digital_invoice_no=None, external_invoice_key="INV-S1", issue_date=date(2026, 1, 3), seller="Buyer",
+        buyer="Customer One", net_amount=amount, tax_amount=Decimal("0"), gross_amount=amount,
+        invoice_status=None, source_fragment_id=frag.id, created_at=NOW, updated_at=NOW,
+    )
+    InvoiceRepository(session).add(invoice)
+    session.flush()
+    proposal = propose_sales_invoice_match(
+        session, invoice_id=invoice.id, sales_contract_ids=[sales_contract.id], created_at=NOW
+    )
+    confirm_sales_invoice_match(
+        session, match_case_id=proposal.match_case.id, allocations=[(sales_contract.id, amount)], created_at=NOW
+    )
+    return invoice
+
+
+def _allocate_incoming_receipt(session, sales_contract, amount):
+    """A genuine R3b confirmation: IN payment -> SalesPaymentAllocation."""
+    frag = _make_fragment(session)
+    payment = Payment(
+        id=uuid.uuid4(), transaction_date=date(2026, 1, 5), direction=PaymentDirection.IN, amount=amount,
+        counterparty="Customer One", business_type=None, bank_reference="REF-S1", description=None,
+        running_balance=None, source_fragment_id=frag.id, created_at=NOW, source_account_id="ACC-S1",
+    )
+    PaymentRepository(session).add(payment)
+    session.flush()
+    proposal = propose_sales_payment_match(
+        session, payment_id=payment.id, sales_contract_ids=[sales_contract.id], created_at=NOW
+    )
+    confirm_sales_payment_match(
+        session, match_case_id=proposal.match_case.id, allocations=[(sales_contract.id, amount)], created_at=NOW
+    )
+    return payment
+
+
+def _build_many_to_one_scenario(db_session, *, invoice_amount=Decimal("200.00"), receipt_amount=Decimal("80.00")):
+    """ONE SalesContract legitimately linked to TWO procurement Contracts
+    (docs/V1-SCOPE.md section 5 item 1's primary axis) — the M:N shape
+    that used to misfire duplicate_identity."""
+    p1 = _make_contract(db_session, contract_no="P1")
+    p2 = _make_contract(db_session, contract_no="P2")
+    s1 = _make_sales_contract(db_session)
+    _link_procurement_to_sales(db_session, p1, s1)
+    _link_procurement_to_sales(db_session, p2, s1)
+    invoice = _allocate_sales_invoice(db_session, s1, invoice_amount)
+    payment = _allocate_incoming_receipt(db_session, s1, receipt_amount)
+    db_session.commit()
+    return p1, p2, s1, invoice, payment
+
+
+def _sales_key(sales_contract):
+    return f"our_entity={sales_contract.our_entity}|sales_contract_no={sales_contract.sales_contract_no}"
+
+
+def _link_key(contract, sales_contract):
+    return (
+        f"procurement_sales_link:contract_no={contract.contract_no}|counterparty={contract.counterparty}"
+        f"|{_sales_key(sales_contract)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +381,124 @@ def test_14_business_string_numeric_lookalikes_never_normalized_equal(db_session
 
     assert _normalize({"contract_no": "00123"}) != _normalize({"contract_no": "123"})
     assert _normalize({"gross_amount": "100"}) == _normalize({"gross_amount": "100.00"})
+
+
+# ---------------------------------------------------------------------------
+# Gate-fix round 2 — one SalesContract linked to N procurement Contracts
+# (P1 -> S1, P2 -> S1) must never be reported as duplicate_identity
+# ---------------------------------------------------------------------------
+
+
+def test_many_to_one_sales_scope_is_observed_once_not_as_duplicate_identity(db_session):
+    p1, p2, s1, invoice, payment = _build_many_to_one_scenario(db_session)
+
+    # Precondition: the R4 primary axis really does project the SAME
+    # scope twice — one row per procurement Contract.
+    ledger = get_contract_business_ledger(db_session)
+    assert len(ledger.rows) == 2
+    assert [len(row.sales_scopes) for row in ledger.rows] == [1, 1]
+    assert {scope.sales_contract.id for row in ledger.rows for scope in row.sales_scopes} == {s1.id}
+
+    snapshot = build_contract_execution_snapshot(db_session)
+    assert not any("duplicate_identity" in key for key in snapshot)
+
+    # Each scope-level fact appears under exactly ONE business key.
+    assert len([k for k in snapshot if k.startswith("sales_contract:")]) == 1
+    assert len([k for k in snapshot if k.startswith("sales_invoice_allocation:")]) == 1
+    assert len([k for k in snapshot if k.startswith("incoming_receipt_allocation:")]) == 1
+    # ...while the procurement axis keeps one entry per procurement row.
+    assert len([k for k in snapshot if k.startswith("procurement_sales_link:")]) == 2
+    assert f"sales_invoice_allocation:{_sales_key(s1)}|invoice={invoice.external_invoice_key}" in snapshot
+
+
+def test_many_to_one_sales_scope_reconciles_against_a_complete_baseline(db_session):
+    """End-to-end: the same M:N shape still has to reconcile, with every
+    scope-level fact adjudicated exactly once."""
+    p1, p2, s1, _invoice, payment = _build_many_to_one_scenario(db_session)
+    entries = _contract_entries(p1, OUTCOME_MATCH) + _contract_entries(p2, OUTCOME_MATCH)
+    entries.append(
+        {
+            "key": f"sales_contract:{_sales_key(s1)}",
+            "expected": {
+                "customer": s1.customer, "currency": s1.currency, "gross_amount": str(s1.gross_amount),
+                "contract_date": s1.contract_date.isoformat(),
+            },
+            "outcome": OUTCOME_MATCH,
+        }
+    )
+    for contract in (p1, p2):
+        entries.append({"key": _link_key(contract, s1), "expected": {"current": True}, "outcome": OUTCOME_MATCH})
+    entries.append(
+        {
+            "key": f"sales_invoice_allocation:{_sales_key(s1)}|invoice=INV-S1",
+            "expected": {"allocated_gross_amount": "200.00"}, "outcome": OUTCOME_MATCH,
+        }
+    )
+    entries.append(
+        {
+            "key": (
+                f"incoming_receipt_allocation:{_sales_key(s1)}|payment=source_account_id={payment.source_account_id}"
+                f"|transaction_date={payment.transaction_date.isoformat()}|direction={payment.direction}"
+                f"|amount={payment.amount}|bank_reference={payment.bank_reference}"
+            ),
+            "expected": {"allocated_amount": "80.00"}, "outcome": OUTCOME_MATCH,
+        }
+    )
+
+    result = reconcile(db_session, {"entries": entries})
+    assert result.passed
+    assert result.unresolved_count == 0
+
+
+def test_genuine_contract_identity_collision_stays_unresolved(db_session):
+    """The dedupe is ONE namespace wide: two Contracts sharing a business
+    key is a real collision — UNRESOLVED even when their content happens
+    to agree, and a baseline can never pre-adjudicate it away."""
+    c1 = _make_contract(db_session, contract_no="P1", gross_amount=Decimal("100.00"))
+    c2 = _make_contract(db_session, contract_no="P1", gross_amount=Decimal("999.00"))
+    db_session.commit()
+
+    snapshot = build_contract_execution_snapshot(db_session)
+    collisions = [k for k in snapshot if k.startswith("unresolved:duplicate_identity:")]
+    assert collisions  # the procurement axis is never deduplicated
+    assert _contract_key(c1) not in snapshot  # == _contract_key(c2)
+
+    entries = _contract_entries(c1, OUTCOME_MATCH)
+    result = reconcile(db_session, {"entries": entries})
+    assert not result.passed
+    assert any(e.key in collisions for e in result.entries if e.outcome == OUTCOME_UNRESOLVED)
+
+
+def test_genuine_contract_identity_collision_with_identical_content_stays_unresolved(db_session):
+    """Adversarial: even a byte-identical duplicate Contract is a
+    duplicate IDENTITY, not a repeat observation — only the
+    sales-scope namespaces are ever collapsed."""
+    _make_contract(db_session, contract_no="P1", gross_amount=Decimal("100.00"))
+    _make_contract(db_session, contract_no="P1", gross_amount=Decimal("100.00"))
+    db_session.commit()
+
+    snapshot = build_contract_execution_snapshot(db_session)
+    assert [k for k in snapshot if k.startswith("unresolved:duplicate_identity:")]
+
+
+def test_sales_scope_key_with_conflicting_content_is_never_deduped():
+    """The collapse is content-conditioned, not prefix-conditioned: the
+    same sales-scope business key carrying DIFFERENT fact content is a
+    duplicate identity and stays UNRESOLVED — never a silent
+    "first occurrence wins"."""
+    key = "sales_contract:our_entity=Buyer|sales_contract_no=S1"
+    builder = _SnapshotBuilder()
+    builder.add(key, {"customer": "Customer One"})
+    builder.add(key, {"customer": "Customer Two"})
+    snapshot = builder.build()
+    assert len([k for k in snapshot if k.startswith("unresolved:duplicate_identity:")]) == 2
+    assert key not in snapshot
+
+    # Positive control: identical content collapses to ONE observation.
+    builder = _SnapshotBuilder()
+    builder.add(key, {"customer": "Customer One"})
+    builder.add(key, {"customer": "Customer One"})
+    assert builder.build() == {key: {"customer": "Customer One"}}
 
 
 # ---------------------------------------------------------------------------
