@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:18-alpine
         env:
           POSTGRES_USER: bel_ci
           POSTGRES_PASSWORD: bel_ci_password

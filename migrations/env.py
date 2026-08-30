@@ -1,7 +1,7 @@
 import os
 from logging.config import fileConfig
 
-from sqlalchemy import create_engine, engine_from_config
+from sqlalchemy import create_engine
 from sqlalchemy import pool
 
 from alembic import context
@@ -42,6 +42,24 @@ target_metadata = Base.metadata
 # ... etc.
 
 
+class MissingDatabaseUrlError(RuntimeError):
+    """BEL_DATABASE_URL is BEL's ONE runtime configuration contract (see
+    docs/PERSISTENCE-MIGRATION-POLICY.md) — every Alembic operation that
+    needs to know a database (its dialect for offline SQL rendering, or
+    a live connection for online execution) requires it explicitly.
+    alembic.ini's own ``sqlalchemy.url`` is a non-runtime placeholder
+    only (see the ini file) and is never consulted as a fallback here:
+    an accidentally-missing environment variable must fail loudly, never
+    silently connect to and migrate whatever placeholder/local database
+    alembic.ini happens to name."""
+
+
+def _require_database_url() -> str:
+    if not DATABASE_URL:
+        raise MissingDatabaseUrlError("BEL_DATABASE_URL is required for Alembic database operations")
+    return DATABASE_URL
+
+
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.
 
@@ -54,9 +72,8 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = DATABASE_URL or config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=_require_database_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -74,14 +91,7 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    if DATABASE_URL:
-        connectable = create_engine(DATABASE_URL, poolclass=pool.NullPool)
-    else:
-        connectable = engine_from_config(
-            config.get_section(config.config_ini_section, {}),
-            prefix="sqlalchemy.",
-            poolclass=pool.NullPool,
-        )
+    connectable = create_engine(_require_database_url(), poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
         context.configure(

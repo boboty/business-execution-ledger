@@ -192,6 +192,15 @@ hide as one clean added file.
 
 ## Runtime contract
 
+**PostgreSQL 18 is the BEL V1 production/runtime target.** No older or
+newer major version is documented as a supported production baseline —
+there is no compatibility matrix, and none is planned. SQLite remains
+explicitly a test-only convenience, never a production runtime. (Earlier
+Phase 2D.1-P investigation and verification used PostgreSQL 16 and 17
+locally and in CI before the target was frozen at 18 — that history is
+left in commit messages and this document's own "rebaseline" section
+rather than erased; it does not change the frozen target.)
+
 Canonical `BEL_DATABASE_URL` forms:
 
 - `postgresql+psycopg://user:password@host:5432/bel` — production, the
@@ -199,9 +208,19 @@ Canonical `BEL_DATABASE_URL` forms:
 - `sqlite:///path/to/file.db` / `sqlite://` (in-memory) — test
   convenience only, no active Alembic chain, no concurrent-Web guarantee
 
-No default to a local file. CLI: `--database-url` or the
+`BEL_DATABASE_URL` is BEL's ONE runtime configuration contract, with no
+second protocol (no `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME`
+reconstructed internally) and no fallback: Alembic (`migrations/env.py`)
+requires it explicitly for every operation that needs to know a
+database and fails fast with a controlled `MissingDatabaseUrlError` if
+it's unset — it never falls back to `alembic.ini`'s own `sqlalchemy.url`
+key, which is a deliberately unresolvable placeholder, never a usable
+local/default connection string. CLI: `--database-url` or the
 `BEL_DATABASE_URL` environment variable, required. Web: same, via
-`create_app(database_url=...)`.
+`create_app(database_url=...)`. A local `.env` (gitignored, never
+committed — see `.env.example` for the placeholder template) or a plain
+exported shell variable are both sufficient; no dotenv dependency is
+required.
 
 Concurrency: `serialized_write_transaction` (SQLite: `BEGIN IMMEDIATE`;
 PostgreSQL: `SET LOCAL lock_timeout` + `pg_advisory_xact_lock` on one

@@ -28,8 +28,9 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 git config core.hooksPath .githooks
 
-# A local PostgreSQL 16+ instance is needed for anything touching the
-# migration chain or PostgreSQL-marked tests — createdb, then:
+# A local PostgreSQL 18 instance (BEL's V1 production target) is needed
+# for anything touching the migration chain or PostgreSQL-marked tests —
+# createdb, then:
 export BEL_DATABASE_URL=postgresql+psycopg://localhost/bel_dev
 .venv/bin/alembic upgrade head
 
