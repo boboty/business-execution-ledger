@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import literal, select, text, update
+from sqlalchemy import func, literal, select, text, update
 from sqlalchemy.orm import Session
 
 from bel.domain.accrual import (
@@ -25,9 +25,21 @@ from bel.domain.contract import (
 from bel.domain.event import BusinessEvent
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment
 from bel.domain.exception import TaskException
-from bel.domain.invoice import Invoice, InvoiceItem
-from bel.domain.matching import InvoiceAllocation, MatchCandidate, MatchCase, PaymentAllocation
-from bel.domain.payment import Payment
+from bel.domain.invoice import Invoice, InvoiceDirection, InvoiceItem
+from bel.domain.matching import (
+    ConfirmationType,
+    InvoiceAllocation,
+    MatchCandidate,
+    MatchCase,
+    MatchCaseStatus,
+    PaymentAllocation,
+    SalesInvoiceAllocation,
+    SalesMatchCandidate,
+    SalesPaymentAllocation,
+    SubjectType,
+    validate_storable_amount,
+)
+from bel.domain.payment import Payment, PaymentDirection
 from bel.domain.procurement_sales_link import ProcurementSalesLink, ProcurementSalesLinkCorrection
 from bel.domain.sales_contract import SalesContract, SalesContractRevision, SalesContractRevisionType
 from bel.domain.shipment import Shipment, ShipmentRevision, ShipmentRevisionType
@@ -56,6 +68,9 @@ from bel.infrastructure.persistence.models import (
     ProcurementSalesLinkModel,
     SalesContractModel,
     SalesContractRevisionModel,
+    SalesInvoiceAllocationModel,
+    SalesMatchCandidateModel,
+    SalesPaymentAllocationModel,
     ShipmentModel,
     ShipmentRevisionModel,
     TaskExceptionModel,
@@ -1625,6 +1640,67 @@ class MatchCaseRepository:
         m.status = status
         m.resolved_at = resolved_at
 
+    def add_if_no_case_for_subject(self, match_case: MatchCase) -> bool:
+        """Phase 2D.1-R3b: the atomic counterpart to `add()` — a single
+        `INSERT ... SELECT ... WHERE NOT EXISTS (...)` statement, never a
+        separate `find_by_subject` check followed by `add()`, which two
+        concurrent sessions proposing a match for the SAME subject could
+        both pass. M001's own `_run_match_pass` still uses the older
+        check-then-`add()` pattern (unchanged, out of this round's
+        scope — it is a single-writer batch pass with no concurrent
+        caller, and — see `MatchCaseModel`'s docstring — the procurement
+        leg legitimately allows more than one `MatchCase` per subject
+        across different Contracts, so a `(subject_type, subject_id)` DB
+        constraint is deliberately NOT added here). This method exists
+        for the sales leg's newly-concurrent manual proposal path
+        (`bel.application.sales_matching`), where exactly one `MatchCase`
+        per subject IS the intended design (multi-target allocation
+        happens via several `SalesInvoiceAllocation`/`SalesPaymentAllocation`
+        rows under that ONE case, never via several cases). Returns
+        `False` — having written nothing — if a MatchCase for this
+        subject already exists."""
+        table = MatchCaseModel.__table__
+        existing = table.alias("existing")
+        blocking = select(existing.c.id).where(
+            existing.c.subject_type == match_case.subject_type, existing.c.subject_id == match_case.subject_id
+        )
+        select_values = select(
+            literal(match_case.id, type_=table.c.id.type),
+            literal(match_case.subject_type, type_=table.c.subject_type.type),
+            literal(match_case.subject_id, type_=table.c.subject_id.type),
+            literal(match_case.status, type_=table.c.status.type),
+            literal(match_case.match_method, type_=table.c.match_method.type),
+            literal(match_case.created_at, type_=table.c.created_at.type),
+            literal(match_case.resolved_at, type_=table.c.resolved_at.type),
+        ).where(~blocking.exists())
+        stmt = table.insert().from_select(
+            ["id", "subject_type", "subject_id", "status", "match_method", "created_at", "resolved_at"],
+            select_values,
+        )
+        result = self._session.execute(stmt)
+        self._session.flush()
+        return result.rowcount == 1
+
+    def resolve_if_pending(self, match_case_id: uuid.UUID, *, resolved_at: datetime) -> bool:
+        """Phase 2D.1-R3b: the atomic conditional counterpart to
+        `update_status()` — a single `UPDATE ... WHERE status =
+        'HUMAN_CONFIRMATION_REQUIRED'` (never a separate read-then-write),
+        so two sessions concurrently confirming the SAME MatchCase can
+        never both succeed. Returns `False` — having written nothing —
+        if the case was not `HUMAN_CONFIRMATION_REQUIRED` at the moment
+        this statement executed (already resolved by a concurrent
+        confirmation, or never eligible in the first place)."""
+        result = self._session.execute(
+            update(MatchCaseModel)
+            .where(
+                MatchCaseModel.id == match_case_id,
+                MatchCaseModel.status == MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED,
+            )
+            .values(status=MatchCaseStatus.RESOLVED, resolved_at=resolved_at)
+        )
+        self._session.flush()
+        return result.rowcount == 1
+
     def list_all(self) -> list[MatchCase]:
         rows = self._session.scalars(select(MatchCaseModel))
         return [_match_case_to_domain(m) for m in rows]
@@ -1651,6 +1727,40 @@ class MatchCandidateRepository:
     def list_for_case(self, match_case_id: uuid.UUID) -> list[MatchCandidate]:
         rows = self._session.scalars(select(MatchCandidateModel).where(MatchCandidateModel.match_case_id == match_case_id))
         return [_match_candidate_to_domain(m) for m in rows]
+
+
+def _sales_match_candidate_to_domain(m: SalesMatchCandidateModel) -> SalesMatchCandidate:
+    return SalesMatchCandidate(
+        id=m.id, match_case_id=m.match_case_id, sales_contract_id=m.sales_contract_id, created_at=m.created_at
+    )
+
+
+class SalesMatchCandidateRepository:
+    """The sales-side twin of `MatchCandidateRepository` (Phase 2D.1-R3b,
+    docs/PHASE2D1-R0-DECISIONS.md section 2.7) — never a generalisation
+    of it. `uq_sales_match_candidates_case_target` (declared on the
+    model) makes proposing the SAME SalesContract twice for one case a
+    harmless no-op at the DB level; `add_if_new` below is the
+    application-facing idempotent wrapper."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, candidate: SalesMatchCandidate) -> None:
+        self._session.add(
+            SalesMatchCandidateModel(
+                id=candidate.id,
+                match_case_id=candidate.match_case_id,
+                sales_contract_id=candidate.sales_contract_id,
+                created_at=candidate.created_at,
+            )
+        )
+
+    def list_for_case(self, match_case_id: uuid.UUID) -> list[SalesMatchCandidate]:
+        rows = self._session.scalars(
+            select(SalesMatchCandidateModel).where(SalesMatchCandidateModel.match_case_id == match_case_id)
+        )
+        return [_sales_match_candidate_to_domain(m) for m in rows]
 
 
 class InvoiceAllocationRepository:
@@ -1709,6 +1819,251 @@ class PaymentAllocationRepository:
     def sum_confirmed_for_contract(self, contract_id: uuid.UUID) -> Decimal:
         rows = self.list_for_contract(contract_id)
         return sum((a.allocated_amount for a in rows), Decimal("0"))
+
+
+def _sales_invoice_allocation_to_domain(m: SalesInvoiceAllocationModel) -> SalesInvoiceAllocation:
+    return SalesInvoiceAllocation(
+        id=m.id,
+        invoice_id=m.invoice_id,
+        sales_contract_id=m.sales_contract_id,
+        match_case_id=m.match_case_id,
+        allocated_gross_amount=m.allocated_gross_amount,
+        confirmation_type=m.confirmation_type,
+        created_at=m.created_at,
+    )
+
+
+class MatchCaseNotPendingError(ValueError):
+    """Raised by Sales*AllocationRepository.add() ONLY for the
+    MatchCase-status check — distinguished from every other ValueError
+    this method raises so a caller (specifically
+    bel.application.sales_matching) can treat ONLY this as "a concurrent
+    session got here first" and translate it to a retryable conflict,
+    never silently reclassifying a genuine bug (wrong direction, bad
+    amount, capacity exceeded) as mere bad timing."""
+
+
+class SalesInvoiceAllocationRepository:
+    """The sales-side twin of `InvoiceAllocationRepository` (Phase
+    2D.1-R3b, docs/PHASE2D1-R0-DECISIONS.md section 2.7) — never a
+    generalisation of it. No `list_for_contract` exists here on purpose:
+    this table has no `contract_id` at all.
+
+    `add()` is the ONLY write primitive and IS the authoritative
+    boundary — Gate 2D.1-R3b fix round, BLOCKER 1 (round 1) and BLOCKER 1
+    (round 2): the application layer's checks (direction, MatchCase
+    status, amount, subject-level capacity) do not close this off, since
+    this repository is itself public and callable directly, bypassing
+    `bel.application.sales_matching` entirely. A caller who did that
+    could otherwise write a PURCHASE invoice, a non-existent/mismatched/
+    already-resolved MatchCase, a negative/oversized amount, or an
+    allocation that pushes the subject's confirmed total past its own
+    amount, straight past every application-level guard. So the SAME
+    checks are enforced here, not only there — including the capacity
+    check, computed fresh against whatever is already committed (or
+    already `add()`-ed earlier in the SAME transaction — SQLAlchemy
+    autoflushes pending inserts before a `SELECT`, so sequential
+    multi-target `add()` calls within one confirmation correctly
+    accumulate)."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, allocation: SalesInvoiceAllocation) -> None:
+        invoice_row = self._session.get(InvoiceModel, allocation.invoice_id)
+        if invoice_row is None:
+            raise ValueError(f"Invoice {allocation.invoice_id} not found")
+        if invoice_row.direction != InvoiceDirection.SALES:
+            raise ValueError(
+                f"Invoice {allocation.invoice_id} has direction {invoice_row.direction!r} — "
+                "SalesInvoiceAllocation requires a SALES invoice"
+            )
+        match_case_row = self._session.get(MatchCaseModel, allocation.match_case_id)
+        if match_case_row is None:
+            raise ValueError(f"MatchCase {allocation.match_case_id} not found")
+        if match_case_row.subject_type != SubjectType.INVOICE or match_case_row.subject_id != allocation.invoice_id:
+            raise ValueError(
+                f"MatchCase {allocation.match_case_id} does not correspond to Invoice {allocation.invoice_id}"
+            )
+        if match_case_row.status != MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED:
+            raise MatchCaseNotPendingError(
+                f"MatchCase {allocation.match_case_id} is {match_case_row.status}, not "
+                "HUMAN_CONFIRMATION_REQUIRED — an allocation can only be written while its case is pending"
+            )
+        if allocation.confirmation_type != ConfirmationType.HUMAN_CONFIRMED:
+            raise ValueError("SalesInvoiceAllocation.confirmation_type must be HUMAN_CONFIRMED")
+        validate_storable_amount(allocation.allocated_gross_amount)
+        # Gate 2D.1-R3b fix round #4, BLOCKER (the real one): rounds 1-3
+        # made the capacity check correct within ONE session (explicit
+        # `flush()` instead of relying on autoflush) but that is a
+        # read-then-write pattern, and reads from one session cannot see
+        # another session's UNCOMMITTED writes — two independent sessions
+        # can each read total=0 for the SAME invoice before either
+        # commits, then each insert 60.00 against a 100.00 cap, landing
+        # at 120.00. `flush()` cannot fix a cross-session race; only
+        # collapsing "read the current total" and "write, conditioned on
+        # that total" into ONE atomic SQL statement can — the exact
+        # `INSERT ... SELECT ... WHERE <condition>` technique already
+        # proven for `ProcurementSalesLinkRepository.insert_episode_if_no_current`
+        # and `MatchCaseRepository.add_if_no_case_for_subject`. SQLite
+        # executes one write statement at a time; by the time a second
+        # session's INSERT actually runs, it evaluates its own WHERE
+        # clause against whatever the first session already committed,
+        # never against a stale snapshot.
+        self._session.flush()  # same-session/no_autoflush safety, as before — now a defence layer, not the guarantee
+        table = SalesInvoiceAllocationModel.__table__
+        amount_type = table.c.allocated_gross_amount.type
+        current_sum = func.coalesce(func.sum(table.c.allocated_gross_amount), literal(Decimal("0"), type_=amount_type))
+        current_sum_subquery = select(current_sum).where(table.c.invoice_id == allocation.invoice_id).scalar_subquery()
+        new_amount = literal(allocation.allocated_gross_amount, type_=amount_type)
+        gross_amount = literal(invoice_row.gross_amount, type_=amount_type)
+        capacity_ok = (current_sum_subquery + new_amount) <= gross_amount
+        select_values = select(
+            literal(allocation.id, type_=table.c.id.type),
+            literal(allocation.invoice_id, type_=table.c.invoice_id.type),
+            literal(allocation.sales_contract_id, type_=table.c.sales_contract_id.type),
+            literal(allocation.match_case_id, type_=table.c.match_case_id.type),
+            new_amount,
+            literal(allocation.confirmation_type, type_=table.c.confirmation_type.type),
+            literal(allocation.created_at, type_=table.c.created_at.type),
+        ).where(capacity_ok)
+        stmt = table.insert().from_select(
+            ["id", "invoice_id", "sales_contract_id", "match_case_id", "allocated_gross_amount", "confirmation_type", "created_at"],
+            select_values,
+        )
+        result = self._session.execute(stmt)
+        if result.rowcount != 1:
+            # Either a genuine cross-session race was lost, or the
+            # pre-existing total already left no room — recompute for an
+            # accurate message; the atomic statement above is what
+            # actually enforced the invariant, this is purely diagnostic.
+            already_allocated = self.sum_for_invoice(allocation.invoice_id)
+            raise ValueError(
+                f"allocations for Invoice {allocation.invoice_id} totalling "
+                f"{already_allocated + allocation.allocated_gross_amount} would exceed its gross_amount "
+                f"{invoice_row.gross_amount}"
+            )
+        self._session.flush()
+
+    def list_for_invoice(self, invoice_id: uuid.UUID) -> list[SalesInvoiceAllocation]:
+        rows = self._session.scalars(
+            select(SalesInvoiceAllocationModel).where(SalesInvoiceAllocationModel.invoice_id == invoice_id)
+        )
+        return [_sales_invoice_allocation_to_domain(m) for m in rows]
+
+    def list_for_sales_contract(self, sales_contract_id: uuid.UUID) -> list[SalesInvoiceAllocation]:
+        rows = self._session.scalars(
+            select(SalesInvoiceAllocationModel).where(
+                SalesInvoiceAllocationModel.sales_contract_id == sales_contract_id
+            )
+        )
+        return [_sales_invoice_allocation_to_domain(m) for m in rows]
+
+    def sum_for_invoice(self, invoice_id: uuid.UUID) -> Decimal:
+        return sum((a.allocated_gross_amount for a in self.list_for_invoice(invoice_id)), Decimal("0"))
+
+
+def _sales_payment_allocation_to_domain(m: SalesPaymentAllocationModel) -> SalesPaymentAllocation:
+    return SalesPaymentAllocation(
+        id=m.id,
+        payment_id=m.payment_id,
+        sales_contract_id=m.sales_contract_id,
+        match_case_id=m.match_case_id,
+        allocated_amount=m.allocated_amount,
+        confirmation_type=m.confirmation_type,
+        created_at=m.created_at,
+    )
+
+
+class SalesPaymentAllocationRepository:
+    """The sales-side twin of `PaymentAllocationRepository` (Phase
+    2D.1-R3b, docs/PHASE2D1-R0-DECISIONS.md section 2.7). No
+    `contract_id` on this table.
+
+    `add()` is the ONLY write primitive and IS the authoritative
+    boundary — see `SalesInvoiceAllocationRepository.add`'s docstring
+    for why the same checks belong here too, not only in the
+    application layer."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def add(self, allocation: SalesPaymentAllocation) -> None:
+        payment_row = self._session.get(PaymentModel, allocation.payment_id)
+        if payment_row is None:
+            raise ValueError(f"Payment {allocation.payment_id} not found")
+        if payment_row.direction != PaymentDirection.IN:
+            raise ValueError(
+                f"Payment {allocation.payment_id} has direction {payment_row.direction!r} — "
+                "SalesPaymentAllocation requires an IN payment"
+            )
+        match_case_row = self._session.get(MatchCaseModel, allocation.match_case_id)
+        if match_case_row is None:
+            raise ValueError(f"MatchCase {allocation.match_case_id} not found")
+        if match_case_row.subject_type != SubjectType.PAYMENT or match_case_row.subject_id != allocation.payment_id:
+            raise ValueError(
+                f"MatchCase {allocation.match_case_id} does not correspond to Payment {allocation.payment_id}"
+            )
+        if match_case_row.status != MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED:
+            raise MatchCaseNotPendingError(
+                f"MatchCase {allocation.match_case_id} is {match_case_row.status}, not "
+                "HUMAN_CONFIRMATION_REQUIRED — an allocation can only be written while its case is pending"
+            )
+        if allocation.confirmation_type != ConfirmationType.HUMAN_CONFIRMED:
+            raise ValueError("SalesPaymentAllocation.confirmation_type must be HUMAN_CONFIRMED")
+        validate_storable_amount(allocation.allocated_amount)
+        # Gate 2D.1-R3b fix round #4, BLOCKER (the real one): see the
+        # identical atomic-conditional-insert note in
+        # SalesInvoiceAllocationRepository.add — a read-then-write
+        # capacity check cannot be made cross-session-safe by `flush()`
+        # alone; only collapsing the read and the write into ONE atomic
+        # SQL statement closes the race.
+        self._session.flush()  # same-session/no_autoflush safety, as before — now a defence layer, not the guarantee
+        table = SalesPaymentAllocationModel.__table__
+        amount_type = table.c.allocated_amount.type
+        current_sum = func.coalesce(func.sum(table.c.allocated_amount), literal(Decimal("0"), type_=amount_type))
+        current_sum_subquery = select(current_sum).where(table.c.payment_id == allocation.payment_id).scalar_subquery()
+        new_amount = literal(allocation.allocated_amount, type_=amount_type)
+        payment_amount = literal(payment_row.amount, type_=amount_type)
+        capacity_ok = (current_sum_subquery + new_amount) <= payment_amount
+        select_values = select(
+            literal(allocation.id, type_=table.c.id.type),
+            literal(allocation.payment_id, type_=table.c.payment_id.type),
+            literal(allocation.sales_contract_id, type_=table.c.sales_contract_id.type),
+            literal(allocation.match_case_id, type_=table.c.match_case_id.type),
+            new_amount,
+            literal(allocation.confirmation_type, type_=table.c.confirmation_type.type),
+            literal(allocation.created_at, type_=table.c.created_at.type),
+        ).where(capacity_ok)
+        stmt = table.insert().from_select(
+            ["id", "payment_id", "sales_contract_id", "match_case_id", "allocated_amount", "confirmation_type", "created_at"],
+            select_values,
+        )
+        result = self._session.execute(stmt)
+        if result.rowcount != 1:
+            already_allocated = self.sum_for_payment(allocation.payment_id)
+            raise ValueError(
+                f"allocations for Payment {allocation.payment_id} totalling "
+                f"{already_allocated + allocation.allocated_amount} would exceed its amount {payment_row.amount}"
+            )
+        self._session.flush()
+
+    def list_for_payment(self, payment_id: uuid.UUID) -> list[SalesPaymentAllocation]:
+        rows = self._session.scalars(
+            select(SalesPaymentAllocationModel).where(SalesPaymentAllocationModel.payment_id == payment_id)
+        )
+        return [_sales_payment_allocation_to_domain(m) for m in rows]
+
+    def list_for_sales_contract(self, sales_contract_id: uuid.UUID) -> list[SalesPaymentAllocation]:
+        rows = self._session.scalars(
+            select(SalesPaymentAllocationModel).where(
+                SalesPaymentAllocationModel.sales_contract_id == sales_contract_id
+            )
+        )
+        return [_sales_payment_allocation_to_domain(m) for m in rows]
+
+    def sum_for_payment(self, payment_id: uuid.UUID) -> Decimal:
+        return sum((a.allocated_amount for a in self.list_for_payment(payment_id)), Decimal("0"))
 
 
 def _invoice_item_allocation_to_domain(m: InvoiceItemAllocationModel) -> InvoiceItemAllocation:

@@ -420,6 +420,17 @@ def confirm_match(session: Session, match_case_id: uuid.UUID, contract_id: uuid.
         invoice = invoice_repo.get(match_case.subject_id)
         if invoice is None:
             raise ValueError(f"Invoice {match_case.subject_id} not found")
+        # Phase 2D.1-R3b, docs/PHASE2D1-R0-DECISIONS.md section 2.7 Gate
+        # G5 guard #1 (HARD): this function has no leg/direction check of
+        # its own — left as is, confirming a SALES invoice's MatchCase
+        # here would attribute it to a procurement Contract, the exact
+        # outcome the sales/procurement physical separation forbids. A
+        # defensive rejection only; M001 semantics are unchanged.
+        if invoice.direction != InvoiceDirection.PURCHASE:
+            raise ValueError(
+                f"MatchCase {match_case_id} is for a {invoice.direction} invoice — procurement confirm_match "
+                "only accepts PURCHASE invoices; use bel.application.sales_matching.confirm_sales_invoice_match"
+            )
         amount = invoice.gross_amount
         already_allocated = allocation_repo.sum_confirmed_for_contract(contract_id)
         if already_allocated + amount > contract.gross_amount:
@@ -445,6 +456,12 @@ def confirm_match(session: Session, match_case_id: uuid.UUID, contract_id: uuid.
         payment = payment_repo.get(match_case.subject_id)
         if payment is None:
             raise ValueError(f"Payment {match_case.subject_id} not found")
+        # Same Gate G5 guard #1 as the INVOICE branch above, for the OUT/IN direction.
+        if payment.direction != PaymentDirection.OUT:
+            raise ValueError(
+                f"MatchCase {match_case_id} is for a {payment.direction} payment — procurement confirm_match "
+                "only accepts OUT payments; use bel.application.sales_matching.confirm_sales_payment_match"
+            )
         amount = payment.amount
         already_allocated = allocation_repo.sum_confirmed_for_contract(contract_id)
         if already_allocated + amount > contract.gross_amount:

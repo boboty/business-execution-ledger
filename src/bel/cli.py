@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -48,6 +48,15 @@ from bel.application.sales_contract_facts import (
     get_sales_contract,
     get_sales_contract_history,
     list_sales_contracts,
+)
+from bel.application.sales_matching import (
+    SalesMatchError,
+    confirm_sales_invoice_match,
+    confirm_sales_payment_match,
+    list_sales_match_cases,
+    list_sales_match_candidates,
+    propose_sales_invoice_match,
+    propose_sales_payment_match,
 )
 from bel.application.shipment_facts import (
     ShipmentFactError,
@@ -1472,6 +1481,171 @@ def sales_link_list(ctx: click.Context, procurement_contract_id, sales_contract_
             f"  {link.id} procurement_contract={link.procurement_contract_id} sales_contract={link.sales_contract_id} "
             f"confirmation_type={link.confirmation_type}"
         )
+
+
+def _parse_allocation_pairs(raw_pairs: tuple[str, ...]) -> list[tuple[uuid.UUID, Decimal]]:
+    """Parses `--allocate <sales_contract_id>:<amount>` options. Amounts
+    are always caller-supplied and Decimal — never computed/split here."""
+    pairs = []
+    for raw in raw_pairs:
+        try:
+            sc_id_str, amount_str = raw.split(":", 1)
+            pairs.append((uuid.UUID(sc_id_str), Decimal(amount_str)))
+        except (ValueError, ArithmeticError) as exc:
+            click.echo(f"Error: --allocate value {raw!r} must be <sales_contract_id>:<amount>")
+            raise SystemExit(1) from exc
+    return pairs
+
+
+@cli.group("sales-match")
+def sales_match_group() -> None:
+    """Sales-side manual matching (Phase 2D.1-R3b): explicit human
+    proposal + confirmation of a SALES invoice or IN payment against one
+    or more SalesContracts. No automatic sales matching algorithm exists
+    — every candidate and every allocation amount is supplied explicitly."""
+
+
+@sales_match_group.group("invoice")
+def sales_match_invoice_group() -> None:
+    """Sales-side matching for SALES invoices."""
+
+
+@sales_match_invoice_group.command("propose")
+@click.option("--invoice", "invoice_id", type=click.UUID, required=True)
+@click.option("--sales-contract", "sales_contract_ids", type=click.UUID, required=True, multiple=True, help="Repeatable.")
+@click.pass_context
+def sales_match_invoice_propose(ctx: click.Context, invoice_id, sales_contract_ids) -> None:
+    """Propose one or more candidate SalesContracts for a SALES invoice
+    — creates a HUMAN_CONFIRMATION_REQUIRED MatchCase. Candidates are
+    never computed automatically; pass every one explicitly."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = propose_sales_invoice_match(
+                session, invoice_id=invoice_id, sales_contract_ids=list(sales_contract_ids),
+                created_at=datetime.now(timezone.utc),
+            )
+            session.commit()
+    except SalesMatchError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+
+    outcome = "created" if result.created else ("already exists (replay)" if result.replay else "already exists")
+    click.echo(f"MatchCase {result.match_case.id} {outcome}: status={result.match_case.status}")
+
+
+@sales_match_invoice_group.command("confirm")
+@click.option("--match-case", "match_case_id", type=click.UUID, required=True)
+@click.option(
+    "--allocate", "raw_allocations", multiple=True, required=True,
+    help="Repeatable <sales_contract_id>:<amount>, e.g. --allocate 11111111-.../60.00",
+)
+@click.pass_context
+def sales_match_invoice_confirm(ctx: click.Context, match_case_id, raw_allocations) -> None:
+    """Confirm a proposed MatchCase with the COMPLETE allocation set for
+    this invoice in one submission — never a single-target call."""
+    pairs = _parse_allocation_pairs(raw_allocations)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = confirm_sales_invoice_match(
+                session, match_case_id=match_case_id, allocations=pairs, created_at=datetime.now(timezone.utc),
+            )
+            session.commit()
+    except SalesMatchError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+
+    replay_note = " (idempotent replay)" if result.replay else ""
+    click.echo(
+        f"MatchCase {result.match_case.id} confirmed{replay_note} -> {result.match_case.status}: "
+        f"{len(result.allocations)} allocation(s)"
+    )
+
+
+@sales_match_group.group("payment")
+def sales_match_payment_group() -> None:
+    """Sales-side matching for IN payments."""
+
+
+@sales_match_payment_group.command("propose")
+@click.option("--payment", "payment_id", type=click.UUID, required=True)
+@click.option("--sales-contract", "sales_contract_ids", type=click.UUID, required=True, multiple=True, help="Repeatable.")
+@click.pass_context
+def sales_match_payment_propose(ctx: click.Context, payment_id, sales_contract_ids) -> None:
+    """Propose one or more candidate SalesContracts for an IN payment."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = propose_sales_payment_match(
+                session, payment_id=payment_id, sales_contract_ids=list(sales_contract_ids), created_at=datetime.now(timezone.utc),
+            )
+            session.commit()
+    except SalesMatchError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+
+    outcome = "created" if result.created else ("already exists (replay)" if result.replay else "already exists")
+    click.echo(f"MatchCase {result.match_case.id} {outcome}: status={result.match_case.status}")
+
+
+@sales_match_payment_group.command("confirm")
+@click.option("--match-case", "match_case_id", type=click.UUID, required=True)
+@click.option("--allocate", "raw_allocations", multiple=True, required=True, help="Repeatable <sales_contract_id>:<amount>.")
+@click.pass_context
+def sales_match_payment_confirm(ctx: click.Context, match_case_id, raw_allocations) -> None:
+    """Confirm a proposed MatchCase with the COMPLETE allocation set for
+    this payment in one submission."""
+    pairs = _parse_allocation_pairs(raw_allocations)
+    session_factory = _session_factory(ctx.obj["db_path"])
+    try:
+        with session_factory() as session:
+            result = confirm_sales_payment_match(
+                session, match_case_id=match_case_id, allocations=pairs, created_at=datetime.now(timezone.utc),
+            )
+            session.commit()
+    except SalesMatchError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+
+    replay_note = " (idempotent replay)" if result.replay else ""
+    click.echo(
+        f"MatchCase {result.match_case.id} confirmed{replay_note} -> {result.match_case.status}: "
+        f"{len(result.allocations)} allocation(s)"
+    )
+
+
+@sales_match_group.command("list")
+@click.option("--status", default=None, help="Filter by MatchCase status.")
+@click.pass_context
+def sales_match_list(ctx: click.Context, status: str | None) -> None:
+    """List sales-leg MatchCases only — a procurement case never appears
+    here (docs/PHASE2D1-R0-DECISIONS.md section 2.7's leg separation)."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        cases = list_sales_match_cases(session, status=status.upper() if status else None)
+
+    if not cases:
+        click.echo("No sales match cases.")
+        return
+    for c in cases:
+        click.echo(f"{c.id}  [{c.status}] {c.subject_type} {c.subject_id}  method={c.match_method}")
+
+
+@sales_match_group.command("show")
+@click.argument("match_case_id", type=click.UUID)
+@click.pass_context
+def sales_match_show(ctx: click.Context, match_case_id) -> None:
+    """Show a sales MatchCase's candidates."""
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        candidates = list_sales_match_candidates(session, match_case_id)
+    if not candidates:
+        click.echo(f"No candidates for MatchCase {match_case_id} (or it does not exist).")
+        return
+    click.echo(f"MatchCase {match_case_id} candidates:")
+    for c in candidates:
+        click.echo(f"  {c.sales_contract_id}")
 
 
 @cli.group("period-close")

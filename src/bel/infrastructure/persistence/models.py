@@ -624,7 +624,20 @@ class MatchCaseModel(Base):
     """subject_id is polymorphic (points at invoices.id or payments.id
     per subject_type) so it is intentionally not an FK — a single column
     can't target two tables without a generic-association framework,
-    which Phase 2A explicitly avoids building."""
+    which Phase 2A explicitly avoids building.
+
+    Deliberately NO `UniqueConstraint` on `(subject_type, subject_id)`:
+    an earlier Phase 2D.1-R3b draft added one, reasoning it only
+    formalised an assumed invariant — but
+    `tests/web/test_web_contract_360.py::test_contract360_item_allocation_is_scoped_to_own_contract`
+    proves the procurement leg already relies on ONE Invoice legitimately
+    producing TWO separate `MatchCase` rows (one per Contract it is
+    confirmed against — "Domain: Invoice <-> Contract is many-to-many").
+    A blanket constraint would have broken that existing, tested
+    behaviour. The sales leg's OWN concurrency safety (Phase 2D.1-R3b
+    section 27) comes instead from `MatchCaseRepository
+    .add_if_no_case_for_subject`'s atomic conditional insert — see its
+    docstring — which needs no DB-level constraint change here."""
 
     __tablename__ = "match_cases"
 
@@ -646,6 +659,90 @@ class MatchCandidateModel(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     match_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("match_cases.id"), nullable=False, index=True)
     contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class SalesInvoiceAllocationModel(Base):
+    """The sales-side twin of `InvoiceAllocationModel`
+    (docs/PHASE2D1-R0-DECISIONS.md section 2.7) — physically separate,
+    targeting `sales_contracts.id` instead of `contracts.id`. No
+    `contract_id` column anywhere on this table: a SALES invoice cannot
+    be attributed to a procurement Contract even by mistake, structurally."""
+
+    __tablename__ = "sales_invoice_allocations"
+    __table_args__ = (
+        CheckConstraint(
+            "confirmation_type = 'HUMAN_CONFIRMED'", name="ck_sales_invoice_allocations_confirmation_type"
+        ),
+        # Gate 2D.1-R3b fix round, BLOCKER 1: a DB-level backstop against
+        # a negative/zero amount even via a raw ORM bypass of
+        # SalesInvoiceAllocationRepository.add's own validation.
+        CheckConstraint("allocated_gross_amount > 0", name="ck_sales_invoice_allocations_positive_amount"),
+        # Gate 2D.1-R3b fix round #2, BLOCKER 2: a coarse DB-level
+        # backstop bounding NUMERIC(18,2) to at most 16 integer digits
+        # (10**16) — NOT the authoritative precision guard (a plain SQL
+        # CHECK cannot express the actual float-round-trip condition
+        # bel.domain.matching.validate_storable_amount enforces), just a
+        # sanity bound against wildly out-of-range values via ORM bypass.
+        CheckConstraint(
+            f"allocated_gross_amount < {10 ** 16}", name="ck_sales_invoice_allocations_max_amount"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    invoice_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("invoices.id"), nullable=False, index=True)
+    sales_contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sales_contracts.id"), nullable=False, index=True)
+    match_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("match_cases.id"), nullable=False, index=True)
+    allocated_gross_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    # R3b's first version is HUMAN_CONFIRMED only (docs/PHASE2D1-R0-DECISIONS.md
+    # section 2.7); the CHECK constraint enforces this even against an
+    # ORM bypass.
+    confirmation_type: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class SalesPaymentAllocationModel(Base):
+    """The sales-side twin of `PaymentAllocationModel`
+    (docs/PHASE2D1-R0-DECISIONS.md section 2.7). No `contract_id`
+    column: an `IN` receipt cannot be attributed to a procurement
+    Contract even by mistake, structurally."""
+
+    __tablename__ = "sales_payment_allocations"
+    __table_args__ = (
+        CheckConstraint(
+            "confirmation_type = 'HUMAN_CONFIRMED'", name="ck_sales_payment_allocations_confirmation_type"
+        ),
+        CheckConstraint("allocated_amount > 0", name="ck_sales_payment_allocations_positive_amount"),
+        CheckConstraint(f"allocated_amount < {10 ** 16}", name="ck_sales_payment_allocations_max_amount"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    payment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("payments.id"), nullable=False, index=True)
+    sales_contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sales_contracts.id"), nullable=False, index=True)
+    match_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("match_cases.id"), nullable=False, index=True)
+    allocated_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    confirmation_type: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class SalesMatchCandidateModel(Base):
+    """A human-confirmation candidate for a sales-leg `MatchCase`
+    (docs/PHASE2D1-R0-DECISIONS.md section 2.7's `MatchCase` reuse) — a
+    separate object from `MatchCandidateModel`, never a generalisation of
+    it (that model's `contract_id` is a hard FK to `contracts.id`).
+    `uq_sales_match_candidates_case_target` prevents the same
+    SalesContract being proposed twice as a candidate for one case."""
+
+    __tablename__ = "sales_match_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "match_case_id", "sales_contract_id", name="uq_sales_match_candidates_case_target"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    match_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("match_cases.id"), nullable=False, index=True)
+    sales_contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sales_contracts.id"), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
