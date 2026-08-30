@@ -253,6 +253,18 @@ def _apply_revision(
     _validate_fields(fields)
     if not fields:
         raise ContractFactError(f"{revision_type.lower()} requires at least one field")
+    # Phase 2D.1-R5 gate fix: a supplement/correction only ever asserts a
+    # KNOWN value — asserting None here would let a CORRECTION null out
+    # gross_amount/currency (the pre-R5 invariant: the current revision's
+    # gross_amount and currency are ALWAYS non-NULL) or any other field.
+    # "Previously unknown" is expressed by never having asserted the
+    # field at all, never by asserting None.
+    for key, value in fields.items():
+        if value is None:
+            raise ContractFactError(
+                f"{revision_type.lower()}: field {key!r} cannot be asserted as None — a supplement/correction "
+                "only ever asserts a known value"
+            )
 
     contract_repo = ContractRepository(session)
     current_contract = contract_repo.get(contract_id)

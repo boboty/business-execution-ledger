@@ -20,14 +20,30 @@ Closed outcome set, exactly three: ``MATCH``, ``BEL_CORRECTED_LEGACY``,
 adjudicated — not that BEL agrees with the legacy spreadsheet
 everywhere. Any ``UNRESOLVED`` entry fails the whole reconciliation run.
 
-No fuzzy tolerance: Decimal values are compared as exact canonical
-Decimal (``100`` and ``100.00`` normalize equal; a real difference of
-any size does not). Collections are compared order-insensitively but
-via a deterministic normalized form, never database insertion order.
+Gate-fix (Phase 2D.1-R5 round 2) HARD invariants:
+
+- No internal UUID ever stands in for a business identity. Every
+  snapshot key/value is a genuine business identity field. A fact whose
+  identity is incomplete, or a computed key that collides with another
+  fact's, is NEVER silently keyed by its own row id and never silently
+  overwrites the colliding entry — both become permanent, unconditional
+  ``unresolved:``-prefixed entries that no baseline can pre-adjudicate.
+- Every OPEN backfill-produced ``TaskException``
+  (``BackfillIdentityIncomplete`` / ``BackfillIdentityAmbiguous`` /
+  ``BackfillConflict``) enters the snapshot as one such unconditional
+  ``unresolved:`` entry too — a backfill run that left ANY of these open
+  can never pass reconciliation, whether or not it maps to a specific
+  Contract.
+- Decimal-equivalence normalization is applied ONLY to fields known to
+  be genuinely Decimal-typed (``_DECIMAL_FIELD_NAMES``); every other
+  field (business strings like a contract/sales-contract number) always
+  compares as an exact string — ``"00123"`` and ``"123"`` are NEVER
+  treated as equal.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -35,12 +51,46 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from bel.application.contract_business_ledger import get_contract_business_ledger
+from bel.domain.exception import ExceptionStatus, ExceptionType
+from bel.infrastructure.persistence.repositories import ExceptionRepository
 
 OUTCOME_MATCH = "MATCH"
 OUTCOME_BEL_CORRECTED_LEGACY = "BEL_CORRECTED_LEGACY"
 OUTCOME_UNRESOLVED = "UNRESOLVED"
 
 _RECORDABLE_BASELINE_OUTCOMES = (OUTCOME_MATCH, OUTCOME_BEL_CORRECTED_LEGACY)
+
+_UNRESOLVED_PREFIX = "unresolved:"
+
+# R5 backfill's own unresolved-work producers (docs/ROADMAP.md 2D.1-R5
+# gate fix) — the ONLY exception types this module treats as
+# reconciliation-blocking backfill tasks. Pre-existing exception types
+# (BusinessKeyConflict, AllocationCapacityExceeded, ...) are out of this
+# round's scope and are left alone.
+_BACKFILL_EXCEPTION_TYPES = (
+    ExceptionType.BACKFILL_IDENTITY_INCOMPLETE,
+    ExceptionType.BACKFILL_IDENTITY_AMBIGUOUS,
+    ExceptionType.BACKFILL_CONFLICT,
+)
+
+# Only these field NAMES are genuinely Decimal-typed business values —
+# every other field (business strings: contract numbers, references,
+# product names, customer names, ...) compares as an exact string,
+# never coerced through Decimal. A field name is unambiguous across
+# this module's whole snapshot shape (never reused with a different
+# meaning), so a flat set checked at any nesting depth is correct.
+_DECIMAL_FIELD_NAMES = {
+    "gross_amount",
+    "net_amount",
+    "quantity",
+    "unit_price",
+    "allocated_gross_amount",
+    "allocated_amount",
+    "allocated_quantity",
+    "remaining_quantity",
+    "remaining_estimated_cost",
+    "estimated_cost",
+}
 
 
 @dataclass(frozen=True)
@@ -57,116 +107,245 @@ class ReconciliationResult:
     passed: bool
 
 
-def _normalize_scalar(value: Any) -> Any:
-    """Decimal-equivalence normalization only — never a fuzzy tolerance.
-    A numeric string/int/float is compared as its canonical Decimal;
-    everything else compares by value equality after that."""
+def _normalize_decimal(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float, Decimal)):
+    try:
         return Decimal(str(value))
-    if isinstance(value, str):
-        try:
-            return Decimal(value)
-        except InvalidOperation:
-            return value
+    except InvalidOperation:
+        return value
+
+
+def _normalize_value(field_name: str | None, value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _normalize_value(k, v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return sorted((_normalize_value(field_name, v) for v in value), key=repr)
+    if field_name in _DECIMAL_FIELD_NAMES:
+        return _normalize_decimal(value)
+    # Every non-Decimal field — including a numeric-LOOKING business
+    # string like a contract number — compares as an exact value, never
+    # coerced. "00123" and "123" are deliberately NOT normalized equal.
     return value
 
 
 def _normalize(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: _normalize(v) for k, v in sorted(value.items())}
-    if isinstance(value, (list, tuple)):
-        # Deterministic normalized order — collections compare
-        # order-insensitively, never by database/insertion order.
-        return sorted((_normalize(v) for v in value), key=repr)
-    return _normalize_scalar(value)
+    return _normalize_value(None, value)
 
 
 def _d(value) -> str | None:
     return str(value) if value is not None else None
 
 
+def _payment_identity_key(payment) -> str | None:
+    """The full R5 Payment business identity
+    (docs/PHASE2D1-R0-DECISIONS.md section 4.4):
+    ``(source_account_id, transaction_date, direction, amount, bank_reference)``.
+    Returns None — never a partial/UUID substitute — when any part is
+    missing."""
+    if payment is None:
+        return None
+    if not payment.source_account_id or not payment.bank_reference:
+        return None
+    return (
+        f"source_account_id={payment.source_account_id}|transaction_date={payment.transaction_date.isoformat()}"
+        f"|direction={payment.direction}|amount={_d(payment.amount)}|bank_reference={payment.bank_reference}"
+    )
+
+
+class _SnapshotBuilder:
+    """Collects (key, value) pairs first and resolves duplicates in a
+    second pass — a silent dict-assignment can never let a later
+    colliding key overwrite an earlier one. Every entry with an
+    incomplete business identity is routed straight to an unconditional
+    ``unresolved:`` marker and never attempts the normal key at all."""
+
+    def __init__(self) -> None:
+        self._entries: list[tuple[str, dict[str, Any]]] = []
+        self._unresolved_ordinal = 0
+
+    def add(self, key: str, value: dict[str, Any]) -> None:
+        self._entries.append((key, value))
+
+    def add_unresolved(self, category: str, reason: str, **context: Any) -> None:
+        self._unresolved_ordinal += 1
+        key = f"{_UNRESOLVED_PREFIX}{category}:{self._unresolved_ordinal}"
+        self._entries.append((key, {"reason": reason, **context}))
+
+    def build(self) -> dict[str, dict[str, Any]]:
+        counts = Counter(k for k, _ in self._entries)
+        snapshot: dict[str, dict[str, Any]] = {}
+        collision_ordinal = 0
+        for key, value in self._entries:
+            if key.startswith(_UNRESOLVED_PREFIX):
+                snapshot[key] = value
+                continue
+            if counts[key] > 1:
+                collision_ordinal += 1
+                # Duplicate business identity — never a silent dict
+                # overwrite. BOTH/ALL colliding occurrences become their
+                # own permanent, unconditional unresolved entries.
+                snapshot[f"{_UNRESOLVED_PREFIX}duplicate_identity:{collision_ordinal}"] = {
+                    "reason": "duplicate_business_identity", "key": key,
+                }
+            else:
+                snapshot[key] = value
+        return snapshot
+
+
 def build_contract_execution_snapshot(session: Session) -> dict[str, dict[str, Any]]:
     """Normalized, business-identity-keyed snapshot of the
     contract-execution Fact layer — built entirely from the SAME R4
-    Ledger projection the page/export use. Every key is a business
-    identity string, never an internal UUID; every value is a plain
-    JSON-safe dict."""
+    Ledger projection the page/export use, PLUS every OPEN R5
+    backfill-produced Task (never omitted just because it cannot be
+    mapped to a specific Contract). Every key is a business identity
+    string or an unconditional ``unresolved:`` marker — never an
+    internal UUID standing in for one."""
     ledger = get_contract_business_ledger(session)
-    snapshot: dict[str, dict[str, Any]] = {}
+    builder = _SnapshotBuilder()
 
     for row in ledger.rows:
         contract = row.contract
         contract_key = f"contract_no={contract.contract_no}|counterparty={contract.counterparty}"
 
-        snapshot[f"contract:{contract_key}"] = {
-            "contract_type": contract.contract_type,
-            "buyer": contract.buyer,
-            "gross_amount": _d(contract.gross_amount),
-            "currency": contract.currency,
-            "contract_date": contract.contract_date.isoformat() if contract.contract_date else None,
-        }
+        builder.add(
+            f"contract:{contract_key}",
+            {
+                "contract_type": contract.contract_type,
+                "buyer": contract.buyer,
+                "gross_amount": _d(contract.gross_amount),
+                "currency": contract.currency,
+                "contract_date": contract.contract_date.isoformat() if contract.contract_date else None,
+            },
+        )
+
+        item_source_key_by_id = {item.id: item.source_item_key for item in row.items}
 
         for item in row.items:
-            snapshot[f"contract_item:{contract_key}|source_item_key={item.source_item_key}"] = {
-                "sku": item.sku, "product_name": item.product_name, "specification": item.specification,
-                "quantity": _d(item.quantity), "unit": item.unit, "unit_price": _d(item.unit_price),
-                "gross_amount": _d(item.gross_amount), "net_amount": _d(item.net_amount),
-            }
+            if not item.source_item_key:
+                builder.add_unresolved(
+                    "contract_item_identity", "missing_source_item_key", contract=contract_key,
+                )
+                continue
+            builder.add(
+                f"contract_item:{contract_key}|source_item_key={item.source_item_key}",
+                {
+                    "sku": item.sku, "product_name": item.product_name, "specification": item.specification,
+                    "quantity": _d(item.quantity), "unit": item.unit, "unit_price": _d(item.unit_price),
+                    "gross_amount": _d(item.gross_amount), "net_amount": _d(item.net_amount),
+                },
+            )
 
         for entry in row.shipments:
             s = entry.shipment
-            snapshot[
-                f"shipment:{contract_key}|external_reference={s.external_reference}|execution_date={s.execution_date.isoformat()}"
-            ] = {"quantity": _d(s.quantity), "contract_item_id_known": s.contract_item_id is not None}
+            if not s.external_reference:
+                builder.add_unresolved(
+                    "shipment_identity", "missing_external_reference", contract=contract_key,
+                    execution_date=s.execution_date.isoformat(),
+                )
+                continue
+            builder.add(
+                f"shipment:{contract_key}|external_reference={s.external_reference}|execution_date={s.execution_date.isoformat()}",
+                {"quantity": _d(s.quantity), "contract_item_id_known": s.contract_item_id is not None},
+            )
 
         for entry in row.procurement_invoices:
             invoice = entry.invoice
-            key = invoice.external_invoice_key if invoice else str(entry.allocation.invoice_id)
-            snapshot[f"procurement_invoice_allocation:{contract_key}|invoice={key}"] = {
-                "allocated_gross_amount": _d(entry.allocation.allocated_gross_amount),
-            }
+            if invoice is None or not invoice.external_invoice_key:
+                builder.add_unresolved(
+                    "procurement_invoice_identity", "missing_external_invoice_key", contract=contract_key,
+                )
+                continue
+            builder.add(
+                f"procurement_invoice_allocation:{contract_key}|invoice={invoice.external_invoice_key}",
+                {"allocated_gross_amount": _d(entry.allocation.allocated_gross_amount)},
+            )
 
         for entry in row.outgoing_payments:
-            payment = entry.payment
-            key = payment.bank_reference if payment and payment.bank_reference else str(entry.allocation.payment_id)
-            snapshot[f"outgoing_payment_allocation:{contract_key}|payment={key}"] = {
-                "allocated_amount": _d(entry.allocation.allocated_amount),
-            }
+            payment_key = _payment_identity_key(entry.payment)
+            if payment_key is None:
+                builder.add_unresolved(
+                    "outgoing_payment_identity", "incomplete_payment_identity", contract=contract_key,
+                )
+                continue
+            builder.add(
+                f"outgoing_payment_allocation:{contract_key}|payment={payment_key}",
+                {"allocated_amount": _d(entry.allocation.allocated_amount)},
+            )
 
         for entry in row.accruals:
-            snapshot[f"accrual:{contract_key}|item_id={entry.contract_item_id}|period={entry.accrual.period}"] = {
-                "remaining_quantity": _d(entry.remaining_quantity),
-                "remaining_estimated_cost": _d(entry.remaining_estimated_cost),
-                "current_status": entry.projected_status,
-            }
+            source_item_key = item_source_key_by_id.get(entry.contract_item_id)
+            if not source_item_key:
+                builder.add_unresolved(
+                    "accrual_identity", "missing_contract_item_identity", contract=contract_key,
+                    period=entry.accrual.period,
+                )
+                continue
+            builder.add(
+                f"accrual:{contract_key}|source_item_key={source_item_key}|period={entry.accrual.period}",
+                {
+                    "remaining_quantity": _d(entry.remaining_quantity),
+                    "remaining_estimated_cost": _d(entry.remaining_estimated_cost),
+                    "current_status": entry.projected_status,
+                },
+            )
 
         for scope in row.sales_scopes:
             sc = scope.sales_contract
             sales_key = f"our_entity={sc.our_entity}|sales_contract_no={sc.sales_contract_no}"
-            snapshot[f"sales_contract:{sales_key}"] = {
-                "customer": sc.customer, "currency": sc.currency, "gross_amount": _d(sc.gross_amount),
-                "contract_date": sc.contract_date.isoformat() if sc.contract_date else None,
-            }
-            snapshot[f"procurement_sales_link:{contract_key}|{sales_key}"] = {"current": True}
+            builder.add(
+                f"sales_contract:{sales_key}",
+                {
+                    "customer": sc.customer, "currency": sc.currency, "gross_amount": _d(sc.gross_amount),
+                    "contract_date": sc.contract_date.isoformat() if sc.contract_date else None,
+                },
+            )
+            builder.add(f"procurement_sales_link:{contract_key}|{sales_key}", {"current": True})
 
             for a in scope.sales_invoice_allocations:
-                invoice_key = a.invoice.external_invoice_key if a.invoice else str(a.allocation.invoice_id)
-                snapshot[f"sales_invoice_allocation:{sales_key}|invoice={invoice_key}"] = {
-                    "allocated_gross_amount": _d(a.allocation.allocated_gross_amount),
-                }
+                invoice = a.invoice
+                if invoice is None or not invoice.external_invoice_key:
+                    builder.add_unresolved(
+                        "sales_invoice_identity", "missing_external_invoice_key", sales_contract=sales_key,
+                    )
+                    continue
+                builder.add(
+                    f"sales_invoice_allocation:{sales_key}|invoice={invoice.external_invoice_key}",
+                    {"allocated_gross_amount": _d(a.allocation.allocated_gross_amount)},
+                )
             for a in scope.incoming_receipt_allocations:
-                payment_key = a.payment.bank_reference if a.payment and a.payment.bank_reference else str(a.allocation.payment_id)
-                snapshot[f"incoming_receipt_allocation:{sales_key}|payment={payment_key}"] = {
-                    "allocated_amount": _d(a.allocation.allocated_amount),
-                }
+                payment_key = _payment_identity_key(a.payment)
+                if payment_key is None:
+                    builder.add_unresolved(
+                        "incoming_receipt_identity", "incomplete_payment_identity", sales_contract=sales_key,
+                    )
+                    continue
+                builder.add(
+                    f"incoming_receipt_allocation:{sales_key}|payment={payment_key}",
+                    {"allocated_amount": _d(a.allocation.allocated_amount)},
+                )
 
-        snapshot[f"unresolved_indicator:{contract_key}"] = {"has_unresolved": row.has_unresolved}
+        builder.add(f"unresolved_indicator:{contract_key}", {"has_unresolved": row.has_unresolved})
 
-    return snapshot
+    for exc in ExceptionRepository(session).list_all():
+        if exc.status != ExceptionStatus.OPEN:
+            continue
+        if exc.exception_type not in _BACKFILL_EXCEPTION_TYPES:
+            continue
+        # An OPEN backfill Task ALWAYS blocks reconciliation — whether or
+        # not it maps to a specific Contract (spec gate-fix section 1).
+        # Keyed by the task's own persisted id: this is the task's OWN
+        # canonical identity, not a stand-in for a missing business
+        # identity — the whole reason the Task exists is that no clean
+        # business identity could be established.
+        builder.add_unresolved(
+            "backfill_task", "open_backfill_task", exception_type=exc.exception_type, task_id=str(exc.id),
+            identity_key=exc.detail.get("identity_key"),
+        )
+
+    return builder.build()
 
 
 def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResult:
@@ -178,6 +357,10 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
     entry naming any other outcome (including a literal "UNRESOLVED")
     is itself an unadjudicated discrepancy and counts as UNRESOLVED.
 
+    Any snapshot key beginning with ``unresolved:`` (an incomplete/
+    duplicate business identity, or an OPEN backfill Task) is ALWAYS
+    UNRESOLVED — no baseline entry can pre-adjudicate one away.
+
     Out-of-scope keys (section 34) never enter ``build_contract_execution_snapshot``
     in the first place, so there is nothing to special-case here — the
     snapshot's own key set already IS the in-scope set."""
@@ -187,7 +370,17 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
     results: list[ReconciliationEntry] = []
     unresolved = 0
 
+    resolvable_actual_keys: set[str] = set()
+    for key in actual:
+        if key.startswith(_UNRESOLVED_PREFIX):
+            results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=None))
+            unresolved += 1
+        else:
+            resolvable_actual_keys.add(key)
+
     for key, entry in baseline_entries.items():
+        if key.startswith(_UNRESOLVED_PREFIX):
+            continue  # never a baseline-adjudicatable key
         recorded_outcome = entry.get("outcome")
         actual_value = actual.get(key)
         if recorded_outcome not in _RECORDABLE_BASELINE_OUTCOMES:
@@ -205,7 +398,7 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
             results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=recorded_outcome))
             unresolved += 1
 
-    for key in actual:
+    for key in resolvable_actual_keys:
         if key not in baseline_entries:
             # BEL holds an in-scope Fact the baseline never adjudicated.
             results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=None))

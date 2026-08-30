@@ -1774,6 +1774,37 @@ def _resolve_cutover_period_dir(period: str) -> Path:
     return period_dir
 
 
+def _write_cutover_report(period_dir: Path, filename: str, diagnostic: dict) -> None:
+    """Write full diagnostics ONLY under
+    ``$BEL_PRIVATE_DATA_ROOT/reports/`` — never to stdout, never into the
+    repository (gate-fix section 5, HARD). ``period_dir`` was already
+    resolved strictly inside ``BEL_PRIVATE_DATA_ROOT`` by
+    ``_resolve_cutover_period_dir``, so its parent IS that root."""
+    import json
+
+    root = period_dir.parent.resolve(strict=True)
+    repo_root = Path(__file__).resolve().parents[2]
+    reports_dir = root / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    resolved_reports_dir = reports_dir.resolve(strict=True)
+    try:
+        resolved_reports_dir.relative_to(root)
+    except ValueError:
+        raise click.ClickException("reports directory escapes BEL_PRIVATE_DATA_ROOT")
+    try:
+        resolved_reports_dir.relative_to(repo_root)
+        raise click.ClickException("reports directory must not be inside the repository")
+    except ValueError:
+        pass
+    target = (resolved_reports_dir / filename).resolve(strict=False)
+    try:
+        target.relative_to(resolved_reports_dir)
+    except ValueError:
+        raise click.ClickException("report filename escapes the reports directory")
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump(diagnostic, f, indent=2, ensure_ascii=False, default=str)
+
+
 @cli.group("cutover")
 def cutover_group() -> None:
     """Phase 2D.1-R5 cutover infrastructure/rehearsal — backfill and
@@ -1786,8 +1817,10 @@ def cutover_group() -> None:
 @click.pass_context
 def cutover_backfill_cmd(ctx: click.Context, period: str) -> None:
     """Run the identity-aware backfill plan (backfill-plan.json) for one
-    period against the local BEL database. Never prints private business
-    values — only per-section created/replay/task counts."""
+    period against the local BEL database. Public stdout is a single
+    safe verdict line only — no created/replay/task counts, no business
+    identities. Full diagnostics go ONLY to
+    ``$BEL_PRIVATE_DATA_ROOT/reports/`` (gate-fix section 5, HARD)."""
     from bel.application.cutover_plan import run_backfill_plan
 
     period_dir = _resolve_cutover_period_dir(period)
@@ -1799,18 +1832,16 @@ def cutover_backfill_cmd(ctx: click.Context, period: str) -> None:
 
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     session_factory = _session_factory(ctx.obj["db_path"])
-    with session_factory() as session:
-        result = run_backfill_plan(session, plan, period_dir=period_dir, created_at=datetime.now(timezone.utc))
+    try:
+        with session_factory() as session:
+            result = run_backfill_plan(session, plan, period_dir=period_dir, created_at=datetime.now(timezone.utc))
+    except Exception as exc:  # noqa: BLE001 — stdout must stay safe even on failure
+        _write_cutover_report(period_dir, f"cutover-backfill-{period}.json", {"error": str(exc)})
+        click.echo("P2D_CUTOVER_BACKFILL: FAIL")
+        raise SystemExit(1) from exc
 
-    click.echo(f"cutover backfill — period={period}")
-    for section, outcome in result.sections.items():
-        if isinstance(outcome, list):
-            for entry in outcome:
-                click.echo(f"  {section}: created={entry.get('created')} tasks={len(entry.get('tasks', []))}")
-        elif isinstance(outcome, dict) and "created" in outcome:
-            click.echo(f"  {section}: created={outcome['created']} tasks={len(outcome.get('tasks', []))}")
-        else:
-            click.echo(f"  {section}: done")
+    _write_cutover_report(period_dir, f"cutover-backfill-{period}.json", {"sections": result.sections})
+    click.echo("P2D_CUTOVER_BACKFILL: DONE")
 
 
 @cutover_group.command("reconcile")
@@ -1818,9 +1849,10 @@ def cutover_backfill_cmd(ctx: click.Context, period: str) -> None:
 @click.pass_context
 def cutover_reconcile_cmd(ctx: click.Context, period: str) -> None:
     """Reconcile the local BEL database's current contract-execution
-    state against the private Cutover Baseline for one period. Prints
-    only the scenario verdict and the UNRESOLVED count — full diagnostics
-    (business identities, amounts) are never printed to stdout."""
+    state against the private Cutover Baseline for one period. Public
+    stdout is the safe scenario verdict line only — no unresolved_count,
+    no business identities. Full diagnostics go ONLY to
+    ``$BEL_PRIVATE_DATA_ROOT/reports/`` (gate-fix section 5, HARD)."""
     from bel.application.cutover_reconciliation import reconcile
 
     period_dir = _resolve_cutover_period_dir(period)
@@ -1832,11 +1864,24 @@ def cutover_reconcile_cmd(ctx: click.Context, period: str) -> None:
 
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     session_factory = _session_factory(ctx.obj["db_path"])
-    with session_factory() as session:
-        result = reconcile(session, baseline)
+    try:
+        with session_factory() as session:
+            result = reconcile(session, baseline)
+    except Exception as exc:  # noqa: BLE001 — stdout must stay safe even on failure
+        _write_cutover_report(period_dir, f"cutover-reconciliation-{period}.json", {"error": str(exc)})
+        click.echo("P2D_CUTOVER_RECONCILIATION: FAIL")
+        raise SystemExit(1) from exc
 
+    _write_cutover_report(
+        period_dir, f"cutover-reconciliation-{period}.json",
+        {
+            "unresolved_count": result.unresolved_count,
+            "entries": [
+                {"key": e.key, "outcome": e.outcome, "baseline_outcome": e.baseline_outcome} for e in result.entries
+            ],
+        },
+    )
     click.echo(f"P2D_CUTOVER_RECONCILIATION: {'PASS' if result.passed else 'FAIL'}")
-    click.echo(f"unresolved_count={result.unresolved_count}")
 
 
 if __name__ == "__main__":

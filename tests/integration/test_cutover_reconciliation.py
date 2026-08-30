@@ -254,3 +254,85 @@ def test_13_real_decimal_difference_fails_no_fuzzy_tolerance(db_session):
     entries[0]["expected"]["gross_amount"] = "100.01"  # one cent off — must still FAIL
     result = reconcile(db_session, {"entries": entries})
     assert not result.passed
+
+
+def test_14_business_string_numeric_lookalikes_never_normalized_equal(db_session):
+    """Adversarial regression (gate-fix section 4): a business string
+    field must NEVER be coerced through Decimal — "00123" and "123" stay
+    distinct even though both parse as numbers."""
+    contract = _make_contract(db_session, contract_no="C-STR")
+    db_session.commit()
+    entries = _contract_entries(contract, OUTCOME_MATCH)
+    # contract_type happens to look numeric-ish in this adversarial case.
+    entries[0]["expected"]["contract_type"] = "00" + (contract.contract_type or "")
+    result = reconcile(db_session, {"entries": entries})
+    assert not result.passed  # "00出口..." must never equal "出口..." via Decimal coercion
+
+    from bel.application.cutover_reconciliation import _normalize
+
+    assert _normalize({"contract_no": "00123"}) != _normalize({"contract_no": "123"})
+    assert _normalize({"gross_amount": "100"}) == _normalize({"gross_amount": "100.00"})
+
+
+# ---------------------------------------------------------------------------
+# Gate-fix — backfill unresolved work is included in the Gate (section 1)
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_task_blocks_reconciliation_even_unmapped_to_a_contract(db_session):
+    """An OPEN backfill Task that cannot be mapped to any Contract (a
+    Payment with no source_account_id at all) must still make
+    reconciliation UNRESOLVED — never silently absent from the Gate."""
+    from bel.application.cutover_backfill import backfill_payment_transactions
+    from bel.adapters.pdf.cmb_bank_statement import ParsedBankTransaction
+
+    doc_id = uuid.uuid4()
+    from bel.infrastructure.persistence.repositories import EvidenceRepository as _ER
+
+    _ER(db_session).add_document(
+        EvidenceDocument(id=doc_id, file_name="x", sha256="f" * 64, source_type="cmb_bank_statement_pdf", imported_at=NOW)
+    )
+    db_session.flush()
+    txn = ParsedBankTransaction(
+        page_index=0, transaction_index=0, raw_data={}, transaction_date=date(2026, 1, 1), business_type="转账",
+        bank_reference="REF-ORPHAN", signed_amount=Decimal("50.00"), running_balance=Decimal("1000.00"),
+        counterparty="Someone", description=None,
+    )
+    outcome = backfill_payment_transactions(db_session, [txn], source_account_id=None, document_id=doc_id, created_at=NOW)
+    assert outcome.tasks
+
+    db_session.commit()
+    result = reconcile(db_session, {"entries": []})
+    assert not result.passed
+    assert any("backfill_task" in e.key for e in result.entries if e.outcome == OUTCOME_UNRESOLVED)
+
+
+def test_backfill_task_resolution_clears_reconciliation_block(db_session):
+    from bel.application.cutover_backfill import backfill_contracts
+    from bel.domain.exception import ExceptionStatus
+    from bel.infrastructure.persistence.repositories import ExceptionRepository
+    from pathlib import Path
+    import tempfile
+    import openpyxl
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "ledger.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "报关出口购销合同"
+        ws.append(["Title"])
+        ws.append(["序号", "合同编码", "卖方", "买方", "金额"])
+        ws.append([1, "C-TASK", None, "BuyerX", 100])
+        wb.save(path)
+        backfill_contracts(db_session, path)
+
+    exception_repo = ExceptionRepository(db_session)
+    open_task = next(e for e in exception_repo.list_open())
+    db_session.commit()
+    unresolved_before = reconcile(db_session, {"entries": []})
+    assert not unresolved_before.passed
+
+    exception_repo.update_status(open_task.id, ExceptionStatus.RESOLVED)
+    db_session.commit()
+    result_after = reconcile(db_session, {"entries": []})
+    assert not any(e.key.startswith("unresolved:backfill_task") for e in result_after.entries)

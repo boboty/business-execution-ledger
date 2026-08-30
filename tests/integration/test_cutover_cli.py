@@ -83,15 +83,29 @@ def test_cutover_backfill_and_reconcile_cli(tmp_path):
 
     backfill_result = _run_bel(db_path, private_root, "cutover", "backfill", "--period", "2026-01")
     assert backfill_result.returncode == 0, backfill_result.stderr
-    assert "cutover backfill" in backfill_result.stdout
-    assert "created=1" in backfill_result.stdout
+    assert backfill_result.stdout.strip() == "P2D_CUTOVER_BACKFILL: DONE"
+    # No business counts, identities, or amounts ever printed to stdout.
+    assert "created=" not in backfill_result.stdout
+    assert "tasks=" not in backfill_result.stdout
+    assert "SupplierCLI" not in backfill_result.stdout
+
+    backfill_report_path = private_root / "reports" / "cutover-backfill-2026-01.json"
+    assert backfill_report_path.exists()
+    backfill_report = json.loads(backfill_report_path.read_text(encoding="utf-8"))
+    assert backfill_report["sections"]["contracts"]["created"] == 1
 
     reconcile_result = _run_bel(db_path, private_root, "cutover", "reconcile", "--period", "2026-01")
     assert reconcile_result.returncode == 0, reconcile_result.stderr
-    assert "P2D_CUTOVER_RECONCILIATION: PASS" in reconcile_result.stdout
-    assert "unresolved_count=0" in reconcile_result.stdout
-    # No business identity or amount ever printed to stdout.
+    assert reconcile_result.stdout.strip() == "P2D_CUTOVER_RECONCILIATION: PASS"
+    # No unresolved_count, business identity, or amount ever printed to stdout.
+    assert "unresolved_count" not in reconcile_result.stdout
     assert "SupplierCLI" not in reconcile_result.stdout
+
+    reconcile_report_path = private_root / "reports" / "cutover-reconciliation-2026-01.json"
+    assert reconcile_report_path.exists()
+    reconcile_report = json.loads(reconcile_report_path.read_text(encoding="utf-8"))
+    assert reconcile_report["unresolved_count"] == 0
+    assert len(reconcile_report["entries"]) == 2
 
 
 def test_cutover_backfill_rejects_period_dir_outside_private_root(tmp_path):

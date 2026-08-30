@@ -28,16 +28,31 @@ This module NEVER reads ``$BEL_PRIVATE_DATA_ROOT/<period>/expected/`` —
 that is acceptance material for ``cutover_reconciliation``, never a Fact
 source (section 47, HARD).
 
-``ContractItem``, ``SalesContract`` and ``ProcurementSalesLink`` have no
-natural raw-Excel-column source in the current adapters (the contract
-ledger promotes only ``contract_no``/``counterparty``/``buyer``/
-``gross_amount`` — see ``bel.adapters.excel.contract_ledger`` — and
-carries no frozen sales-scope-reference column mapping). Backfilling
-these three therefore takes an explicit structured entry list (the same
-shape discipline as ``cutover_fact_pack``'s selectors) rather than
-guessing a column mapping that was never frozen — guessing one would
-itself violate the "does not guess" principle this whole module exists
-to uphold.
+``ContractItem`` has no natural raw-Excel-column source in the current
+adapters (the contract ledger promotes only ``contract_no``/
+``counterparty``/``buyer``/``gross_amount`` for CANONICAL fields — see
+``bel.adapters.excel.contract_ledger``); its Human-Confirmed structured
+entries go through ``bel.application.cutover_fact_pack``'s closed
+allowlist exclusively (see that module) — this file never builds its
+own ad-hoc MANUAL_FACT for it.
+
+``SalesContract``/``ProcurementSalesLink`` DO have a frozen, genuine
+Evidence basis (docs/PHASE2D1-R0-DECISIONS.md section 2.4's "the
+procurement ledger's sales-scope reference column as a backfill basis"):
+the SAME contract-ledger row's ``外销合同编码`` (export sales-contract
+code — preserved verbatim in ``raw_data``, never promoted to a canonical
+Contract field) paired with that SAME row's ``买方`` (``Contract.buyer``
+— our own entity), using that row's OWN EvidenceFragment as
+``source_fragment_id`` for both the SalesContract and the link. This
+NEVER stitches fields across two different rows/fragments, and
+``customer`` is NEVER inferred from it — see ``_backfill_sales_scope_basis``.
+
+``Shipment`` has no genuine-Evidence source implemented in this round
+(no export/customs-declaration adapter exists) — ``backfill_shipments``
+below remains available for a future genuine-Evidence caller, but the
+backfill PLAN (``cutover_plan.py``) does not wire it to any manifest
+section: a plan assertion must never stand in for genuine export
+Evidence (gate-fix section 2, HARD).
 """
 
 from __future__ import annotations
@@ -79,6 +94,7 @@ from bel.application.sales_contract_facts import (
 from bel.application.shipment_facts import ShipmentFactConflict, ShipmentFactError, create_shipment_fact
 from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
+from bel.domain.exception import ExceptionStatus, ExceptionType, TaskException
 from bel.domain.invoice import Invoice, InvoiceDirection, InvoiceItem
 from bel.domain.payment import Payment, PaymentDirection
 from bel.domain.procurement_sales_link import ConfirmationType as LinkConfirmationType
@@ -86,6 +102,7 @@ from bel.infrastructure.persistence.repositories import (
     ContractItemRepository,
     ContractRepository,
     EvidenceRepository,
+    ExceptionRepository,
     InvoiceItemRepository,
     InvoiceRepository,
     PaymentRepository,
@@ -111,14 +128,25 @@ def _as_date(value: Any) -> date:
     raise ValueError(f"expected an ISO date string or date object, got {value!r}")
 
 
+_TASK_KIND_TO_EXCEPTION_TYPE = {
+    "IDENTITY_INCOMPLETE": ExceptionType.BACKFILL_IDENTITY_INCOMPLETE,
+    "IDENTITY_AMBIGUOUS": ExceptionType.BACKFILL_IDENTITY_AMBIGUOUS,
+    "CONFLICT": ExceptionType.BACKFILL_CONFLICT,
+}
+
+
 @dataclass
 class BackfillTaskRef:
     """One unresolved backfill row — never silently skipped, never
-    silently guessed. ``kind`` is one of: IDENTITY_INCOMPLETE,
-    IDENTITY_AMBIGUOUS, CONFLICT."""
+    silently guessed, and never ONLY an in-memory return value: every
+    instance corresponds to a real, persisted, OPEN ``TaskException``
+    (``task_exception_id``), which is what lets
+    ``bel.application.cutover_reconciliation`` see it. ``kind`` is one
+    of: IDENTITY_INCOMPLETE, IDENTITY_AMBIGUOUS, CONFLICT."""
 
     kind: str
     detail: dict[str, Any]
+    task_exception_id: uuid.UUID
 
 
 @dataclass
@@ -126,6 +154,32 @@ class BackfillOutcome:
     created: int = 0
     replay_or_corroborating: int = 0
     tasks: list[BackfillTaskRef] = field(default_factory=list)
+
+
+def _find_or_create_backfill_task(
+    session: Session, *, kind: str, fact_type: str, identity_key: str, summary: str, extra: dict[str, Any] | None = None,
+    created_at: datetime,
+) -> BackfillTaskRef:
+    """Persists an OPEN ``TaskException`` for one unresolved backfill
+    row — idempotently. A rerun that resolves to the SAME
+    ``identity_key`` (a stable business-identity-derived string, never a
+    row number or fragment id alone) reuses the existing OPEN row rather
+    than creating a duplicate, so re-running the same plan against
+    unchanged source data never piles up Tasks."""
+    exception_type = _TASK_KIND_TO_EXCEPTION_TYPE[kind]
+    exception_repo = ExceptionRepository(session)
+    for existing in exception_repo.list_open():
+        if existing.exception_type == exception_type and existing.detail.get("identity_key") == identity_key:
+            return BackfillTaskRef(kind=kind, detail=existing.detail, task_exception_id=existing.id)
+
+    detail = {"fact_type": fact_type, "identity_key": identity_key, **(extra or {})}
+    task = TaskException(
+        id=uuid.uuid4(), exception_type=exception_type, status=ExceptionStatus.OPEN, summary=summary, detail=detail,
+        created_at=created_at,
+    )
+    exception_repo.add(task)
+    session.flush()
+    return BackfillTaskRef(kind=kind, detail=detail, task_exception_id=task.id)
 
 
 def _row_fragments(
@@ -160,6 +214,60 @@ def _get_or_create_document(session: Session, file_path: Path, *, source_type: s
     return document, False
 
 
+EXPORT_SALES_CONTRACT_NO_RAW_KEY = "外销合同编码"
+
+
+def _backfill_sales_scope_basis(
+    session: Session, *, contract: Contract, row, source_fragment_id: uuid.UUID, created_at: datetime
+) -> None:
+    """The frozen legacy-ledger sales-scope basis
+    (docs/PHASE2D1-R0-DECISIONS.md section 2.4): the SAME contract-ledger
+    row's ``外销合同编码`` (export sales-contract code, preserved in
+    ``raw_data``) paired with that SAME row's ``买方``
+    (``Contract.buyer`` — our own entity) is sufficient genuine Evidence
+    to establish a ``customer=NULL`` SalesContract scope and the
+    ProcurementSalesLink basis, using that row's OWN fragment as
+    ``source_fragment_id`` for both. Never stitches fields across two
+    different rows/fragments; ``customer`` is NEVER inferred — the
+    unresolved-customer Task R3a already raises stands.
+
+    A no-op when either half is missing on this row — there is
+    deliberately no fallback and no cross-row search."""
+    export_sales_contract_no = row.raw_data.get(EXPORT_SALES_CONTRACT_NO_RAW_KEY)
+    if isinstance(export_sales_contract_no, str):
+        export_sales_contract_no = export_sales_contract_no.strip()
+    if not export_sales_contract_no or not contract.buyer:
+        return
+
+    our_entity = contract.buyer
+    identity_key = f"SalesScopeBasis|{our_entity}|{export_sales_contract_no}"
+    try:
+        sales_result = create_sales_contract_fact(
+            session, our_entity=our_entity, sales_contract_no=str(export_sales_contract_no), fields={},
+            source_fragment_id=source_fragment_id, created_at=created_at,
+        )
+    except (SalesContractFactConflict, SalesContractFactError) as exc:
+        _find_or_create_backfill_task(
+            session, kind="CONFLICT", fact_type="SalesContract", identity_key=identity_key,
+            summary=f"Sales-scope basis for Contract {contract.contract_no}: conflicting SalesContract content",
+            extra={"reason": str(exc)}, created_at=created_at,
+        )
+        return
+
+    try:
+        add_procurement_sales_link(
+            session, procurement_contract_id=contract.id, sales_contract_id=sales_result.sales_contract.id,
+            source_fragment_id=source_fragment_id, confirmation_type=LinkConfirmationType.AUTO_CONFIRMED,
+            created_at=created_at,
+        )
+    except (ProcurementSalesLinkFactConflict, ProcurementSalesLinkFactError) as exc:
+        _find_or_create_backfill_task(
+            session, kind="CONFLICT", fact_type="ProcurementSalesLink", identity_key=identity_key,
+            summary=f"Sales-scope basis link for Contract {contract.contract_no}: conflicting link content",
+            extra={"reason": str(exc)}, created_at=created_at,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Contract backfill — identity (contract_no, counterparty)
 # ---------------------------------------------------------------------------
@@ -180,15 +288,17 @@ def backfill_contracts(session: Session, file_path: Path, *, created_at: datetim
 
     for row in business_rows:
         fragment_id = fragment_ids[row.row_number]
+        identity_key = f"Contract|{row.contract_no}|{row.counterparty}"
         if not row.contract_no or not row.counterparty:
             outcome.tasks.append(
-                BackfillTaskRef(
-                    kind="IDENTITY_INCOMPLETE",
-                    detail={
-                        "fact_type": "Contract", "row_number": row.row_number,
+                _find_or_create_backfill_task(
+                    session, kind="IDENTITY_INCOMPLETE", fact_type="Contract", identity_key=identity_key,
+                    summary=f"Contract backfill row {row.row_number}: identity incomplete",
+                    extra={
                         "missing_contract_no": not bool(row.contract_no),
                         "missing_counterparty": not bool(row.counterparty),
                     },
+                    created_at=now,
                 )
             )
             continue
@@ -203,17 +313,19 @@ def backfill_contracts(session: Session, file_path: Path, *, created_at: datetim
             )
         except ContractFactAmbiguous as exc:
             outcome.tasks.append(
-                BackfillTaskRef(
-                    kind="IDENTITY_AMBIGUOUS",
-                    detail={"fact_type": "Contract", "row_number": row.row_number, "reason": str(exc)},
+                _find_or_create_backfill_task(
+                    session, kind="IDENTITY_AMBIGUOUS", fact_type="Contract", identity_key=identity_key,
+                    summary=f"Contract backfill row {row.row_number}: identity ambiguous",
+                    extra={"reason": str(exc)}, created_at=now,
                 )
             )
             continue
         except (ContractFactConflict, ContractFactError) as exc:
             outcome.tasks.append(
-                BackfillTaskRef(
-                    kind="CONFLICT",
-                    detail={"fact_type": "Contract", "row_number": row.row_number, "reason": str(exc)},
+                _find_or_create_backfill_task(
+                    session, kind="CONFLICT", fact_type="Contract", identity_key=identity_key,
+                    summary=f"Contract backfill row {row.row_number}: conflicting content",
+                    extra={"reason": str(exc)}, created_at=now,
                 )
             )
             continue
@@ -221,6 +333,7 @@ def backfill_contracts(session: Session, file_path: Path, *, created_at: datetim
             outcome.created += 1
         else:
             outcome.replay_or_corroborating += 1
+        _backfill_sales_scope_basis(session, contract=result.contract, row=row, source_fragment_id=fragment_id, created_at=now)
     return outcome
 
 
@@ -245,25 +358,31 @@ def backfill_contract_items(
         contract_no = entry.get("contract_no")
         counterparty = entry.get("counterparty")
         source_item_key = entry.get("source_item_key")
+        identity_key = f"ContractItem|{contract_no}|{counterparty}|{source_item_key or f'index={index}'}"
         if not source_item_key:
             outcome.tasks.append(
-                BackfillTaskRef(kind="IDENTITY_INCOMPLETE", detail={"fact_type": "ContractItem", "index": index})
+                _find_or_create_backfill_task(
+                    session, kind="IDENTITY_INCOMPLETE", fact_type="ContractItem", identity_key=identity_key,
+                    summary=f"ContractItem backfill entry {index}: source_item_key missing", created_at=now,
+                )
             )
             continue
         matches = contract_repo.find_by_identity(contract_no, counterparty)
         if len(matches) == 0:
             outcome.tasks.append(
-                BackfillTaskRef(
-                    kind="IDENTITY_INCOMPLETE",
-                    detail={"fact_type": "ContractItem", "index": index, "reason": "no matching Contract"},
+                _find_or_create_backfill_task(
+                    session, kind="IDENTITY_INCOMPLETE", fact_type="ContractItem", identity_key=identity_key,
+                    summary=f"ContractItem backfill entry {index}: no matching Contract",
+                    extra={"reason": "no matching Contract"}, created_at=now,
                 )
             )
             continue
         if len(matches) > 1:
             outcome.tasks.append(
-                BackfillTaskRef(
-                    kind="IDENTITY_AMBIGUOUS",
-                    detail={"fact_type": "ContractItem", "index": index, "matches": len(matches)},
+                _find_or_create_backfill_task(
+                    session, kind="IDENTITY_AMBIGUOUS", fact_type="ContractItem", identity_key=identity_key,
+                    summary=f"ContractItem backfill entry {index}: ambiguous Contract identity",
+                    extra={"matches": len(matches)}, created_at=now,
                 )
             )
             continue
@@ -274,7 +393,11 @@ def backfill_contract_items(
             )
         except (ContractItemFactConflict, ContractItemFactError) as exc:
             outcome.tasks.append(
-                BackfillTaskRef(kind="CONFLICT", detail={"fact_type": "ContractItem", "index": index, "reason": str(exc)})
+                _find_or_create_backfill_task(
+                    session, kind="CONFLICT", fact_type="ContractItem", identity_key=identity_key,
+                    summary=f"ContractItem backfill entry {index}: conflicting content", extra={"reason": str(exc)},
+                    created_at=now,
+                )
             )
             continue
         if result.created:
@@ -316,7 +439,11 @@ def backfill_invoices(
         external_key = header.digital_invoice_no
         if not external_key:
             outcome.tasks.append(
-                BackfillTaskRef(kind="IDENTITY_INCOMPLETE", detail={"fact_type": "Invoice", "index": group_index})
+                _find_or_create_backfill_task(
+                    session, kind="IDENTITY_INCOMPLETE", fact_type="Invoice",
+                    identity_key=f"Invoice|{direction}|index={group_index}",
+                    summary=f"Invoice backfill group {group_index}: external key missing", created_at=now,
+                )
             )
             continue
 
@@ -328,9 +455,9 @@ def backfill_invoices(
                 outcome.replay_or_corroborating += 1
                 continue
             outcome.tasks.append(
-                BackfillTaskRef(
-                    kind="CONFLICT",
-                    detail={"fact_type": "Invoice", "external_invoice_key": external_key, "index": group_index},
+                _find_or_create_backfill_task(
+                    session, kind="CONFLICT", fact_type="Invoice", identity_key=f"Invoice|{external_key}",
+                    summary=f"Invoice backfill: {external_key} has conflicting content", created_at=now,
                 )
             )
             continue
@@ -396,27 +523,41 @@ def backfill_payment_transactions(
         amount = abs(txn.signed_amount)
 
         if not source_account_id or not txn.bank_reference:
+            # No stable business identity exists for this row (that is
+            # the whole problem) — the best available deterministic
+            # dedup key uses whatever IS present plus the transaction's
+            # own position, so an exact rerun of the SAME source still
+            # reuses the same OPEN Task rather than piling up duplicates.
+            identity_key = (
+                f"Payment|incomplete|account={source_account_id}|date={txn.transaction_date}|direction={direction}"
+                f"|amount={amount}|bank_reference={txn.bank_reference}|txn={txn.transaction_index}"
+            )
             outcome.tasks.append(
-                BackfillTaskRef(
-                    kind="IDENTITY_INCOMPLETE",
-                    detail={
-                        "fact_type": "Payment", "transaction_index": txn.transaction_index,
+                _find_or_create_backfill_task(
+                    session, kind="IDENTITY_INCOMPLETE", fact_type="Payment", identity_key=identity_key,
+                    summary=f"Payment backfill transaction {txn.transaction_index}: identity incomplete",
+                    extra={
                         "missing_source_account_id": not bool(source_account_id),
                         "missing_bank_reference": not bool(txn.bank_reference),
                     },
+                    created_at=now,
                 )
             )
             continue
 
+        payment_identity_key = (
+            f"Payment|{source_account_id}|{txn.transaction_date}|{direction}|{amount}|{txn.bank_reference}"
+        )
         matches = payment_repo.find_by_identity(
             source_account_id=source_account_id, transaction_date=txn.transaction_date, direction=direction,
             amount=amount, bank_reference=txn.bank_reference,
         )
         if len(matches) > 1:
             outcome.tasks.append(
-                BackfillTaskRef(
-                    kind="IDENTITY_AMBIGUOUS",
-                    detail={"fact_type": "Payment", "transaction_index": txn.transaction_index, "matches": len(matches)},
+                _find_or_create_backfill_task(
+                    session, kind="IDENTITY_AMBIGUOUS", fact_type="Payment", identity_key=payment_identity_key,
+                    summary=f"Payment backfill transaction {txn.transaction_index}: ambiguous identity",
+                    extra={"matches": len(matches)}, created_at=now,
                 )
             )
             continue
@@ -431,9 +572,10 @@ def backfill_payment_transactions(
                 outcome.replay_or_corroborating += 1
             else:
                 outcome.tasks.append(
-                    BackfillTaskRef(
-                        kind="CONFLICT",
-                        detail={"fact_type": "Payment", "transaction_index": txn.transaction_index},
+                    _find_or_create_backfill_task(
+                        session, kind="CONFLICT", fact_type="Payment", identity_key=payment_identity_key,
+                        summary=f"Payment backfill transaction {txn.transaction_index}: conflicting content",
+                        created_at=now,
                     )
                 )
             continue
@@ -489,12 +631,17 @@ def backfill_shipments(
     item_repo = ContractItemRepository(session)
 
     for index, entry in enumerate(entries):
-        matches = contract_repo.find_by_identity(entry.get("contract_no"), entry.get("counterparty"))
+        contract_no, counterparty = entry.get("contract_no"), entry.get("counterparty")
+        identity_key = f"Shipment|{contract_no}|{counterparty}|index={index}"
+        matches = contract_repo.find_by_identity(contract_no, counterparty)
         if len(matches) != 1:
             outcome.tasks.append(
-                BackfillTaskRef(
+                _find_or_create_backfill_task(
+                    session,
                     kind="IDENTITY_AMBIGUOUS" if len(matches) > 1 else "IDENTITY_INCOMPLETE",
-                    detail={"fact_type": "Shipment", "index": index, "matches": len(matches)},
+                    fact_type="Shipment", identity_key=identity_key,
+                    summary=f"Shipment backfill entry {index}: Contract identity unresolved",
+                    extra={"matches": len(matches)}, created_at=now,
                 )
             )
             continue
@@ -516,7 +663,12 @@ def backfill_shipments(
             )
         except (ShipmentFactConflict, ShipmentFactError) as exc:
             outcome.tasks.append(
-                BackfillTaskRef(kind="CONFLICT", detail={"fact_type": "Shipment", "index": index, "reason": str(exc)})
+                _find_or_create_backfill_task(
+                    session, kind="CONFLICT", fact_type="Shipment",
+                    identity_key=f"Shipment|{contract_no}|{counterparty}|{entry.get('external_reference')}|{entry.get('execution_date')}",
+                    summary=f"Shipment backfill entry {index}: conflicting content", extra={"reason": str(exc)},
+                    created_at=now,
+                )
             )
             continue
         if result.created:
@@ -542,14 +694,20 @@ def backfill_sales_contracts(
     outcome = BackfillOutcome()
 
     for index, entry in enumerate(entries):
+        our_entity, sales_contract_no = entry.get("our_entity"), entry.get("sales_contract_no")
         try:
             result = create_sales_contract_fact(
-                session, our_entity=entry.get("our_entity"), sales_contract_no=entry.get("sales_contract_no"),
+                session, our_entity=our_entity, sales_contract_no=sales_contract_no,
                 fields=entry.get("fields", {}), source_fragment_id=source_fragment_id, created_at=now,
             )
         except (SalesContractFactConflict, SalesContractFactError) as exc:
             outcome.tasks.append(
-                BackfillTaskRef(kind="CONFLICT", detail={"fact_type": "SalesContract", "index": index, "reason": str(exc)})
+                _find_or_create_backfill_task(
+                    session, kind="CONFLICT", fact_type="SalesContract",
+                    identity_key=f"SalesContract|{our_entity}|{sales_contract_no}",
+                    summary=f"SalesContract backfill entry {index}: conflicting content", extra={"reason": str(exc)},
+                    created_at=now,
+                )
             )
             continue
         if result.created:
@@ -579,16 +737,20 @@ def backfill_procurement_sales_links(
     sales_contract_repo = SalesContractRepository(session)
 
     for index, entry in enumerate(entries):
-        contract_matches = contract_repo.find_by_identity(entry.get("contract_no"), entry.get("counterparty"))
-        sales_contract = sales_contract_repo.find_by_identity(entry.get("sales_our_entity"), entry.get("sales_contract_no"))
+        contract_no, counterparty = entry.get("contract_no"), entry.get("counterparty")
+        sales_our_entity, sales_contract_no = entry.get("sales_our_entity"), entry.get("sales_contract_no")
+        identity_key = f"ProcurementSalesLink|{contract_no}|{counterparty}|{sales_our_entity}|{sales_contract_no}"
+        contract_matches = contract_repo.find_by_identity(contract_no, counterparty)
+        sales_contract = sales_contract_repo.find_by_identity(sales_our_entity, sales_contract_no)
         if len(contract_matches) != 1 or sales_contract is None:
             outcome.tasks.append(
-                BackfillTaskRef(
+                _find_or_create_backfill_task(
+                    session,
                     kind="IDENTITY_AMBIGUOUS" if len(contract_matches) > 1 else "IDENTITY_INCOMPLETE",
-                    detail={
-                        "fact_type": "ProcurementSalesLink", "index": index,
-                        "contract_matches": len(contract_matches), "sales_contract_found": sales_contract is not None,
-                    },
+                    fact_type="ProcurementSalesLink", identity_key=identity_key,
+                    summary=f"ProcurementSalesLink backfill entry {index}: identity unresolved",
+                    extra={"contract_matches": len(contract_matches), "sales_contract_found": sales_contract is not None},
+                    created_at=now,
                 )
             )
             continue
@@ -600,8 +762,10 @@ def backfill_procurement_sales_links(
             )
         except (ProcurementSalesLinkFactConflict, ProcurementSalesLinkFactError) as exc:
             outcome.tasks.append(
-                BackfillTaskRef(
-                    kind="CONFLICT", detail={"fact_type": "ProcurementSalesLink", "index": index, "reason": str(exc)}
+                _find_or_create_backfill_task(
+                    session, kind="CONFLICT", fact_type="ProcurementSalesLink", identity_key=identity_key,
+                    summary=f"ProcurementSalesLink backfill entry {index}: conflicting content",
+                    extra={"reason": str(exc)}, created_at=now,
                 )
             )
             continue

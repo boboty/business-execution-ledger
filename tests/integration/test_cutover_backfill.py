@@ -43,7 +43,7 @@ from bel.infrastructure.persistence.repositories import (
 
 NOW = datetime.now(timezone.utc)
 
-CONTRACT_HEADERS = ["序号", "合同编码", "卖方", "买方", "金额"]
+CONTRACT_HEADERS = ["序号", "合同编码", "卖方", "买方", "金额", "外销合同编码"]
 INVOICE_HEADERS_ROW = [
     "凭证模板", "凭证字号", "发票票种", "开票日期", "发票号码", "数电发票号码", "销方名称",
     "商品名称（明细）", "规格型号（明细）", "单位（明细）", "数量（明细）", "单价（明细）", "金额（明细）",
@@ -487,3 +487,125 @@ def test_backfill_module_never_touches_private_root_resolution():
     assert "os.environ" not in source
     assert "resolve_private_root" not in source
     assert "import os" not in source
+
+
+# ---------------------------------------------------------------------------
+# Gate-fix — frozen legacy-ledger sales-scope basis (section 2)
+# ---------------------------------------------------------------------------
+
+
+def test_sales_scope_basis_established_from_same_row(db_session, tmp_path):
+    path = tmp_path / "ledger.xlsx"
+    _write_ledger(path, [[1, "C001", "SellerA", "BuyerX", 100, "SC-BASIS-1"]])
+    backfill_contracts(db_session, path)
+
+    contract = ContractRepository(db_session).find_by_contract_no("C001")[0]
+    sales_contracts = SalesContractRepository(db_session).list_all()
+    assert len(sales_contracts) == 1
+    sc = sales_contracts[0]
+    assert sc.our_entity == "BuyerX"  # 买方 on the SAME row
+    assert sc.sales_contract_no == "SC-BASIS-1"  # 外销合同编码 on the SAME row
+    assert sc.customer is None  # never inferred
+    assert ProcurementSalesLinkRepository(db_session).get_current_link(contract.id, sc.id) is not None
+
+
+def test_sales_scope_basis_absent_when_export_code_missing(db_session, tmp_path):
+    path = tmp_path / "ledger.xlsx"
+    _write_ledger(path, [[1, "C001", "SellerA", "BuyerX", 100, None]])
+    backfill_contracts(db_session, path)
+    assert SalesContractRepository(db_session).list_all() == []
+
+
+def test_sales_scope_basis_absent_when_buyer_missing(db_session, tmp_path):
+    path = tmp_path / "ledger.xlsx"
+    _write_ledger(path, [[1, "C001", "SellerA", None, 100, "SC-BASIS-2"]])
+    backfill_contracts(db_session, path)
+    assert SalesContractRepository(db_session).list_all() == []
+
+
+def test_sales_scope_basis_never_stitches_across_rows(db_session, tmp_path):
+    """Row 1 supplies our_entity (买方) but no export code; row 2 supplies
+    an export code but has a DIFFERENT buyer — neither row alone
+    satisfies both halves, and the two must never be combined."""
+    path = tmp_path / "ledger.xlsx"
+    _write_ledger(
+        path,
+        [
+            [1, "C001", "SellerA", "BuyerX", 100, None],
+            [2, "C002", "SellerB", "BuyerY", 200, "SC-BASIS-3"],
+        ],
+    )
+    backfill_contracts(db_session, path)
+    sales_contracts = SalesContractRepository(db_session).list_all()
+    assert len(sales_contracts) == 1
+    assert sales_contracts[0].our_entity == "BuyerY"  # only row 2's OWN pair, never row 1's buyer
+
+
+def test_sales_scope_basis_reruns_idempotently(db_session, tmp_path):
+    path = tmp_path / "ledger.xlsx"
+    _write_ledger(path, [[1, "C001", "SellerA", "BuyerX", 100, "SC-BASIS-4"]])
+    backfill_contracts(db_session, path)
+    path2 = tmp_path / "ledger2.xlsx"
+    _write_ledger(path2, [[99, "C001", "SellerA", "BuyerX", 100, "SC-BASIS-4"]])
+    backfill_contracts(db_session, path2)  # revised bytes, same business content
+    assert len(SalesContractRepository(db_session).list_all()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Gate-fix — persistent, idempotent OPEN TaskException (section 1)
+# ---------------------------------------------------------------------------
+
+
+def test_identity_incomplete_task_is_persisted_open(db_session, tmp_path):
+    path = tmp_path / "ledger.xlsx"
+    _write_ledger(path, [[1, "C001", None, "BuyerX", 100, None]])
+    result = backfill_contracts(db_session, path)
+    assert len(result.tasks) == 1
+    task_id = result.tasks[0].task_exception_id
+
+    from bel.domain.exception import ExceptionStatus, ExceptionType
+    from bel.infrastructure.persistence.repositories import ExceptionRepository
+
+    persisted = [e for e in ExceptionRepository(db_session).list_all() if e.id == task_id]
+    assert len(persisted) == 1
+    assert persisted[0].status == ExceptionStatus.OPEN
+    assert persisted[0].exception_type == ExceptionType.BACKFILL_IDENTITY_INCOMPLETE
+    assert persisted[0].detail["identity_key"]  # structured, not a parsed summary
+
+
+def test_identity_incomplete_task_rerun_reuses_same_open_task(db_session, tmp_path):
+    """A rerun hitting the SAME underlying identity problem must reuse
+    the existing OPEN TaskException, never create a duplicate."""
+    path1 = tmp_path / "ledger1.xlsx"
+    path2 = tmp_path / "ledger2.xlsx"
+    _write_ledger(path1, [[1, "C001", None, "BuyerX", 100, None]])
+    _write_ledger(path2, [[99, "C001", None, "BuyerX", 100, None]])  # revised bytes, same problem
+
+    from bel.domain.exception import ExceptionType
+    from bel.infrastructure.persistence.repositories import ExceptionRepository
+
+    result1 = backfill_contracts(db_session, path1)
+    result2 = backfill_contracts(db_session, path2)
+    assert result1.tasks[0].task_exception_id == result2.tasks[0].task_exception_id
+    open_tasks = [
+        e for e in ExceptionRepository(db_session).list_open() if e.exception_type == ExceptionType.BACKFILL_IDENTITY_INCOMPLETE
+    ]
+    assert len(open_tasks) == 1
+
+
+def test_conflict_task_is_persisted_open(db_session, tmp_path):
+    path1 = tmp_path / "ledger1.xlsx"
+    path2 = tmp_path / "ledger2.xlsx"
+    _write_ledger(path1, [[1, "C001", "SellerA", "BuyerX", 100, None]])
+    _write_ledger(path2, [[1, "C001", "SellerA", "BuyerX", 999, None]])
+    backfill_contracts(db_session, path1)
+    result = backfill_contracts(db_session, path2)
+
+    from bel.domain.exception import ExceptionStatus, ExceptionType
+    from bel.infrastructure.persistence.repositories import ExceptionRepository
+
+    task_id = result.tasks[0].task_exception_id
+    persisted = ExceptionRepository(db_session).list_all()
+    match = next(e for e in persisted if e.id == task_id)
+    assert match.status == ExceptionStatus.OPEN
+    assert match.exception_type == ExceptionType.BACKFILL_CONFLICT

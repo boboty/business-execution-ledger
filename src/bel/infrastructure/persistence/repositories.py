@@ -2514,6 +2514,10 @@ class CostRecognitionFactRepository:
             )
         )
 
+    def get(self, fact_id: uuid.UUID) -> CostRecognitionFact | None:
+        m = self._session.get(CostRecognitionFactModel, fact_id)
+        return _cost_recognition_fact_to_domain(m) if m else None
+
     def list_for_shipment(self, shipment_id: uuid.UUID) -> list[CostRecognitionFact]:
         rows = self._session.scalars(
             select(CostRecognitionFactModel).where(
@@ -2573,6 +2577,10 @@ class AccrualBasisFactRepository:
                 created_at=fact.created_at,
             )
         )
+
+    def get(self, fact_id: uuid.UUID) -> AccrualBasisFact | None:
+        m = self._session.get(AccrualBasisFactModel, fact_id)
+        return _accrual_basis_fact_to_domain(m) if m else None
 
     def list_all(self) -> list[AccrualBasisFact]:
         rows = self._session.scalars(
@@ -2640,6 +2648,10 @@ class HistoricalAccrualFactRepository:
                 confirmed_at=fact.confirmed_at,
             )
         )
+
+    def get(self, fact_id: uuid.UUID) -> HistoricalAccrualFact | None:
+        m = self._session.get(HistoricalAccrualFactModel, fact_id)
+        return _historical_accrual_fact_to_domain(m) if m else None
 
     def list_all(self) -> list[HistoricalAccrualFact]:
         rows = self._session.scalars(

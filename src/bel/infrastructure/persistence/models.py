@@ -108,6 +108,22 @@ class ContractRevisionModel(Base):
             "revision_type IN ('INITIAL', 'SUPPLEMENT', 'CORRECTION')",
             name="ck_contract_revisions_revision_type",
         ),
+        # Phase 2D.1-R5 gate fix: the pre-R5 invariant "Contract.gross_amount
+        # and Contract.currency are always non-NULL" must hold for the
+        # CURRENT revision — schema-level backstop behind
+        # bel.application.contract_facts's own guard (which rejects
+        # asserting None for either field at the application layer).
+        # Evaluated at INSERT time: a brand-new revision always has
+        # superseded_by_revision_id IS NULL, so the OR never lets a
+        # newly-written current row through with either NULL; a row
+        # LATER retired (superseded_by_revision_id set on UPDATE) keeps
+        # whatever non-NULL values it was written with — this constraint
+        # only ever fires on that row's own gross_amount/currency
+        # columns, which nothing here re-writes.
+        CheckConstraint(
+            "superseded_by_revision_id IS NOT NULL OR (gross_amount IS NOT NULL AND currency IS NOT NULL)",
+            name="ck_contract_revisions_current_requires_amount_currency",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)

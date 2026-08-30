@@ -86,6 +86,26 @@ class ExceptionType:
     # conflict -> Task / reject. No second correction record is written,
     # and the existing lineage is not altered").
     PROCUREMENT_SALES_LINK_CORRECTION_CONFLICT = "ProcurementSalesLinkCorrectionConflict"
+    # Phase 2D.1-R5 gate fix: a backfill row's business identity for its
+    # fact type is missing a required part (e.g. Contract counterparty,
+    # Payment source_account_id/bank_reference) — never silently skipped
+    # or guessed. Persisted (not merely returned in-memory) so
+    # reconciliation can see it, and idempotent: a rerun hitting the SAME
+    # identity_key reuses the existing OPEN row rather than creating a
+    # duplicate (bel.application.cutover_backfill._find_or_create_backfill_task).
+    BACKFILL_IDENTITY_INCOMPLETE = "BackfillIdentityIncomplete"
+    # Phase 2D.1-R5 gate fix: a backfill row's declared identity matches
+    # more than one existing anchor (Contract's (contract_no, counterparty)
+    # is deliberately non-unique — docs/PHASE2D1-R0-DECISIONS.md section
+    # 4.4) or more than one candidate resolves ambiguously. Never
+    # resolved by picking the first match.
+    BACKFILL_IDENTITY_AMBIGUOUS = "BackfillIdentityAmbiguous"
+    # Phase 2D.1-R5 gate fix: a backfill row's business identity matches
+    # an existing Fact whose asserted content differs — "latest wins" is
+    # forbidden; the existing Fact is left untouched and this Task
+    # surfaces the conflict for a human to resolve via an explicit
+    # supplement/correction.
+    BACKFILL_CONFLICT = "BackfillConflict"
 
 
 class ExceptionStatus:
