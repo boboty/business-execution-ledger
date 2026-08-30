@@ -170,10 +170,28 @@ def resolve_period_dir(root: Path, period: str | None) -> Path:
             raise AcceptanceError(REASON_PERIOD_NOT_FOUND, {"root": str(root), "period": period})
         return candidate
 
-    periods = sorted(p.name for p in resolved_root.iterdir() if p.is_dir() and PERIOD_DIR_RE.match(p.name))
-    if not periods:
+    # Autodiscovery (gate-fix, Phase 2D.1-R5 final round 2), HARD:
+    # Path.is_dir() follows symlinks, so a NAME-matching child could be a
+    # symlink resolving outside the private root. Every candidate is
+    # resolved (following any symlink) and re-checked for containment
+    # BEFORE it is eligible to be selected as "latest" — an excluded
+    # candidate never enters the selection at all, and the directory
+    # actually returned is the resolved, contained one, never the
+    # unresolved symlink path.
+    candidates: dict[str, Path] = {}
+    for p in resolved_root.iterdir():
+        if not PERIOD_DIR_RE.match(p.name):
+            continue
+        try:
+            resolved_candidate = p.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not resolved_candidate.is_dir() or not _is_within(resolved_candidate, resolved_root):
+            continue
+        candidates[p.name] = resolved_candidate
+    if not candidates:
         raise AcceptanceError(REASON_PERIOD_NOT_FOUND, {"root": str(root)})
-    return resolved_root / periods[-1]
+    return candidates[sorted(candidates)[-1]]
 
 
 def _assert_equal(diagnostic: dict[str, Any], label: str, actual: Any, expected: Any) -> None:

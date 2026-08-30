@@ -220,6 +220,96 @@ def test_resolve_period_dir_autodiscovery_still_finds_latest(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# resolve_period_dir autodiscovery — symlink boundary (Phase 2D.1-R5 final
+# gate fix round 2). Path.is_dir() follows symlinks, so a NAME-matching
+# YYYY-MM child that is itself a symlink escaping the private root must
+# never be selected as "latest" — every candidate is resolved and
+# containment-checked BEFORE it is eligible.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_period_dir_autodiscovery_skips_symlink_escaping_root_even_when_lexically_later(tmp_path):
+    """A. A real 2026-01 directory plus a lexically-later 2099-12 that is
+    a symlink resolving outside the private root — autodiscovery must
+    select 2026-01, never the escaped symlink."""
+    real_period = tmp_path / "2026-01"
+    real_period.mkdir()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "2099-12").symlink_to(outside, target_is_directory=True)
+
+    result = runner.resolve_period_dir(tmp_path, None)
+
+    assert result == real_period.resolve(strict=True)
+
+
+def test_resolve_period_dir_autodiscovery_only_candidate_is_symlink_outside_root(tmp_path):
+    """B. The ONLY YYYY-MM-named child is a symlink outside the private
+    root — it must be excluded entirely, leaving no eligible candidate."""
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "2026-01").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(runner.AcceptanceError) as exc_info:
+        runner.resolve_period_dir(tmp_path, None)
+    assert exc_info.value.reason_code == runner.REASON_PERIOD_NOT_FOUND
+
+
+def test_resolve_period_dir_autodiscovery_excludes_symlink_into_repository(tmp_path):
+    """C. A YYYY-MM-named child symlinked into the repository is excluded
+    from candidates, never selected."""
+    repo_root = Path(runner.__file__).resolve().parents[2]
+    real_period = tmp_path / "2026-01"
+    real_period.mkdir()
+    (tmp_path / "2099-12").symlink_to(repo_root, target_is_directory=True)
+
+    result = runner.resolve_period_dir(tmp_path, None)
+
+    assert result == real_period.resolve(strict=True)
+
+
+def test_resolve_period_dir_autodiscovery_multiple_real_periods_selects_latest(tmp_path):
+    """D. Normal case, multiple real YYYY-MM directories — latest is
+    still correctly selected."""
+    (tmp_path / "2025-10").mkdir()
+    (tmp_path / "2025-11").mkdir()
+    (tmp_path / "2026-02").mkdir()
+
+    result = runner.resolve_period_dir(tmp_path, None)
+
+    assert result == (tmp_path / "2026-02").resolve(strict=True)
+
+
+def test_run_scenario_autodiscovery_escape_never_invokes_scenario_function(monkeypatch, tmp_path, capsys):
+    """E. run_scenario(root, None, ...) with a lexically-latest-looking
+    escaped symlink present — the scenario function must never be
+    invoked with a path outside the private root, and stdout stays the
+    one-line redacted verdict."""
+    real_period = tmp_path / "2026-01"
+    real_period.mkdir()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "2099-12").symlink_to(outside, target_is_directory=True)
+
+    called: list[Path] = []
+
+    def spy(period_dir):
+        called.append(period_dir)
+        return {"scenario": "P1_IMPORT"}
+
+    monkeypatch.setitem(runner.SCENARIOS, "P1_IMPORT", spy)
+
+    result = runner.run_scenario(tmp_path, None, "P1_IMPORT")
+
+    assert result is True  # the real 2026-01 directory is a legitimate selection
+    assert called == [real_period.resolve(strict=True)]  # never the escaped symlink's target
+    captured = capsys.readouterr()
+    assert captured.out == "P1_IMPORT: PASS\n"
+    assert captured.err == ""
+    assert str(outside) not in captured.out
+
+
+# ---------------------------------------------------------------------------
 # P2D_CUTOVER_RECONCILIATION — synthetic end-to-end, public-safe throughout.
 # ---------------------------------------------------------------------------
 
