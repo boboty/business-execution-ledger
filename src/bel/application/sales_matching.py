@@ -93,7 +93,7 @@ from bel.domain.matching import (
     validate_storable_amount,
 )
 from bel.domain.payment import PaymentDirection
-from bel.infrastructure.persistence.database import is_database_busy
+from bel.infrastructure.persistence.database import acquire_serialization_lock, is_database_busy
 from bel.infrastructure.persistence.repositories import (
     InvoiceRepository,
     MatchCaseNotPendingError,
@@ -197,7 +197,13 @@ def propose_sales_invoice_match(
     existing MatchCase (or an identical prior proposal — idempotent
     replay). Never computes candidates itself — `sales_contract_ids` is
     caller-supplied, exactly as docs/PHASE2D1-R0-DECISIONS.md section 2.7
-    requires ("no automatic sales matching algorithm")."""
+    requires ("no automatic sales matching algorithm").
+
+    Phase 2D.1-P: ``acquire_serialization_lock`` closes the same race
+    under PostgreSQL that SQLite's whole-database write lock always
+    implicitly closed for the atomic INSERT this relies on (see
+    ``MatchCaseRepository.add_if_no_case_for_subject``'s docstring)."""
+    acquire_serialization_lock(session)
     invoice = InvoiceRepository(session).get(invoice_id)
     if invoice is None:
         raise SalesMatchError(f"Invoice {invoice_id} not found")
@@ -250,6 +256,7 @@ def propose_sales_payment_match(
     session: Session, *, payment_id: uuid.UUID, sales_contract_ids: Sequence[uuid.UUID], created_at: datetime
 ) -> SalesMatchProposalResult:
     """The `IN` receipt twin of `propose_sales_invoice_match`."""
+    acquire_serialization_lock(session)
     payment = PaymentRepository(session).get(payment_id)
     if payment is None:
         raise SalesMatchError(f"Payment {payment_id} not found")
@@ -316,7 +323,15 @@ def confirm_sales_invoice_match(
     and amount BEFORE writing anything; writes every
     `SalesInvoiceAllocation` and resolves the `MatchCase` atomically
     (via a SAVEPOINT — see the race-handling below), never leaving a
-    partial allocation set behind."""
+    partial allocation set behind.
+
+    Phase 2D.1-P: ``acquire_serialization_lock`` — the capacity check
+    folded into ``SalesInvoiceAllocationRepository.add``'s atomic INSERT
+    is race-free under SQLite's whole-database write lock, but under
+    PostgreSQL two concurrent confirmations could each evaluate the
+    capacity predicate before either commits and both pass, over-
+    allocating the subject. The lock serializes that."""
+    acquire_serialization_lock(session)
     match_case_repo = MatchCaseRepository(session)
     match_case = match_case_repo.get(match_case_id)
     if match_case is None:
@@ -421,6 +436,7 @@ def confirm_sales_payment_match(
     created_at: datetime,
 ) -> SalesMatchConfirmationResult:
     """The `IN` receipt twin of `confirm_sales_invoice_match`."""
+    acquire_serialization_lock(session)
     match_case_repo = MatchCaseRepository(session)
     match_case = match_case_repo.get(match_case_id)
     if match_case is None:

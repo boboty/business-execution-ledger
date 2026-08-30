@@ -97,12 +97,14 @@ class ContractRevisionModel(Base):
             "contract_id",
             unique=True,
             sqlite_where=text("superseded_by_revision_id IS NULL"),
+            postgresql_where=text("superseded_by_revision_id IS NULL"),
         ),
         Index(
             "uq_contract_revisions_one_initial",
             "contract_id",
             unique=True,
             sqlite_where=text("revision_type = 'INITIAL'"),
+            postgresql_where=text("revision_type = 'INITIAL'"),
         ),
         CheckConstraint(
             "revision_type IN ('INITIAL', 'SUPPLEMENT', 'CORRECTION')",
@@ -141,7 +143,7 @@ class ContractRevisionModel(Base):
     # fragment for every revision it writes.
     source_fragment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=True)
     superseded_by_revision_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("contract_revisions.id"), nullable=True, index=True
+        ForeignKey("contract_revisions.id", deferrable=True, initially="DEFERRED"), nullable=True, index=True
     )
     # The exact field names the writing command actually asserted, for
     # exact-replay comparison. See ContractItemRevisionModel's docstring.
@@ -208,12 +210,14 @@ class ContractItemRevisionModel(Base):
             "contract_item_id",
             unique=True,
             sqlite_where=text("superseded_by_revision_id IS NULL"),
+            postgresql_where=text("superseded_by_revision_id IS NULL"),
         ),
         Index(
             "uq_contract_item_revisions_one_initial",
             "contract_item_id",
             unique=True,
             sqlite_where=text("revision_type = 'INITIAL'"),
+            postgresql_where=text("revision_type = 'INITIAL'"),
         ),
         CheckConstraint(
             "revision_type IN ('INITIAL', 'SUPPLEMENT', 'CORRECTION')",
@@ -241,7 +245,7 @@ class ContractItemRevisionModel(Base):
     # requires a real fragment for every revision it writes.
     source_fragment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=True)
     superseded_by_revision_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("contract_item_revisions.id"), nullable=True, index=True
+        ForeignKey("contract_item_revisions.id", deferrable=True, initially="DEFERRED"), nullable=True, index=True
     )
     # The exact field names the writing command actually asserted,
     # captured verbatim (Phase 2D.1-R1 Codex fix round #2) — NOT
@@ -315,12 +319,14 @@ class ShipmentRevisionModel(Base):
             "shipment_id",
             unique=True,
             sqlite_where=text("superseded_by_revision_id IS NULL"),
+            postgresql_where=text("superseded_by_revision_id IS NULL"),
         ),
         Index(
             "uq_shipment_revisions_one_initial",
             "shipment_id",
             unique=True,
             sqlite_where=text("revision_type = 'INITIAL'"),
+            postgresql_where=text("revision_type = 'INITIAL'"),
         ),
         CheckConstraint(
             "revision_type IN ('INITIAL', 'SUPPLEMENT', 'CORRECTION')",
@@ -337,7 +343,7 @@ class ShipmentRevisionModel(Base):
     # re-pointed. See docs/PHASE2D1-R0-DECISIONS.md sections 1.3 and 3.2.
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
     superseded_by_revision_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("shipment_revisions.id"), nullable=True, index=True
+        ForeignKey("shipment_revisions.id", deferrable=True, initially="DEFERRED"), nullable=True, index=True
     )
     # The exact field names the writing command actually asserted,
     # captured verbatim — see ContractItemRevisionModel's docstring for
@@ -400,12 +406,14 @@ class SalesContractRevisionModel(Base):
             "sales_contract_id",
             unique=True,
             sqlite_where=text("superseded_by_revision_id IS NULL"),
+            postgresql_where=text("superseded_by_revision_id IS NULL"),
         ),
         Index(
             "uq_sales_contract_revisions_one_initial",
             "sales_contract_id",
             unique=True,
             sqlite_where=text("revision_type = 'INITIAL'"),
+            postgresql_where=text("revision_type = 'INITIAL'"),
         ),
         CheckConstraint(
             "revision_type IN ('INITIAL', 'SUPPLEMENT', 'CORRECTION')",
@@ -427,7 +435,7 @@ class SalesContractRevisionModel(Base):
     # re-pointed. See docs/PHASE2D1-R0-DECISIONS.md sections 1.3 and 2.2.
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
     superseded_by_revision_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("sales_contract_revisions.id"), nullable=True, index=True
+        ForeignKey("sales_contract_revisions.id", deferrable=True, initially="DEFERRED"), nullable=True, index=True
     )
     # The exact field names the writing command actually asserted,
     # captured verbatim — see ContractItemRevisionModel's docstring for
@@ -517,13 +525,37 @@ class ProcurementSalesLinkCorrectionModel(Base):
 # CHECK constraints cannot reference another table), so it is a trigger,
 # registered via SQLAlchemy DDL events so `Base.metadata.create_all()`
 # (used by in-memory test fixtures) creates it identically to
-# `alembic upgrade head` (see the R3a Slice 2 migration, which issues the
-# same SQL). Attached to the CORRECTIONS table's create/drop events since
-# SQLAlchemy creates tables in FK-dependency order (links before
-# corrections) and drops them in reverse — this guarantees both tables
-# already exist when the trigger is created, and the trigger is dropped
-# before either table goes away.
-_ONE_CURRENT_LINK_TRIGGER_SQL = """
+# `alembic upgrade head`. Attached to the CORRECTIONS table's create/drop
+# events since SQLAlchemy creates tables in FK-dependency order (links
+# before corrections) and drops them in reverse — this guarantees both
+# tables already exist when the trigger is created, and the trigger is
+# dropped before either table goes away.
+#
+# Two dialect-scoped bodies, not one literal translation (Phase 2D.1-P):
+#
+# SQLite (unchanged since Phase 2D.1-R3a Slice 2): the raw `WHEN EXISTS
+# (...) ... RAISE(ABORT, ...)` trigger is safe as-is because SQLite has
+# no concurrent writer to race against in the first place (the whole
+# database has one write lock).
+#
+# PostgreSQL has no such implicit guarantee under READ COMMITTED — two
+# concurrent INSERTs for the SAME (procurement_contract_id,
+# sales_contract_id) could each evaluate the "no current row" EXISTS
+# check before either commits and both pass, even inside a BEFORE INSERT
+# trigger, including from a write that bypasses
+# `serialized_write_transaction` entirely (a raw ORM `session.add` or a
+# direct INSERT from another connection). The PostgreSQL trigger function
+# therefore takes a business-key-scoped `pg_advisory_xact_lock` as its
+# FIRST action, before the existence check — transaction-scoped, released
+# automatically on commit/rollback, and blocking a second concurrent
+# insert for the same key until the first resolves, at which point the
+# EXISTS check correctly observes the committed outcome (or its absence).
+# Inserts for DIFFERENT business keys never contend. This lock is
+# independent of, and not expected to collide with, the single global key
+# `serialized_write_transaction` uses at the application layer (see
+# `database.py`'s `_WRITE_LOCK_KEY`) — different key space, and even a
+# collision would only cost extra (harmless) waiting.
+_ONE_CURRENT_LINK_TRIGGER_SQLITE = """
 CREATE TRIGGER trg_procurement_sales_links_one_current
 BEFORE INSERT ON procurement_sales_links
 FOR EACH ROW
@@ -541,15 +573,55 @@ BEGIN
 END;
 """
 
+_ONE_CURRENT_LINK_TRIGGER_POSTGRESQL = """
+CREATE FUNCTION trg_procurement_sales_links_one_current_fn() RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(NEW.procurement_contract_id::text || ':' || NEW.sales_contract_id::text, 0)
+    );
+    IF EXISTS (
+        SELECT 1 FROM procurement_sales_links existing
+        WHERE existing.procurement_contract_id = NEW.procurement_contract_id
+          AND existing.sales_contract_id = NEW.sales_contract_id
+          AND NOT EXISTS (
+              SELECT 1 FROM procurement_sales_link_corrections c
+              WHERE c.superseded_link_id = existing.id
+          )
+    ) THEN
+        RAISE EXCEPTION 'one current assertion episode per relationship business key';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_procurement_sales_links_one_current
+BEFORE INSERT ON procurement_sales_links
+FOR EACH ROW
+EXECUTE FUNCTION trg_procurement_sales_links_one_current_fn();
+"""
+
 event.listen(
     ProcurementSalesLinkCorrectionModel.__table__,
     "after_create",
-    DDL(_ONE_CURRENT_LINK_TRIGGER_SQL),
+    DDL(_ONE_CURRENT_LINK_TRIGGER_SQLITE).execute_if(dialect="sqlite"),
+)
+event.listen(
+    ProcurementSalesLinkCorrectionModel.__table__,
+    "after_create",
+    DDL(_ONE_CURRENT_LINK_TRIGGER_POSTGRESQL).execute_if(dialect="postgresql"),
 )
 event.listen(
     ProcurementSalesLinkCorrectionModel.__table__,
     "before_drop",
-    DDL("DROP TRIGGER IF EXISTS trg_procurement_sales_links_one_current"),
+    DDL("DROP TRIGGER IF EXISTS trg_procurement_sales_links_one_current").execute_if(dialect="sqlite"),
+)
+event.listen(
+    ProcurementSalesLinkCorrectionModel.__table__,
+    "before_drop",
+    DDL(
+        "DROP TRIGGER IF EXISTS trg_procurement_sales_links_one_current ON procurement_sales_links; "
+        "DROP FUNCTION IF EXISTS trg_procurement_sales_links_one_current_fn()"
+    ).execute_if(dialect="postgresql"),
 )
 
 

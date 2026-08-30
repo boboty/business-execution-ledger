@@ -63,6 +63,7 @@ from bel.domain.matching import (
 )
 from bel.domain.normalize import normalize_counterparty
 from bel.domain.payment import PaymentDirection
+from bel.infrastructure.persistence.database import acquire_serialization_lock
 from bel.infrastructure.persistence.repositories import (
     ContractRepository,
     EventRepository,
@@ -398,7 +399,15 @@ def confirm_match(session: Session, match_case_id: uuid.UUID, contract_id: uuid.
     contract_id need not be one of the pre-computed MatchCandidates — a
     human may know something M001 can't (spec section 26) — but the same
     capacity guard from the automated pass still applies: this CLI is
-    not a bypass for over-allocating a contract."""
+    not a bypass for over-allocating a contract.
+
+    Phase 2D.1-P: the capacity check below and the allocation write have
+    no DB-level backstop of their own (unlike the sales-leg twin, which
+    folds its capacity check into the atomic INSERT itself), so under
+    PostgreSQL's weaker default isolation this needs
+    ``acquire_serialization_lock`` to stay race-free, exactly as it
+    always implicitly was under SQLite's whole-database write lock."""
+    acquire_serialization_lock(session)
     now = datetime.now(timezone.utc)
     match_case_repo = MatchCaseRepository(session)
     contract_repo = ContractRepository(session)

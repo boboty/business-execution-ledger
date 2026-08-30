@@ -80,6 +80,31 @@ from bel.infrastructure.persistence.models import (
 )
 
 
+def _defer_fk_checks(session: Session) -> None:
+    """Defer FK constraint checking to this transaction's commit —
+    dialect-dispatched. Needed by every ``append_revision_against_current``
+    below: the retiring UPDATE momentarily points a row's
+    ``superseded_by_revision_id`` at the new revision's id before that row
+    is inserted (retire-then-insert is the order the partial unique index
+    requires), which an immediately-checked FK would otherwise reject.
+
+    SQLite: ``PRAGMA defer_foreign_keys = ON`` defers ALL FK checks to
+    commit regardless of how the constraint was declared, and resets
+    automatically at the end of every transaction — set fresh here rather
+    than once at connect time (unchanged since Phase 2C.1).
+
+    PostgreSQL: constraint-level deferrability is a DDL-time property —
+    ``SET CONSTRAINTS ALL DEFERRED`` only has an effect on constraints the
+    schema already declared ``DEFERRABLE`` (see the 4 self-referential
+    ``superseded_by_revision_id`` FKs in models.py / the PostgreSQL
+    baseline migration, the only columns this is called for)."""
+    dialect = session.get_bind().dialect.name
+    if dialect == "postgresql":
+        session.execute(text("SET CONSTRAINTS ALL DEFERRED"))
+    else:
+        session.execute(text("PRAGMA defer_foreign_keys = ON"))
+
+
 def _document_to_domain(m: EvidenceDocumentModel) -> EvidenceDocument:
     return EvidenceDocument(
         id=m.id, file_name=m.file_name, sha256=m.sha256, source_type=m.source_type, imported_at=m.imported_at
@@ -497,7 +522,7 @@ class ContractRepository:
                 "append_revision_against_current only accepts revision_type SUPPLEMENT or CORRECTION, got "
                 f"{revision.revision_type!r}"
             )
-        self._session.execute(text("PRAGMA defer_foreign_keys = ON"))
+        _defer_fk_checks(self._session)
         result = self._session.execute(
             update(ContractRevisionModel)
             .where(
@@ -769,7 +794,7 @@ class ContractItemRepository:
         # happened — without weakening the FK constraint itself; SQLite
         # resets it automatically at the end of every transaction, so it
         # is set fresh here rather than once at connect time.
-        self._session.execute(text("PRAGMA defer_foreign_keys = ON"))
+        _defer_fk_checks(self._session)
         result = self._session.execute(
             update(ContractItemRevisionModel)
             .where(
@@ -1005,7 +1030,7 @@ class ShipmentRepository:
         # itself is inserted, and SQLite's connect-time
         # `PRAGMA foreign_keys=ON` would otherwise reject a reference to
         # a row that does not exist yet.
-        self._session.execute(text("PRAGMA defer_foreign_keys = ON"))
+        _defer_fk_checks(self._session)
         result = self._session.execute(
             update(ShipmentRevisionModel)
             .where(
@@ -1259,7 +1284,7 @@ class SalesContractRepository:
         # itself is inserted, and SQLite's connect-time
         # `PRAGMA foreign_keys=ON` would otherwise reject a reference to
         # a row that does not exist yet.
-        self._session.execute(text("PRAGMA defer_foreign_keys = ON"))
+        _defer_fk_checks(self._session)
         result = self._session.execute(
             update(SalesContractRevisionModel)
             .where(
@@ -1541,10 +1566,16 @@ class ProcurementSalesLinkRepository:
         stmt = links.insert().from_select(
             ["id", "procurement_contract_id", "sales_contract_id", "source_fragment_id", "confirmation_type", "created_at"],
             select_values,
-        )
-        result = self._session.execute(stmt)
+        ).returning(links.c.id)
+        # Never trust result.rowcount for INSERT...FROM SELECT — confirmed
+        # empirically that SQLAlchemy's PostgreSQL/psycopg dialect reports
+        # -1 (unsupported) for this statement shape even when a row WAS
+        # inserted, which would silently make every caller of this method
+        # believe it always lost the race. `.returning(...)` + checking
+        # whether a row came back is portable across SQLite and PostgreSQL.
+        inserted = self._session.execute(stmt).fetchone() is not None
         self._session.flush()
-        return result.rowcount == 1
+        return inserted
 
     def get_correction_for_superseded(self, superseded_link_id: uuid.UUID) -> ProcurementSalesLinkCorrection | None:
         m = self._session.scalar(
@@ -1580,10 +1611,12 @@ class ProcurementSalesLinkRepository:
                 "created_at",
             ],
             select_values,
-        )
-        result = self._session.execute(stmt)
+        ).returning(corrections.c.id)
+        # See insert_episode_if_no_current's comment — never trust
+        # result.rowcount for INSERT...FROM SELECT.
+        inserted = self._session.execute(stmt).fetchone() is not None
         self._session.flush()
-        return result.rowcount == 1
+        return inserted
 
     def count(self) -> int:
         return len(self._session.scalars(select(ProcurementSalesLinkModel.id)).all())
@@ -1890,10 +1923,13 @@ class MatchCaseRepository:
         stmt = table.insert().from_select(
             ["id", "subject_type", "subject_id", "status", "match_method", "created_at", "resolved_at"],
             select_values,
-        )
-        result = self._session.execute(stmt)
+        ).returning(table.c.id)
+        # Never trust result.rowcount for INSERT...FROM SELECT — see
+        # ProcurementSalesLinkRepository.insert_episode_if_no_current's
+        # comment for why.
+        inserted = self._session.execute(stmt).fetchone() is not None
         self._session.flush()
-        return result.rowcount == 1
+        return inserted
 
     def resolve_if_pending(self, match_case_id: uuid.UUID, *, resolved_at: datetime) -> bool:
         """Phase 2D.1-R3b: the atomic conditional counterpart to
@@ -2155,9 +2191,12 @@ class SalesInvoiceAllocationRepository:
         stmt = table.insert().from_select(
             ["id", "invoice_id", "sales_contract_id", "match_case_id", "allocated_gross_amount", "confirmation_type", "created_at"],
             select_values,
-        )
-        result = self._session.execute(stmt)
-        if result.rowcount != 1:
+        ).returning(table.c.id)
+        # Never trust result.rowcount for INSERT...FROM SELECT — see
+        # ProcurementSalesLinkRepository.insert_episode_if_no_current's
+        # comment for why.
+        inserted = self._session.execute(stmt).fetchone() is not None
+        if not inserted:
             # Either a genuine cross-session race was lost, or the
             # pre-existing state already made this ineligible — diagnose
             # with a FRESH, identity-map-bypassing column read (never the
@@ -2286,9 +2325,12 @@ class SalesPaymentAllocationRepository:
         stmt = table.insert().from_select(
             ["id", "payment_id", "sales_contract_id", "match_case_id", "allocated_amount", "confirmation_type", "created_at"],
             select_values,
-        )
-        result = self._session.execute(stmt)
-        if result.rowcount != 1:
+        ).returning(table.c.id)
+        # Never trust result.rowcount for INSERT...FROM SELECT — see
+        # ProcurementSalesLinkRepository.insert_episode_if_no_current's
+        # comment for why.
+        inserted = self._session.execute(stmt).fetchone() is not None
+        if not inserted:
             # Diagnose with a FRESH, identity-map-bypassing column read —
             # see the identical note in SalesInvoiceAllocationRepository.add.
             fresh_status = self._session.execute(
