@@ -308,6 +308,29 @@ table.grid a:hover { text-decoration: underline; }
 .form-actions { margin-top: 10px; }
 .form-error { color: var(--danger); font-size: 13px; margin: 8px 0 0; }
 
+/* ---- contract business ledger ---- */
+.ledger-filter-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 14px;
+}
+.filter-field { display: flex; flex-direction: column; gap: 4px; }
+.filter-field label { color: var(--muted); font-size: 12px; }
+.filter-field input[type="text"] {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  background: var(--panel);
+}
+.filter-field-checkbox { flex-direction: row; align-items: center; }
+.filter-field-checkbox label { display: flex; align-items: center; gap: 6px; color: var(--ink); font-size: 13px; }
+.ledger-grid td { white-space: normal; }
+.ledger-nested-list { margin: 6px 0 0; padding-left: 16px; font-size: 12px; }
+.ledger-nested-list li { margin-bottom: 4px; }
+.empty-cell { color: var(--muted); font-size: 12px; }
+
 /* ---- invoice block ---- */
 .invoice-block { border-top: 1px solid var(--line); padding: 10px 0; }
 .invoice-block > summary {

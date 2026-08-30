@@ -615,6 +615,132 @@ class ContractDecisionsVM:
         self.has_any = bool(self.reversals or self.accruals or self.candidates or self.differences or self.blockers)
 
 
+UNRESOLVED_WORK_BADGE_LABEL = "有未结事项"
+NO_UNRESOLVED_WORK_LABEL = "无"
+UNKNOWN_CUSTOMER_LABEL = "客户待补充"
+
+OUTBOUND_INVOICE_STATE_NOTE = "对外开票准备状态将在 2D.3 的 eligibility rule freeze 后提供。"
+
+
+class LedgerShipmentVM:
+    def __init__(self, shipment, item_by_id: dict) -> None:
+        self.external_reference = shipment.external_reference or "—"
+        self.execution_date = _fmt(shipment.execution_date)
+        self.quantity = _fmt(shipment.quantity)
+        self.item = ItemPresentationVM(item_by_id.get(shipment.contract_item_id))
+
+
+class LedgerProcurementInvoiceVM:
+    def __init__(self, entry) -> None:
+        invoice = entry.invoice
+        self.invoice_no = (invoice.external_invoice_key or invoice.invoice_no or "—") if invoice else "—"
+        self.allocated_gross_amount = _fmt(entry.allocation.allocated_gross_amount)
+        self.confirmation_type_label = CONFIRMATION_TYPE_LABELS.get(
+            entry.allocation.confirmation_type, entry.allocation.confirmation_type
+        )
+
+
+class LedgerOutgoingPaymentVM:
+    def __init__(self, entry) -> None:
+        payment = entry.payment
+        self.bank_reference = (payment.bank_reference or str(payment.id)) if payment else "—"
+        self.allocated_amount = _fmt(entry.allocation.allocated_amount)
+        self.confirmation_type_label = CONFIRMATION_TYPE_LABELS.get(
+            entry.allocation.confirmation_type, entry.allocation.confirmation_type
+        )
+
+
+class LedgerAccrualVM:
+    def __init__(self, entry, item_by_id: dict) -> None:
+        self.item = ItemPresentationVM(item_by_id.get(entry.contract_item_id))
+        self.period = entry.accrual.period
+        self.remaining_quantity = _fmt(entry.remaining_quantity)
+        self.remaining_estimated_cost = _fmt(entry.remaining_estimated_cost)
+        self.reversed_quantity = _fmt(entry.reversed_quantity)
+        self.reversed_estimated_cost = _fmt(entry.reversed_estimated_cost)
+        # Current persisted state only — legitimately allowed "已冲销".
+        self.status_label = CURRENT_STATUS_LABELS.get(entry.projected_status, entry.projected_status)
+
+
+class LedgerSalesInvoiceAllocationVM:
+    def __init__(self, entry) -> None:
+        invoice = entry.invoice
+        self.invoice_no = (invoice.external_invoice_key or invoice.invoice_no or "—") if invoice else "—"
+        self.allocated_gross_amount = _fmt(entry.allocation.allocated_gross_amount)
+
+
+class LedgerIncomingReceiptAllocationVM:
+    def __init__(self, entry) -> None:
+        payment = entry.payment
+        self.bank_reference = (payment.bank_reference or str(payment.id)) if payment else "—"
+        self.allocated_amount = _fmt(entry.allocation.allocated_amount)
+
+
+class LedgerSalesScopeVM:
+    """ONE linked SalesContract's own confirmed facts — never a figure
+    attributed to the procurement row it is displayed on (spec section
+    13). The same SalesContract may legitimately appear, with the SAME
+    values, under more than one procurement row."""
+
+    def __init__(self, scope) -> None:
+        sc = scope.sales_contract
+        self.sales_contract_id = sc.id
+        self.sales_contract_no = sc.sales_contract_no
+        self.our_entity = sc.our_entity
+        self.customer = sc.customer or UNKNOWN_CUSTOMER_LABEL
+        self.customer_known = sc.customer is not None
+        self.currency = sc.currency or "—"
+        self.gross_amount = _fmt(sc.gross_amount)
+        self.contract_date = _fmt(sc.contract_date)
+        self.sales_invoice_allocations = [LedgerSalesInvoiceAllocationVM(a) for a in scope.sales_invoice_allocations]
+        self.incoming_receipt_allocations = [
+            LedgerIncomingReceiptAllocationVM(a) for a in scope.incoming_receipt_allocations
+        ]
+        self.has_unresolved = scope.has_unresolved
+
+
+class LedgerRowVM:
+    def __init__(self, row) -> None:
+        contract = row.contract
+        self.contract_id = contract.id
+        self.contract_no = contract.contract_no
+        self.supplier = contract.counterparty or "—"
+        self.our_entity = contract.buyer or "—"
+        self.gross_amount = _fmt(contract.gross_amount)
+        self.currency = contract.currency
+        self.contract_date = _fmt(contract.contract_date)
+
+        item_by_id = {item.id: item for item in row.items}
+        self.items = [ItemPresentationVM(item) for item in row.items]
+        self.item_count = len(row.items)
+        self.shipments = [LedgerShipmentVM(s.shipment, item_by_id) for s in row.shipments]
+        self.procurement_invoices = [LedgerProcurementInvoiceVM(i) for i in row.procurement_invoices]
+        self.outgoing_payments = [LedgerOutgoingPaymentVM(p) for p in row.outgoing_payments]
+        self.accruals = [LedgerAccrualVM(a, item_by_id) for a in row.accruals]
+        self.sales_scopes = [LedgerSalesScopeVM(s) for s in row.sales_scopes]
+        self.unresolved_summaries = [w.summary for w in row.unresolved_work]
+        self.has_unresolved = row.has_unresolved
+        self.unresolved_label = UNRESOLVED_WORK_BADGE_LABEL if row.has_unresolved else NO_UNRESOLVED_WORK_LABEL
+
+
+class LedgerFiltersVM:
+    def __init__(self, filters) -> None:
+        self.contract_no = filters.contract_no or ""
+        self.supplier = filters.supplier or ""
+        self.our_entity = filters.our_entity or ""
+        self.sales_contract_no = filters.sales_contract_no or ""
+        self.customer = filters.customer or ""
+        self.has_unresolved = filters.has_unresolved
+
+
+class ContractBusinessLedgerVM:
+    def __init__(self, ledger) -> None:
+        self.rows = [LedgerRowVM(r) for r in ledger.rows]
+        self.filters = LedgerFiltersVM(ledger.filters)
+        self.row_count = len(self.rows)
+        self.outbound_invoice_state_note = OUTBOUND_INVOICE_STATE_NOTE
+
+
 class Contract360VM:
     def __init__(self, dto: Contract360, period: str) -> None:
         contract = dto.contract

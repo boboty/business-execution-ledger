@@ -15,12 +15,17 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from bel.application.allocate_invoice_item import execute_manual_item_allocation
 from bel.application.contract_360 import get_contract_360
+from bel.application.contract_business_ledger import ContractLedgerFilters, get_contract_business_ledger
+from bel.application.contract_ledger_export import (
+    export_contract_business_ledger_csv,
+    export_contract_business_ledger_xlsx,
+)
 from bel.application.period_close_workbench import get_period_close_workbench, list_known_periods
 from bel.application.search_contracts import search_contracts_by_no
 from bel.infrastructure.persistence.database import is_database_busy
@@ -116,6 +121,77 @@ def contract_360_page(
     vm = viewmodels.Contract360VM(dto, period)
     return _templates(request).TemplateResponse(
         request, "contract_360.html", {"page": "contract-360", "vm": vm}
+    )
+
+
+def _bool_filter(value: str | None) -> bool | None:
+    if value is None or value == "":
+        return None
+    if value.lower() in ("1", "true", "yes"):
+        return True
+    if value.lower() in ("0", "false", "no"):
+        return False
+    return None
+
+
+def _ledger_filters_from_query(request: Request) -> ContractLedgerFilters:
+    """Web only parses query args; Application layer
+    (ContractLedgerFilters / get_contract_business_ledger) owns filter
+    semantics — no SQL/raw field expression is ever built here."""
+    q = request.query_params
+    return ContractLedgerFilters(
+        contract_no=q.get("contract_no") or None,
+        supplier=q.get("supplier") or None,
+        our_entity=q.get("our_entity") or None,
+        sales_contract_no=q.get("sales_contract_no") or None,
+        customer=q.get("customer") or None,
+        has_unresolved=_bool_filter(q.get("has_unresolved")),
+    )
+
+
+@router.get("/contract-ledger", response_class=HTMLResponse)
+def contract_ledger_page(
+    request: Request,
+    session: Session = Depends(_session),
+) -> HTMLResponse:
+    with session.no_autoflush:
+        filters = _ledger_filters_from_query(request)
+        ledger = get_contract_business_ledger(session, filters)
+    vm = viewmodels.ContractBusinessLedgerVM(ledger)
+    return _templates(request).TemplateResponse(
+        request, "contract_ledger.html", {"page": "contract-ledger", "vm": vm}
+    )
+
+
+@router.get("/contract-ledger/export.csv")
+def contract_ledger_export_csv(
+    request: Request,
+    session: Session = Depends(_session),
+) -> Response:
+    with session.no_autoflush:
+        filters = _ledger_filters_from_query(request)
+        ledger = get_contract_business_ledger(session, filters)
+    content = export_contract_business_ledger_csv(ledger)
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=contract-business-ledger.csv"},
+    )
+
+
+@router.get("/contract-ledger/export.xlsx")
+def contract_ledger_export_xlsx(
+    request: Request,
+    session: Session = Depends(_session),
+) -> Response:
+    with session.no_autoflush:
+        filters = _ledger_filters_from_query(request)
+        ledger = get_contract_business_ledger(session, filters)
+    content = export_contract_business_ledger_xlsx(ledger)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=contract-business-ledger.xlsx"},
     )
 
 
