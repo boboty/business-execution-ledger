@@ -19,3 +19,10 @@ __pycache__/
 *.db-journal
 *.db-shm
 *.db-wal
+
+# Local database runtime credentials (BEL_DATABASE_URL, etc.) — never
+# committed. See .env.example for the placeholder template and
+# docs/PERSISTENCE-MIGRATION-POLICY.md for the runtime contract.
+.env
+.env.local
+.env.*.local

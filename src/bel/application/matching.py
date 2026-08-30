@@ -302,6 +302,16 @@ def _run_match_pass(
 
 
 def match_invoices(session: Session) -> MatchRunSummary:
+    """Phase 2D.1-P: acquire_serialization_lock() is the FIRST action,
+    before any read — this is a production read-check-write batch writer
+    (read current MatchCase state, read allocation capacity, decide,
+    write MatchCase + allocation), and SQLite's implicit whole-database
+    write lock always serialized it against every other writer
+    (including a concurrent confirm_match / another match pass)
+    for free. PostgreSQL's weaker default isolation has no such implicit
+    guarantee, so this now takes the same shared advisory lock every
+    other manual/batch writer takes, closing the same race class."""
+    acquire_serialization_lock(session)
     now = datetime.now(timezone.utc)
     contract_repo = ContractRepository(session)
     invoice_repo = InvoiceRepository(session)
@@ -349,6 +359,9 @@ def match_invoices(session: Session) -> MatchRunSummary:
 
 
 def match_payments(session: Session) -> MatchRunSummary:
+    """The OUT-payment twin of match_invoices — see its docstring for
+    why acquire_serialization_lock() is the first action here too."""
+    acquire_serialization_lock(session)
     now = datetime.now(timezone.utc)
     contract_repo = ContractRepository(session)
     payment_repo = PaymentRepository(session)

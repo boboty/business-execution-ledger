@@ -1,7 +1,7 @@
 import os
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config
+from sqlalchemy import create_engine, engine_from_config
 from sqlalchemy import pool
 
 from alembic import context
@@ -17,9 +17,22 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Allow overriding the DB URL (e.g. for tests) without editing alembic.ini.
-if os.environ.get("BEL_DATABASE_URL"):
-    config.set_main_option("sqlalchemy.url", os.environ["BEL_DATABASE_URL"])
+# BEL_DATABASE_URL is BEL's ONE runtime configuration contract (see
+# docs/PERSISTENCE-MIGRATION-POLICY.md) — read directly from the
+# environment into a plain local variable, and NEVER round-tripped
+# through alembic.ini's ConfigParser-backed Config object below.
+# `Config.set_main_option`/`get_section` apply ConfigParser's
+# BasicInterpolation to stored values, which treats a bare `%` as the
+# start of a `%(name)s` reference — a URL-encoded password containing
+# `%40`, `%25`, etc. (entirely valid, common for special characters)
+# raises `ValueError: invalid interpolation syntax` the moment it's
+# stored, before any connection is even attempted. Reading the URL
+# straight from `os.environ` and handing it directly to
+# `create_engine()`/`context.configure(url=...)` sidesteps that parser
+# entirely — no decoding, no rebuilding, no parallel credential parser;
+# the string SQLAlchemy receives is byte-for-byte what BEL_DATABASE_URL
+# contains.
+DATABASE_URL = os.environ.get("BEL_DATABASE_URL")
 
 target_metadata = Base.metadata
 
@@ -41,7 +54,7 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
+    url = DATABASE_URL or config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -61,11 +74,14 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    if DATABASE_URL:
+        connectable = create_engine(DATABASE_URL, poolclass=pool.NullPool)
+    else:
+        connectable = engine_from_config(
+            config.get_section(config.config_ini_section, {}),
+            prefix="sqlalchemy.",
+            poolclass=pool.NullPool,
+        )
 
     with connectable.connect() as connection:
         context.configure(

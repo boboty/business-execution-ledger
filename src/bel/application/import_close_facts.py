@@ -34,7 +34,7 @@ from sqlalchemy.orm import Session
 from bel.adapters.common import compute_sha256
 from bel.application.contract_item_facts import create_contract_item_fact
 from bel.application.item_allocation import validate_item_allocation
-from bel.infrastructure.persistence.database import is_database_busy
+from bel.infrastructure.persistence.database import acquire_serialization_lock, is_database_busy
 from bel.domain.accrual import (
     Accrual,
     AccrualBasisFact,
@@ -244,8 +244,21 @@ def import_close_facts(session: Session, file_path: Path) -> CloseFactImportResu
     """Import a Close Fact Pack. A SQLite busy/lock error (a concurrent
     writer holding the write lock) is surfaced as a controlled
     ``CloseFactPackError`` after rolling the whole transaction back — the
-    import never leaves partial business state."""
+    import never leaves partial business state.
+
+    Phase 2D.1-P write-path audit (Part B): this writes
+    InvoiceItemAllocation through a plain read-check-write (a capacity
+    check via ``validate_item_allocation`` followed by a plain
+    ``alloc_repo.add()``, no atomic CAS) — the SAME table
+    ``allocate_invoice_item.execute_manual_item_allocation`` writes
+    through ``serialized_write_transaction``. Under SQLite the whole-
+    database write lock made the two mutually exclusive for free; under
+    PostgreSQL they would not otherwise contend, so this now takes the
+    same shared advisory lock as its first action too — closing that
+    race, not merely translating the SQLite busy signal this already
+    did."""
     try:
+        acquire_serialization_lock(session)
         return _import_close_facts(session, file_path)
     except OperationalError as exc:
         session.rollback()

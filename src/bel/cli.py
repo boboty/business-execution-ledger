@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import functools
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 import click
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 
 from bel.application.accrual_queries import get_accrual_view, list_accrual_views
@@ -75,6 +77,33 @@ from bel.infrastructure.persistence.schema_gate import SchemaNotAtHeadError, ass
 def _session_factory(database_url: str):
     engine = make_engine(database_url)
     return make_session_factory(engine)
+
+
+def _translate_database_busy(f):
+    """Phase 2D.1-P shared exception-translation boundary: an
+    ``OperationalError`` from a PostgreSQL advisory-lock timeout
+    (``acquire_serialization_lock`` / ``serialized_write_transaction``,
+    e.g. under concurrent ``match invoices``/``match payments``/``match
+    confirm``/``sales-match ... propose``/``sales-match ... confirm``) —
+    or SQLite's equivalent busy/locked error — must never surface as a
+    raw traceback from a normal production CLI operation. One shared
+    decorator rather than duplicating this try/except in every command;
+    apply it closest to the command body (below ``@click.pass_context``).
+    ``is_database_busy`` only inspects the driver's SQLSTATE/message
+    text, never the connection URL, so this never risks a credential
+    leak."""
+
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except OperationalError as exc:
+            if is_database_busy(exc):
+                click.echo("Error: database is busy; retry when the other write completes")
+                raise SystemExit(1) from exc
+            raise
+
+    return wrapper
 
 
 @click.group()
@@ -412,6 +441,7 @@ def match_group() -> None:
 
 @match_group.command("invoices")
 @click.pass_context
+@_translate_database_busy
 def match_invoices_cmd(ctx: click.Context) -> None:
     """Run M001 against all unmatched PURCHASE invoices."""
     session_factory = _session_factory(ctx.obj["database_url"])
@@ -422,6 +452,7 @@ def match_invoices_cmd(ctx: click.Context) -> None:
 
 @match_group.command("payments")
 @click.pass_context
+@_translate_database_busy
 def match_payments_cmd(ctx: click.Context) -> None:
     """Run M001 against all unmatched OUT payments."""
     session_factory = _session_factory(ctx.obj["database_url"])
@@ -432,6 +463,7 @@ def match_payments_cmd(ctx: click.Context) -> None:
 
 @match_group.command("run")
 @click.pass_context
+@_translate_database_busy
 def match_run_cmd(ctx: click.Context) -> None:
     """Run M001 against both invoices and payments."""
     session_factory = _session_factory(ctx.obj["database_url"])
@@ -474,6 +506,7 @@ def match_list(ctx: click.Context, status: str | None) -> None:
 @click.argument("match_case_id", type=click.UUID)
 @click.option("--contract", "contract_id", type=click.UUID, required=True, help="Contract to confirm the match against.")
 @click.pass_context
+@_translate_database_busy
 def match_confirm(ctx: click.Context, match_case_id: uuid.UUID, contract_id: uuid.UUID) -> None:
     session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
@@ -1535,6 +1568,7 @@ def sales_match_invoice_group() -> None:
 @click.option("--invoice", "invoice_id", type=click.UUID, required=True)
 @click.option("--sales-contract", "sales_contract_ids", type=click.UUID, required=True, multiple=True, help="Repeatable.")
 @click.pass_context
+@_translate_database_busy
 def sales_match_invoice_propose(ctx: click.Context, invoice_id, sales_contract_ids) -> None:
     """Propose one or more candidate SalesContracts for a SALES invoice
     — creates a HUMAN_CONFIRMATION_REQUIRED MatchCase. Candidates are
@@ -1562,6 +1596,7 @@ def sales_match_invoice_propose(ctx: click.Context, invoice_id, sales_contract_i
     help="Repeatable <sales_contract_id>:<amount>, e.g. --allocate 11111111-.../60.00",
 )
 @click.pass_context
+@_translate_database_busy
 def sales_match_invoice_confirm(ctx: click.Context, match_case_id, raw_allocations) -> None:
     """Confirm a proposed MatchCase with the COMPLETE allocation set for
     this invoice in one submission — never a single-target call."""
@@ -1593,6 +1628,7 @@ def sales_match_payment_group() -> None:
 @click.option("--payment", "payment_id", type=click.UUID, required=True)
 @click.option("--sales-contract", "sales_contract_ids", type=click.UUID, required=True, multiple=True, help="Repeatable.")
 @click.pass_context
+@_translate_database_busy
 def sales_match_payment_propose(ctx: click.Context, payment_id, sales_contract_ids) -> None:
     """Propose one or more candidate SalesContracts for an IN payment."""
     session_factory = _session_factory(ctx.obj["database_url"])
@@ -1614,6 +1650,7 @@ def sales_match_payment_propose(ctx: click.Context, payment_id, sales_contract_i
 @click.option("--match-case", "match_case_id", type=click.UUID, required=True)
 @click.option("--allocate", "raw_allocations", multiple=True, required=True, help="Repeatable <sales_contract_id>:<amount>.")
 @click.pass_context
+@_translate_database_busy
 def sales_match_payment_confirm(ctx: click.Context, match_case_id, raw_allocations) -> None:
     """Confirm a proposed MatchCase with the COMPLETE allocation set for
     this payment in one submission."""
@@ -1739,6 +1776,22 @@ def web_cmd(ctx: click.Context, host: str, port: int) -> None:
     never opens a browser.
     """
     database_url = ctx.obj["database_url"]
+    # Phase 2D.1-P Blocker 4: `bel web` is the official production Web
+    # entry point and must enforce the frozen contract (PostgreSQL =
+    # production, SQLite = test-only convenience) explicitly — not just
+    # by documentation. This check belongs HERE, not inside
+    # create_app()/DatabaseRuntime: those stay dialect-agnostic on
+    # purpose, since tests construct a Web app directly against an
+    # injected SQLite runtime (create_app(f"sqlite:///{path}"), bypassing
+    # this CLI command entirely) and must keep doing so unchanged.
+    dialect = make_url(database_url).get_backend_name()
+    if dialect != "postgresql":
+        raise click.ClickException(
+            f"bel web requires a PostgreSQL database (got dialect {dialect!r}) — SQLite is a "
+            "test-only convenience with no active Alembic chain and no concurrent-Web guarantee, "
+            "never the runtime for the official Web entry point. Pass "
+            "--database-url postgresql+psycopg://... or set BEL_DATABASE_URL."
+        )
     if host not in ("127.0.0.1", "::1", "localhost"):
         click.echo(
             "WARNING: BEL may display private business data.\n"

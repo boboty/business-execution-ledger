@@ -23,6 +23,9 @@ tests never interfere with each other.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import threading
 import uuid
 from datetime import date, datetime, timezone
@@ -49,20 +52,26 @@ from bel.application.import_bank import import_bank_statement
 from bel.application.import_close_facts import import_close_facts
 from bel.application.import_contract_ledger import import_contract_ledger
 from bel.application.import_invoices import import_invoices
+from bel.application.matching import match_invoices, match_payments
 from bel.application.period_close_workbench import get_period_close_workbench
 from bel.application.procurement_sales_link import add_procurement_sales_link
 from bel.application.sales_contract_facts import create_sales_contract_fact
 from bel.application.sales_matching import confirm_sales_invoice_match, propose_sales_invoice_match
+from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
 from bel.domain.invoice import Invoice, InvoiceDirection
 from bel.domain.matching import ConfirmationType
+from bel.domain.payment import Payment, PaymentDirection
 from bel.domain.procurement_sales_link import ConfirmationType as LinkConfirmationType
 from bel.infrastructure.persistence.database import DatabaseRuntime, is_database_busy, make_engine, make_session_factory
 from bel.infrastructure.persistence.models import Base
 from bel.infrastructure.persistence.repositories import (
     ContractRepository,
     EvidenceRepository,
+    InvoiceAllocationRepository,
     InvoiceRepository,
+    MatchCaseRepository,
+    PaymentAllocationRepository,
     PaymentRepository,
     SalesInvoiceAllocationRepository,
 )
@@ -78,6 +87,7 @@ from tests.conftest import write_invoice_workbook, write_ledger_workbook
 from tests.web.conftest import _confirm_contract_allocations
 
 NOW = datetime.now(timezone.utc)
+REPO_ROOT = Path(__file__).parent.parent.parent
 
 pytestmark = pytest.mark.postgres
 
@@ -400,3 +410,268 @@ def test_procurement_sales_link_trigger_survives_raw_concurrent_inserts(pg_runti
             {"p": str(contract_id), "s": str(sales_contract_id)},
         ).scalar_one()
         assert rows == 1
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 2 — procurement M001 batch matching (match_invoices / match_payments)
+# concurrency, real PostgreSQL sessions, no mocked locking.
+# ---------------------------------------------------------------------------
+
+
+def _seed_m001_contract(database_url: str, *, gross_amount: Decimal, counterparty: str) -> uuid.UUID:
+    engine = make_engine(database_url)
+    with make_session_factory(engine)() as session:
+        frag = _make_fragment(session)
+        contract = Contract(
+            id=uuid.uuid4(), contract_no=f"C-M001-{uuid.uuid4().hex[:8]}", contract_type=None,
+            counterparty=counterparty, buyer="Our Entity", gross_amount=gross_amount, currency="CNY",
+            contract_date=date(2026, 1, 1), current_source_fragment_id=frag.id, created_at=NOW, updated_at=NOW,
+        )
+        ContractRepository(session).add(contract)
+        session.commit()
+        contract_id = contract.id
+    engine.dispose()
+    return contract_id
+
+
+def test_concurrent_match_invoices_against_the_same_eligible_invoice_exactly_one_wins(pg_runtime):
+    """BLOCKER 2 required test A: two independent PostgreSQL sessions
+    concurrently run the full match_invoices() batch pass against the
+    SAME single eligible PURCHASE invoice (a unique-candidate match —
+    M001's EXACT_COUNTERPARTY_AMOUNT_UNIQUE case). MatchCaseModel has no
+    DB-level uniqueness on (subject_type, subject_id) by design (a
+    subject may legitimately have several MatchCases across different
+    Contracts) — so without acquire_serialization_lock() covering the
+    whole read-check-write pass, both sessions could observe "not yet
+    matched" and both write an authoritative MatchCase + InvoiceAllocation
+    for the same invoice, silently doubling its allocated amount."""
+    counterparty = f"Supplier-{uuid.uuid4().hex[:8]}"
+    gross_amount = Decimal("500.00")
+    contract_id = _seed_m001_contract(pg_runtime.database_url, gross_amount=gross_amount, counterparty=counterparty)
+
+    engine = make_engine(pg_runtime.database_url)
+    with make_session_factory(engine)() as session:
+        frag = _make_fragment(session)
+        invoice = Invoice(
+            id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+            digital_invoice_no=None, external_invoice_key=f"PINV-{uuid.uuid4().hex[:8]}", issue_date=date(2026, 1, 10),
+            seller=counterparty, buyer="Our Entity", net_amount=gross_amount, tax_amount=Decimal("0"),
+            gross_amount=gross_amount, invoice_status=None, source_fragment_id=frag.id, created_at=NOW, updated_at=NOW,
+        )
+        InvoiceRepository(session).add(invoice)
+        session.commit()
+        invoice_id = invoice.id
+    engine.dispose()
+
+    results: list[object] = []
+    barrier = threading.Barrier(2)
+
+    def _attempt():
+        thread_engine = make_engine(pg_runtime.database_url)
+        session_factory = make_session_factory(thread_engine)
+        barrier.wait()
+        try:
+            with session_factory() as session:
+                results.append(match_invoices(session))
+        except Exception as exc:  # noqa: BLE001
+            results.append(exc)
+        finally:
+            thread_engine.dispose()
+
+    threads = [threading.Thread(target=_attempt) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert not errors, f"no raw exception expected, got: {errors}"
+    auto_confirmed_runs = sum(1 for r in results if r.auto_confirmed == 1)
+    already_matched_runs = sum(1 for r in results if r.already_matched_skipped == 1)
+    assert auto_confirmed_runs == 1, f"expected exactly one winner, got summaries={results}"
+    assert already_matched_runs == 1, f"expected exactly one deterministic skip, got summaries={results}"
+
+    with pg_runtime.session_factory() as session:
+        match_cases = [
+            mc for mc in MatchCaseRepository(session).list_all() if mc.subject_id == invoice_id
+        ]
+        assert len(match_cases) == 1, f"expected exactly one MatchCase, found {len(match_cases)} — residue from a lost race"
+        allocations = InvoiceAllocationRepository(session).list_for_contract(contract_id)
+        assert len(allocations) == 1
+        assert allocations[0].allocated_gross_amount == gross_amount  # never doubled, never a capacity overflow
+
+
+def test_concurrent_match_payments_against_the_same_eligible_payment_exactly_one_wins(pg_runtime):
+    """BLOCKER 2 required test B: the OUT-payment twin of the invoice
+    test above — see its docstring for the race being closed."""
+    counterparty = f"Supplier-{uuid.uuid4().hex[:8]}"
+    amount = Decimal("300.00")
+    contract_id = _seed_m001_contract(pg_runtime.database_url, gross_amount=amount, counterparty=counterparty)
+
+    engine = make_engine(pg_runtime.database_url)
+    with make_session_factory(engine)() as session:
+        frag = _make_fragment(session)
+        payment = Payment(
+            id=uuid.uuid4(), transaction_date=date(2026, 1, 15), direction=PaymentDirection.OUT, amount=amount,
+            counterparty=counterparty, business_type=None, bank_reference=None, description=None,
+            running_balance=None, source_fragment_id=frag.id, created_at=NOW, source_account_id=None,
+        )
+        PaymentRepository(session).add(payment)
+        session.commit()
+        payment_id = payment.id
+    engine.dispose()
+
+    results: list[object] = []
+    barrier = threading.Barrier(2)
+
+    def _attempt():
+        thread_engine = make_engine(pg_runtime.database_url)
+        session_factory = make_session_factory(thread_engine)
+        barrier.wait()
+        try:
+            with session_factory() as session:
+                results.append(match_payments(session))
+        except Exception as exc:  # noqa: BLE001
+            results.append(exc)
+        finally:
+            thread_engine.dispose()
+
+    threads = [threading.Thread(target=_attempt) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert not errors, f"no raw exception expected, got: {errors}"
+    auto_confirmed_runs = sum(1 for r in results if r.auto_confirmed == 1)
+    already_matched_runs = sum(1 for r in results if r.already_matched_skipped == 1)
+    assert auto_confirmed_runs == 1, f"expected exactly one winner, got summaries={results}"
+    assert already_matched_runs == 1, f"expected exactly one deterministic skip, got summaries={results}"
+
+    with pg_runtime.session_factory() as session:
+        match_cases = [mc for mc in MatchCaseRepository(session).list_all() if mc.subject_id == payment_id]
+        assert len(match_cases) == 1
+        allocations = PaymentAllocationRepository(session).list_for_contract(contract_id)
+        assert len(allocations) == 1
+        assert allocations[0].allocated_amount == amount
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER 3 — advisory lock timeout must surface as a controlled busy error,
+# never a raw traceback, through the real `bel` CLI entry point.
+# ---------------------------------------------------------------------------
+
+
+def _hold_write_lock_and_block(dsn: str, ready: threading.Event, release: threading.Event) -> None:
+    """Acquire BEL's global write-serialization advisory lock
+    (database.py's _WRITE_LOCK_KEY) on a raw connection and hold it,
+    uncommitted, until told to release — simulating a concurrent writer
+    that another real production command must wait behind."""
+    conn = psycopg.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (0x4245_4C00,))
+        ready.set()
+        release.wait(timeout=30)
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def _stamp_alembic_head(engine) -> None:
+    """These two tests invoke the real `bel` CLI as a subprocess, which
+    enforces the Part G schema-at-head gate — but `pg_runtime` builds its
+    schema via Base.metadata.create_all() (structurally identical, much
+    faster than a real `alembic upgrade head` for the other 9 tests in
+    this module that never shell out to the CLI), so it carries no
+    alembic_version row. Recording one here satisfies the gate's
+    precondition for these two subprocess tests without slowing down the
+    rest of the module — not a stamp-as-repair (M5): the schema really is
+    the head schema, this only makes the tracking row agree with a fact
+    that's already true."""
+    with engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)")
+        connection.exec_driver_sql("DELETE FROM alembic_version")
+        connection.exec_driver_sql("INSERT INTO alembic_version (version_num) VALUES ('f5796c006707')")
+
+
+def _run_bel_cli(database_url: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "bel.cli", *args],
+        cwd=REPO_ROOT,
+        env={**os.environ, "BEL_DATABASE_URL": database_url},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_match_run_reports_controlled_busy_error_under_lock_timeout(pg_runtime):
+    """BLOCKER 3: `bel match run` invokes BOTH match_invoices() and
+    match_payments(), each now acquiring the global advisory lock as
+    their first action. With another session holding that lock, `match
+    run` must reach the configured lock_timeout and report BEL's
+    controlled busy message — never an opaque SQLAlchemy/psycopg
+    traceback, never a credential leak, and no partial write."""
+    _stamp_alembic_head(pg_runtime.engine)
+    dsn = pg_runtime.database_url.replace("postgresql+psycopg://", "postgresql://")
+    ready = threading.Event()
+    release = threading.Event()
+    holder = threading.Thread(target=_hold_write_lock_and_block, args=(dsn, ready, release))
+    holder.start()
+    assert ready.wait(timeout=10), "lock holder never confirmed it acquired the lock"
+    try:
+        result = _run_bel_cli(pg_runtime.database_url, "match", "run")
+    finally:
+        release.set()
+        holder.join(timeout=10)
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "database is busy; retry when the other write completes" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
+    assert "OperationalError" not in result.stdout
+    for stream in (result.stdout, result.stderr):
+        assert pg_runtime.database_url not in stream
+        parsed_user = pg_runtime.engine.url.username
+        if parsed_user:
+            assert parsed_user not in stream or "user" not in stream.lower()
+
+    with pg_runtime.session_factory() as session:
+        assert MatchCaseRepository(session).list_all() == []  # zero partial writes
+
+
+def test_sales_match_propose_reports_controlled_busy_error_under_lock_timeout(pg_runtime):
+    """BLOCKER 3, sales path: `bel sales-match invoice propose` calls
+    propose_sales_invoice_match(), which now acquires the same global
+    advisory lock as its first action — before even validating the
+    invoice/candidate ids exist. A held lock must still produce BEL's
+    controlled busy message, not a traceback, regardless of whether the
+    referenced ids are real."""
+    _stamp_alembic_head(pg_runtime.engine)
+    dsn = pg_runtime.database_url.replace("postgresql+psycopg://", "postgresql://")
+    ready = threading.Event()
+    release = threading.Event()
+    holder = threading.Thread(target=_hold_write_lock_and_block, args=(dsn, ready, release))
+    holder.start()
+    assert ready.wait(timeout=10), "lock holder never confirmed it acquired the lock"
+    try:
+        result = _run_bel_cli(
+            pg_runtime.database_url,
+            "sales-match", "invoice", "propose",
+            "--invoice", str(uuid.uuid4()),
+            "--sales-contract", str(uuid.uuid4()),
+        )
+    finally:
+        release.set()
+        holder.join(timeout=10)
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "database is busy; retry when the other write completes" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
+    assert "not found" not in result.stdout  # must fail on the LOCK, not on invoice lookup
+
+    with pg_runtime.session_factory() as session:
+        assert MatchCaseRepository(session).list_all() == []  # zero partial writes

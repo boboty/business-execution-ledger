@@ -16,13 +16,17 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import pytest
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
+
+from bel.infrastructure.persistence.database import make_engine
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 
@@ -103,3 +107,85 @@ def test_alembic_head_to_base_to_head_round_trips_cleanly(postgres_url):
     assert check.returncode == 0, check.stdout + check.stderr
 
     engine.dispose()
+
+
+@pytest.mark.postgres
+def test_percent_encoded_credentials_survive_alembic_and_the_cli_web_path(postgres_url):
+    """BLOCKER 1: a URL-encoded password (%40 for '@', %25 for '%', %2F
+    for '/' — all valid, all likely for a generated production
+    credential) must not break migrations/env.py's Alembic Config
+    handling, and the effective URL reaching SQLAlchemy on the Alembic
+    side and the CLI/Web side (make_engine/DatabaseRuntime) must be
+    semantically identical — same host, same user, same database, same
+    literal password. Neither path may leak the password in its output.
+
+    The bug this guards: alembic.config.Config is ConfigParser-backed
+    with BasicInterpolation, which treats a bare '%' as the start of a
+    '%(name)s' reference — `config.set_main_option("sqlalchemy.url", ...)`
+    raised `ValueError: invalid interpolation syntax` the instant a
+    %-encoded URL was stored, before any connection was even attempted.
+    """
+    admin_engine = create_engine(postgres_url, future=True)
+    role = f"bel_pct_test_{uuid.uuid4().hex[:8]}"
+    dbname = f"bel_pct_test_{uuid.uuid4().hex[:8]}"
+    # Deliberately contains '@', '%', and '/' — each requires percent-
+    # encoding in a URL and each has a distinct, meaningful escape.
+    raw_password = "pa@ss%wo/rd"
+    encoded_password = quote(raw_password, safe="")
+
+    # CREATE/DROP DATABASE cannot run inside a transaction block.
+    # CREATE ROLE ... PASSWORD does not accept a bind parameter (Postgres
+    # rejects a $1 placeholder there — it wants a literal string constant
+    # in the grammar), so the password is embedded as a SQL literal:
+    # single quotes doubled per standard SQL escaping, AND '%' doubled
+    # separately because exec_driver_sql's psycopg cursor scans the raw
+    # query TEXT for its own %s/%b/%t placeholder syntax even with no
+    # bind params supplied. Test-controlled literal, not attacker input.
+    sql_quoted_password = raw_password.replace("'", "''").replace("%", "%%")
+    with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.exec_driver_sql(f"DROP DATABASE IF EXISTS {dbname}")
+        connection.exec_driver_sql(f"DROP ROLE IF EXISTS {role}")
+        connection.exec_driver_sql(f"CREATE ROLE {role} LOGIN PASSWORD '{sql_quoted_password}'")
+        connection.exec_driver_sql(f"CREATE DATABASE {dbname} OWNER {role}")
+
+    try:
+        parts = urlsplit(postgres_url)
+        host_port = parts.hostname + (f":{parts.port}" if parts.port else "")
+        encoded_url = urlunsplit(
+            (parts.scheme, f"{role}:{encoded_password}@{host_port}", f"/{dbname}", "", "")
+        )
+
+        # 1-4: alembic upgrade head with %40/%25/%2F all present at once,
+        # never a ConfigParser interpolation error, and the schema it
+        # produces is the real one — proving the URL reached SQLAlchemy
+        # unmodified, not merely that no exception was raised.
+        upgrade = _alembic(encoded_url, "upgrade", "head")
+        assert upgrade.returncode == 0, upgrade.stderr
+        assert "invalid interpolation syntax" not in (upgrade.stdout + upgrade.stderr)
+
+        current = _alembic(encoded_url, "current")
+        assert current.returncode == 0
+        assert "(head)" in current.stdout
+
+        # 5: CLI/Web (make_engine/DatabaseRuntime) reaches the SAME
+        # database via the SAME URL string — not a second, independently
+        # decoded credential path.
+        cli_engine = make_engine(encoded_url)
+        with cli_engine.connect() as connection:
+            connected_user = connection.execute(text("select current_user")).scalar_one()
+            connected_db = connection.execute(text("select current_database()")).scalar_one()
+        assert connected_user == role
+        assert connected_db == dbname
+        cli_engine.dispose()
+
+        # 6: no controlled error leaks the password or the full
+        # credential-bearing URL in either path's output.
+        for stream in (upgrade.stdout, upgrade.stderr, current.stdout, current.stderr):
+            assert raw_password not in stream
+            assert encoded_password not in stream
+            assert encoded_url not in stream
+    finally:
+        with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            connection.exec_driver_sql(f"DROP DATABASE IF EXISTS {dbname}")
+            connection.exec_driver_sql(f"DROP ROLE IF EXISTS {role}")
+        admin_engine.dispose()
