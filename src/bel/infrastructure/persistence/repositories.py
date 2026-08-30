@@ -1886,6 +1886,10 @@ class SalesInvoiceAllocationRepository:
                 f"MatchCase {allocation.match_case_id} does not correspond to Invoice {allocation.invoice_id}"
             )
         if match_case_row.status != MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED:
+            # Non-authoritative fast-fail only — see the atomic INSERT's
+            # own WHERE clause below, which is what actually enforces
+            # this against a stale identity-map read or a cross-session
+            # race (Gate 2D.1-R3b fix round #5, BLOCKER).
             raise MatchCaseNotPendingError(
                 f"MatchCase {allocation.match_case_id} is {match_case_row.status}, not "
                 "HUMAN_CONFIRMATION_REQUIRED — an allocation can only be written while its case is pending"
@@ -1893,31 +1897,38 @@ class SalesInvoiceAllocationRepository:
         if allocation.confirmation_type != ConfirmationType.HUMAN_CONFIRMED:
             raise ValueError("SalesInvoiceAllocation.confirmation_type must be HUMAN_CONFIRMED")
         validate_storable_amount(allocation.allocated_gross_amount)
-        # Gate 2D.1-R3b fix round #4, BLOCKER (the real one): rounds 1-3
-        # made the capacity check correct within ONE session (explicit
-        # `flush()` instead of relying on autoflush) but that is a
-        # read-then-write pattern, and reads from one session cannot see
-        # another session's UNCOMMITTED writes — two independent sessions
-        # can each read total=0 for the SAME invoice before either
-        # commits, then each insert 60.00 against a 100.00 cap, landing
-        # at 120.00. `flush()` cannot fix a cross-session race; only
-        # collapsing "read the current total" and "write, conditioned on
-        # that total" into ONE atomic SQL statement can — the exact
-        # `INSERT ... SELECT ... WHERE <condition>` technique already
-        # proven for `ProcurementSalesLinkRepository.insert_episode_if_no_current`
-        # and `MatchCaseRepository.add_if_no_case_for_subject`. SQLite
-        # executes one write statement at a time; by the time a second
-        # session's INSERT actually runs, it evaluates its own WHERE
-        # clause against whatever the first session already committed,
-        # never against a stale snapshot.
+        # Gate 2D.1-R3b fix round #5, BLOCKER: round #4 made the CAPACITY
+        # check atomic, but the MatchCase HUMAN_CONFIRMATION_REQUIRED
+        # check above was still a plain `session.get()` read-then-write —
+        # vulnerable both to a stale identity-map entry
+        # (sessionmaker(expire_on_commit=False) can leave an old status
+        # cached) and to a genuine cross-session race (another session
+        # resolves the SAME case between this read and the write below).
+        # Fixed by folding MatchCase eligibility (id, subject_type,
+        # subject_id, status) into the SAME atomic INSERT ... SELECT ...
+        # WHERE as the capacity check, via an EXISTS subquery — so BOTH
+        # conditions are evaluated by SQLite as part of ONE statement,
+        # against whatever is genuinely current at execution time, never
+        # against anything read moments earlier by this session.
         self._session.flush()  # same-session/no_autoflush safety, as before — now a defence layer, not the guarantee
         table = SalesInvoiceAllocationModel.__table__
+        match_case_table = MatchCaseModel.__table__
         amount_type = table.c.allocated_gross_amount.type
         current_sum = func.coalesce(func.sum(table.c.allocated_gross_amount), literal(Decimal("0"), type_=amount_type))
         current_sum_subquery = select(current_sum).where(table.c.invoice_id == allocation.invoice_id).scalar_subquery()
         new_amount = literal(allocation.allocated_gross_amount, type_=amount_type)
         gross_amount = literal(invoice_row.gross_amount, type_=amount_type)
         capacity_ok = (current_sum_subquery + new_amount) <= gross_amount
+        match_case_eligible = (
+            select(literal(1))
+            .where(
+                match_case_table.c.id == allocation.match_case_id,
+                match_case_table.c.subject_type == SubjectType.INVOICE,
+                match_case_table.c.subject_id == allocation.invoice_id,
+                match_case_table.c.status == MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED,
+            )
+            .exists()
+        )
         select_values = select(
             literal(allocation.id, type_=table.c.id.type),
             literal(allocation.invoice_id, type_=table.c.invoice_id.type),
@@ -1926,7 +1937,7 @@ class SalesInvoiceAllocationRepository:
             new_amount,
             literal(allocation.confirmation_type, type_=table.c.confirmation_type.type),
             literal(allocation.created_at, type_=table.c.created_at.type),
-        ).where(capacity_ok)
+        ).where(match_case_eligible, capacity_ok)
         stmt = table.insert().from_select(
             ["id", "invoice_id", "sales_contract_id", "match_case_id", "allocated_gross_amount", "confirmation_type", "created_at"],
             select_values,
@@ -1934,9 +1945,20 @@ class SalesInvoiceAllocationRepository:
         result = self._session.execute(stmt)
         if result.rowcount != 1:
             # Either a genuine cross-session race was lost, or the
-            # pre-existing total already left no room — recompute for an
-            # accurate message; the atomic statement above is what
-            # actually enforced the invariant, this is purely diagnostic.
+            # pre-existing state already made this ineligible — diagnose
+            # with a FRESH, identity-map-bypassing column read (never the
+            # possibly-stale `match_case_row` loaded above) so the error
+            # message is never wrong about which condition actually
+            # failed. The atomic statement above is what actually
+            # enforced the invariant; this is purely diagnostic.
+            fresh_status = self._session.execute(
+                select(match_case_table.c.status).where(match_case_table.c.id == allocation.match_case_id)
+            ).scalar_one_or_none()
+            if fresh_status != MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED:
+                raise MatchCaseNotPendingError(
+                    f"MatchCase {allocation.match_case_id} is {fresh_status}, not "
+                    "HUMAN_CONFIRMATION_REQUIRED — an allocation can only be written while its case is pending"
+                )
             already_allocated = self.sum_for_invoice(allocation.invoice_id)
             raise ValueError(
                 f"allocations for Invoice {allocation.invoice_id} totalling "
@@ -2005,6 +2027,8 @@ class SalesPaymentAllocationRepository:
                 f"MatchCase {allocation.match_case_id} does not correspond to Payment {allocation.payment_id}"
             )
         if match_case_row.status != MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED:
+            # Non-authoritative fast-fail only — see the atomic INSERT's
+            # own WHERE clause below.
             raise MatchCaseNotPendingError(
                 f"MatchCase {allocation.match_case_id} is {match_case_row.status}, not "
                 "HUMAN_CONFIRMATION_REQUIRED — an allocation can only be written while its case is pending"
@@ -2012,20 +2036,30 @@ class SalesPaymentAllocationRepository:
         if allocation.confirmation_type != ConfirmationType.HUMAN_CONFIRMED:
             raise ValueError("SalesPaymentAllocation.confirmation_type must be HUMAN_CONFIRMED")
         validate_storable_amount(allocation.allocated_amount)
-        # Gate 2D.1-R3b fix round #4, BLOCKER (the real one): see the
-        # identical atomic-conditional-insert note in
-        # SalesInvoiceAllocationRepository.add — a read-then-write
-        # capacity check cannot be made cross-session-safe by `flush()`
-        # alone; only collapsing the read and the write into ONE atomic
-        # SQL statement closes the race.
+        # Gate 2D.1-R3b fix round #5, BLOCKER: see the identical
+        # MatchCase-eligibility-folded-into-the-atomic-INSERT note in
+        # SalesInvoiceAllocationRepository.add — a read-then-write status
+        # check is vulnerable to both a stale identity-map entry and a
+        # genuine cross-session race.
         self._session.flush()  # same-session/no_autoflush safety, as before — now a defence layer, not the guarantee
         table = SalesPaymentAllocationModel.__table__
+        match_case_table = MatchCaseModel.__table__
         amount_type = table.c.allocated_amount.type
         current_sum = func.coalesce(func.sum(table.c.allocated_amount), literal(Decimal("0"), type_=amount_type))
         current_sum_subquery = select(current_sum).where(table.c.payment_id == allocation.payment_id).scalar_subquery()
         new_amount = literal(allocation.allocated_amount, type_=amount_type)
         payment_amount = literal(payment_row.amount, type_=amount_type)
         capacity_ok = (current_sum_subquery + new_amount) <= payment_amount
+        match_case_eligible = (
+            select(literal(1))
+            .where(
+                match_case_table.c.id == allocation.match_case_id,
+                match_case_table.c.subject_type == SubjectType.PAYMENT,
+                match_case_table.c.subject_id == allocation.payment_id,
+                match_case_table.c.status == MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED,
+            )
+            .exists()
+        )
         select_values = select(
             literal(allocation.id, type_=table.c.id.type),
             literal(allocation.payment_id, type_=table.c.payment_id.type),
@@ -2034,13 +2068,23 @@ class SalesPaymentAllocationRepository:
             new_amount,
             literal(allocation.confirmation_type, type_=table.c.confirmation_type.type),
             literal(allocation.created_at, type_=table.c.created_at.type),
-        ).where(capacity_ok)
+        ).where(match_case_eligible, capacity_ok)
         stmt = table.insert().from_select(
             ["id", "payment_id", "sales_contract_id", "match_case_id", "allocated_amount", "confirmation_type", "created_at"],
             select_values,
         )
         result = self._session.execute(stmt)
         if result.rowcount != 1:
+            # Diagnose with a FRESH, identity-map-bypassing column read —
+            # see the identical note in SalesInvoiceAllocationRepository.add.
+            fresh_status = self._session.execute(
+                select(match_case_table.c.status).where(match_case_table.c.id == allocation.match_case_id)
+            ).scalar_one_or_none()
+            if fresh_status != MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED:
+                raise MatchCaseNotPendingError(
+                    f"MatchCase {allocation.match_case_id} is {fresh_status}, not "
+                    "HUMAN_CONFIRMATION_REQUIRED — an allocation can only be written while its case is pending"
+                )
             already_allocated = self.sum_for_payment(allocation.payment_id)
             raise ValueError(
                 f"allocations for Payment {allocation.payment_id} totalling "

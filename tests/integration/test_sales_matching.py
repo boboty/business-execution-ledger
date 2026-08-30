@@ -1831,3 +1831,121 @@ def test_real_threads_direct_repository_payment_capacity_never_exceeded(tmp_path
         with session_factory() as verify:
             total = SalesPaymentAllocationRepository(verify).sum_for_payment(payment_id)
         assert total <= Decimal("100.00"), f"trial {trial}: total {total} exceeded Payment's amount 100.00"
+
+
+# ---------------------------------------------------------------------------
+# Gate 2D.1-R3b fix round #5, BLOCKER — MatchCase eligibility (id,
+# subject_type, subject_id, status) folded into the SAME atomic INSERT
+# as the capacity check, closing both a stale-identity-map read
+# (sessionmaker(expire_on_commit=False) can leave an old status cached
+# on an already-loaded MatchCaseModel) and a genuine cross-session
+# status race. Deterministic (no threading/barrier needed): Session A
+# preloads the MatchCase while HCR, Session B independently confirms +
+# resolves + commits, then Session A's OWN direct repository.add()
+# attempt — for an amount that comfortably fits the subject's REMAINING
+# capacity, so a capacity-only guard would have wrongly allowed it —
+# must still be rejected specifically because the case is no longer
+# pending, and must create zero extra allocations.
+# ---------------------------------------------------------------------------
+
+
+def test_deterministic_stale_matchcase_rejected_invoice(tmp_path):
+    from bel.infrastructure.persistence.models import MatchCaseModel
+    from bel.infrastructure.persistence.repositories import MatchCaseNotPendingError
+
+    db_path = tmp_path / "stale-matchcase-invoice.db"
+    engine = make_engine(str(db_path))
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+    with session_factory() as setup_session:
+        frag = _make_fragment(setup_session)
+        invoice = _make_invoice(setup_session, frag.id, InvoiceDirection.SALES, gross_amount=Decimal("100.00"))
+        sc = _make_sales_contract(setup_session, frag.id)
+        proposal = propose_sales_invoice_match(setup_session, invoice_id=invoice.id, sales_contract_ids=[sc.id], created_at=NOW)
+        setup_session.commit()
+        invoice_id, sc_id, match_case_id = invoice.id, sc.id, proposal.match_case.id
+
+    session_a = session_factory()
+    session_b = session_factory()
+    try:
+        # Session A preloads the MatchCase while it is still HCR — this
+        # ORM object remains in session_a's identity map afterward
+        # (expire_on_commit=False), independent of what happens in
+        # session_b.
+        preloaded = session_a.get(MatchCaseModel, match_case_id)
+        assert preloaded.status == MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED
+
+        # Session B independently confirms + resolves the SAME case, but
+        # only PARTIALLY allocates it (50.00 of 100.00) — leaving nominal
+        # capacity room, so the fix under test must be the eligibility
+        # check, not the capacity check.
+        confirm_sales_invoice_match(
+            session_b, match_case_id=match_case_id, allocations=[(sc_id, Decimal("50.00"))], created_at=NOW
+        )
+        session_b.commit()
+
+        # Session A attempts a DIRECT repository write, within its own
+        # (now-stale-with-respect-to-status) session, for an amount that
+        # fits comfortably within the invoice's remaining 50.00 of
+        # nominal capacity.
+        with pytest.raises(MatchCaseNotPendingError):
+            SalesInvoiceAllocationRepository(session_a).add(
+                SalesInvoiceAllocation(
+                    id=uuid.uuid4(), invoice_id=invoice_id, sales_contract_id=sc_id, match_case_id=match_case_id,
+                    allocated_gross_amount=Decimal("30.00"), confirmation_type="HUMAN_CONFIRMED", created_at=NOW,
+                )
+            )
+        session_a.rollback()
+    finally:
+        session_a.close()
+        session_b.close()
+
+    with session_factory() as verify:
+        allocations = list_sales_invoice_allocations_for_invoice(verify, invoice_id)
+        assert len(allocations) == 1  # only session_b's confirmed allocation — session_a wrote nothing
+        assert allocations[0].allocated_gross_amount == Decimal("50.00")
+
+
+def test_deterministic_stale_matchcase_rejected_payment(tmp_path):
+    from bel.infrastructure.persistence.models import MatchCaseModel
+    from bel.infrastructure.persistence.repositories import MatchCaseNotPendingError
+
+    db_path = tmp_path / "stale-matchcase-payment.db"
+    engine = make_engine(str(db_path))
+    Base.metadata.create_all(engine)
+    session_factory = make_session_factory(engine)
+    with session_factory() as setup_session:
+        frag = _make_fragment(setup_session)
+        payment = _make_payment(setup_session, frag.id, PaymentDirection.IN, amount=Decimal("100.00"))
+        sc = _make_sales_contract(setup_session, frag.id)
+        proposal = propose_sales_payment_match(setup_session, payment_id=payment.id, sales_contract_ids=[sc.id], created_at=NOW)
+        setup_session.commit()
+        payment_id, sc_id, match_case_id = payment.id, sc.id, proposal.match_case.id
+
+    session_a = session_factory()
+    session_b = session_factory()
+    try:
+        preloaded = session_a.get(MatchCaseModel, match_case_id)
+        assert preloaded.status == MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED
+
+        confirm_sales_payment_match(
+            session_b, match_case_id=match_case_id, allocations=[(sc_id, Decimal("50.00"))], created_at=NOW
+        )
+        session_b.commit()
+
+        with pytest.raises(MatchCaseNotPendingError):
+            SalesPaymentAllocationRepository(session_a).add(
+                SalesPaymentAllocation(
+                    id=uuid.uuid4(), payment_id=payment_id, sales_contract_id=sc_id, match_case_id=match_case_id,
+                    allocated_amount=Decimal("30.00"), confirmation_type="HUMAN_CONFIRMED", created_at=NOW,
+                )
+            )
+        session_a.rollback()
+    finally:
+        session_a.close()
+        session_b.close()
+
+    with session_factory() as verify:
+        allocations = list_sales_payment_allocations_for_payment(verify, payment_id)
+        assert len(allocations) == 1
+        assert allocations[0].allocated_amount == Decimal("50.00")
