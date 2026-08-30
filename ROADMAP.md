@@ -119,6 +119,39 @@ reconciliation harness, first verified against the contract-execution
 fact layer. **This is cutover infrastructure and rehearsal — it is not
 the final cutover gate**, which runs after Phase 2D.4.
 
+## Phase 2D.1-P — PostgreSQL Runtime Baseline & Migration Discipline
+
+**Infrastructure only — no V1 business-scope expansion.** Inserted
+between Phase 2D.1 and Phase 2D.2, completed before BEL begins carrying
+authoritative (non-disposable) business data.
+
+Moves BEL's runtime persistence from SQLite to PostgreSQL: PostgreSQL is
+now the production/runtime contract for Web and CLI; SQLite remains only
+as an explicit test-only convenience with no active Alembic chain and no
+concurrent-Web guarantee. Every persistence invariant closed in prior
+Phase 2D.1 rounds (one-current/one-initial revisions, the
+ProcurementSalesLink one-current relationship, correction lineage,
+whole-fact supersession, CAS writer races) is preserved under
+PostgreSQL's weaker default isolation via a shared advisory-lock
+serialization boundary.
+
+A pre-existing SQLite-only trigger statement in the frozen migration
+chain could not be replayed on PostgreSQL at all (a hard syntax error,
+not a portability nuance) — resolved as a one-time, explicitly-approved
+migration rebaseline: the old chain (`migrations/versions/`) is frozen
+byte-for-byte as historical reference, and a new PostgreSQL-only chain
+(`migrations/postgresql_versions/`) becomes the active migration
+history, with mechanically-enforced immutability (`tools/check_migration_immutability.py`,
+pre-commit and CI). See
+[docs/PERSISTENCE-MIGRATION-POLICY.md](docs/PERSISTENCE-MIGRATION-POLICY.md)
+for the full rationale and the frozen M1-M10 migration rules.
+
+No SQLite → PostgreSQL data migrator exists or is planned — `bel.db` was
+always disposable; a fresh PostgreSQL database is rebuilt from source
+Excel/Evidence.
+
+Phase 2D.2 is **not yet started** by this phase.
+
 ## Phase 2D.2 — Period Close Business Data Product
 
 Turns the existing read-only preview into a deliverable business data

@@ -80,6 +80,8 @@ Phase 2D.1, **Business Fact Foundation & Contract Ledger**, is implementation-co
 
 The Phase 2D.1 cutover work is **infrastructure and rehearsal only**. BEL has **not** yet passed the first-stage cutover gate and must not yet be declared the System of Record.
 
+**Phase 2D.1-P — PostgreSQL Runtime Baseline & Migration Discipline** followed as an infrastructure-only phase: PostgreSQL is now the production/runtime persistence contract (SQLite remains a test-only convenience), with mechanically-enforced migration immutability. No V1 business scope changed. See [docs/PERSISTENCE-MIGRATION-POLICY.md](docs/PERSISTENCE-MIGRATION-POLICY.md).
+
 ## Not built yet
 
 The remaining V1 critical path is intentionally narrow:
@@ -112,6 +114,12 @@ After 2D.2, V1 proceeds to Outbound Invoicing, the Exception & Task Center, and 
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 git config core.hooksPath .githooks
+
+# PostgreSQL is BEL's runtime database (Phase 2D.1-P) — create one and
+# point BEL_DATABASE_URL at it. No default: production execution must
+# never silently fall back to a local file.
+createdb bel
+export BEL_DATABASE_URL=postgresql+psycopg://localhost/bel
 .venv/bin/alembic upgrade head
 
 # Import deterministic source evidence
@@ -121,7 +129,7 @@ git config core.hooksPath .githooks
 .venv/bin/bel match run
 
 # Human workbench
-.venv/bin/bel --db bel.db web
+.venv/bin/bel web
 # http://127.0.0.1:8000/contract-ledger
 # http://127.0.0.1:8000/period-close
 
@@ -129,7 +137,17 @@ git config core.hooksPath .githooks
 .venv/bin/pytest
 ```
 
-The SQLite runtime database (`bel.db`) is a local development artifact and must stay outside the repository tree. Real business data must never be committed. Public tests run against independently constructed synthetic data under `fixtures/synthetic/`.
+Real business data must never be committed. Public tests run against
+independently constructed synthetic data under `fixtures/synthetic/`.
+SQLite remains available as an explicit test-only convenience
+(`sqlite:///path` or in-memory `sqlite://`) — it has no active Alembic
+chain and no concurrent-Web guarantee, so it is never the runtime for
+`bel web` or a shared development database. See
+[docs/PERSISTENCE-MIGRATION-POLICY.md](docs/PERSISTENCE-MIGRATION-POLICY.md)
+for the full runtime contract, migration immutability rules, and the
+dev-database rebuild path (PostgreSQL dev/test databases are disposable —
+rebuilt from source Excel/Evidence, never migrated from the old SQLite
+file).
 
 Cutover/backfill acceptance uses a private data root outside the repository. Expected Cutover Baseline material is reconciliation input only; it is never a source of canonical Facts.
 
@@ -144,6 +162,7 @@ Cutover/backfill acceptance uses a private data root outside the repository. Exp
 - [Private Data Policy](docs/PRIVATE-DATA-POLICY.md) — sensitive-data handling boundary
 - [Phase 2D.0 Decisions](docs/PHASE2D0-DECISIONS.md) / [Acceptance](docs/PHASE2D0-ACCEPTANCE.md) — V1 product rebaseline
 - [Phase 2D.1 R0 Decisions](docs/PHASE2D1-R0-DECISIONS.md) / [Acceptance](docs/PHASE2D1-R0-ACCEPTANCE.md) — frozen sales, Shipment, correction and cutover semantics
+- [Persistence & Migration Policy](docs/PERSISTENCE-MIGRATION-POLICY.md) — PostgreSQL runtime contract, migration immutability rules (Phase 2D.1-P)
 - [Contributing](CONTRIBUTING.md) — contribution rules and development setup
 
 Implementation decisions and acceptance criteria for each phase are kept in `docs/PHASE*-DECISIONS.md` and `docs/PHASE*-ACCEPTANCE.md` so design changes are explicit rather than silently retrofitted to code.

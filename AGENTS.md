@@ -58,3 +58,38 @@ short: private inputs and diagnostics remain under
 (`fixtures/synthetic/`, `tests/golden/synthetic-v1/`) is independently
 synthetic; the acceptance runner must not print or persist source values
 in the repository.
+
+## Persistence & migration rules (Phase 2D.1-P)
+
+See `docs/PERSISTENCE-MIGRATION-POLICY.md` for the full policy. Hard
+rules every agent must follow:
+
+8. **PostgreSQL is the only production/runtime persistence contract.**
+   `BEL_DATABASE_URL` must be a `postgresql+psycopg://` URL for anything
+   touching production or CI's PostgreSQL gate. SQLite
+   (`sqlite:///<path>` or `sqlite://`) is a test-only convenience with no
+   active Alembic chain and no concurrent-Web guarantee — never suggest
+   it as a production runtime.
+
+9. **Committed migration files are immutable — never edit, delete, or
+   rename one.** This applies to both `migrations/versions/` (frozen at
+   the LEGACY MIGRATION FREEZE ANCHOR, commit
+   `b94f572528e25a620bf1a78bd2e26d12547b0212`) and
+   `migrations/postgresql_versions/` (immutable from each file's own
+   first commit). A schema correction is always a NEW forward migration.
+   `migrations/versions/` is additionally inert — never wire it into
+   Alembic config again; it exists only as historical reference. Before
+   a migration file's first commit, editing it is fine.
+
+10. **Never redo the Phase 2D.1-P rebaseline exception.** That one-time
+    chain restart was justified only because no authoritative business
+    data existed yet. Any future SQLite/PostgreSQL incompatibility in a
+    *new* migration is an authoring bug to fix before its first commit —
+    not grounds for another rebaseline, another chain restart, or
+    `alembic stamp head` used to paper over drift.
+
+11. **Runtime code must never create or mutate production schema
+    directly** (`Base.metadata.create_all()` against a real database,
+    ad-hoc `ALTER TABLE`, startup auto-patching). `Base.metadata.create_all()`
+    remains correct for SQLite test fixtures — that is not "production
+    schema".
