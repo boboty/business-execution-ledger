@@ -1,0 +1,115 @@
+"""CLI smoke test for `bel cutover backfill` / `bel cutover reconcile`
+(Phase 2D.1-R5) against a real migrated SQLite file and a synthetic
+BEL_PRIVATE_DATA_ROOT — proves the actual `bel` entry point wires the
+plan/baseline path resolution and prints only the scenario verdict.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).parent.parent.parent
+
+CONTRACT_HEADERS = ["序号", "合同编码", "卖方", "买方", "金额"]
+
+
+def _run_bel(db_path: Path, private_root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "bel.cli", "--db", str(db_path), *args],
+        cwd=REPO_ROOT,
+        env={**os.environ, "BEL_PRIVATE_DATA_ROOT": str(private_root)},
+        capture_output=True,
+        text=True,
+    )
+
+
+def _upgrade_head(db_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=REPO_ROOT,
+        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _write_ledger(path: Path, rows: list[list]) -> None:
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "报关出口购销合同"
+    ws.append(["Title"])
+    ws.append(CONTRACT_HEADERS)
+    for row in rows:
+        ws.append(row)
+    wb.save(path)
+
+
+def test_cutover_backfill_and_reconcile_cli(tmp_path):
+    db_path = tmp_path / "bel.db"
+    _upgrade_head(db_path)
+
+    private_root = tmp_path / "private"
+    period_dir = private_root / "2026-01"
+    (period_dir / "contracts").mkdir(parents=True)
+    (period_dir / "expected").mkdir(parents=True)
+    _write_ledger(period_dir / "contracts" / "ledger.xlsx", [[1, "C-CLI", "SupplierCLI", "BuyerCLI", 42]])
+    (period_dir / "backfill-plan.json").write_text(
+        json.dumps({"version": 1, "contracts": {"path": "contracts/ledger.xlsx"}})
+    )
+    baseline = {
+        "entries": [
+            {
+                "key": "contract:contract_no=C-CLI|counterparty=SupplierCLI",
+                "expected": {
+                    "contract_type": "出口报关购销合同", "buyer": "BuyerCLI", "gross_amount": "42.00",
+                    "currency": "CNY", "contract_date": None,
+                },
+                "outcome": "MATCH",
+            },
+            {
+                "key": "unresolved_indicator:contract_no=C-CLI|counterparty=SupplierCLI",
+                "expected": {"has_unresolved": False}, "outcome": "MATCH",
+            },
+        ]
+    }
+    (period_dir / "expected" / "cutover-baseline.json").write_text(json.dumps(baseline))
+
+    backfill_result = _run_bel(db_path, private_root, "cutover", "backfill", "--period", "2026-01")
+    assert backfill_result.returncode == 0, backfill_result.stderr
+    assert "cutover backfill" in backfill_result.stdout
+    assert "created=1" in backfill_result.stdout
+
+    reconcile_result = _run_bel(db_path, private_root, "cutover", "reconcile", "--period", "2026-01")
+    assert reconcile_result.returncode == 0, reconcile_result.stderr
+    assert "P2D_CUTOVER_RECONCILIATION: PASS" in reconcile_result.stdout
+    assert "unresolved_count=0" in reconcile_result.stdout
+    # No business identity or amount ever printed to stdout.
+    assert "SupplierCLI" not in reconcile_result.stdout
+
+
+def test_cutover_backfill_rejects_period_dir_outside_private_root(tmp_path):
+    db_path = tmp_path / "bel.db"
+    _upgrade_head(db_path)
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+
+    result = _run_bel(db_path, private_root, "cutover", "backfill", "--period", "../escape")
+    assert result.returncode != 0
+    assert "does not resolve inside" in (result.stdout + result.stderr)
+
+
+def test_cutover_reconcile_missing_private_root_is_a_clean_error(tmp_path):
+    db_path = tmp_path / "bel.db"
+    _upgrade_head(db_path)
+    nonexistent_root = tmp_path / "does-not-exist"
+
+    result = _run_bel(db_path, nonexistent_root, "cutover", "reconcile", "--period", "2026-01")
+    assert result.returncode != 0
+    assert "does not resolve" in (result.stdout + result.stderr)

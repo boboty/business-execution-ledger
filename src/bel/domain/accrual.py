@@ -76,6 +76,14 @@ class CostRecognitionFact:
     source_fragment_id: UUID
     created_at: datetime
     shipment_id: UUID | None = None
+    # Phase 2D.1-R5 pre-flight debt (docs/PHASE2D1-R0-DECISIONS.md
+    # section 21/40): whole-fact supersession lineage pointer. NULL for
+    # a current fact; set exactly once, at the moment a later
+    # independently-evidenced Fact of the SAME type supersedes this one
+    # — never re-pointed afterwards, never a stand-in for editing this
+    # fact's own content in place. "Current" repository queries exclude
+    # any row with this set; a history query can still see everything.
+    superseded_by_fact_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +102,8 @@ class AccrualBasisFact:
     basis: str
     source_fragment_id: UUID
     created_at: datetime
+    # See CostRecognitionFact.superseded_by_fact_id.
+    superseded_by_fact_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +120,8 @@ class HistoricalAccrualFact:
     basis: str
     source_fragment_id: UUID
     confirmed_at: datetime
+    # See CostRecognitionFact.superseded_by_fact_id.
+    superseded_by_fact_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +173,8 @@ class InvoiceItemAllocation:
     confirmation_type: str
     source_fragment_id: UUID
     created_at: datetime
+    # See CostRecognitionFact.superseded_by_fact_id.
+    superseded_by_fact_id: UUID | None = None
 
 
 def get_accrual_balance(

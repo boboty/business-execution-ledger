@@ -1,7 +1,8 @@
 from decimal import Decimal
 
 from bel.application.import_contract_ledger import import_contract_ledger
-from bel.infrastructure.persistence.models import ContractItemModel, ContractModel
+from bel.infrastructure.persistence.models import ContractItemModel
+from bel.infrastructure.persistence.repositories import ContractRepository
 
 HEADERS = ["序号", "合同编码", "卖方", "买方", "金额"]
 
@@ -19,7 +20,7 @@ def test_import_creates_contracts_with_correct_fields(db_session, ledger_workboo
     assert result.contracts_created == 2
     assert result.contract_items_created == 0
 
-    contracts = db_session.query(ContractModel).order_by(ContractModel.contract_no).all()
+    contracts = sorted(ContractRepository(db_session).list_all(), key=lambda c: c.contract_no)
     assert [c.contract_no for c in contracts] == ["C001", "C002"]
     assert contracts[0].counterparty == "SellerA"
     assert contracts[0].buyer == "Buyer Co"

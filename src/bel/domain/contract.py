@@ -24,6 +24,54 @@ class Contract:
     updated_at: datetime
 
 
+class ContractRevisionType:
+    """See docs/PHASE2D1-R0-DECISIONS.md section 1.1 — the three cases
+    that never share one operation, now closing the Phase 2D.1-R5
+    pre-flight debt: Contract itself needed the SAME anchor+revision
+    seam ContractItem/Shipment/SalesContract already have, so a revised
+    legacy ledger can supplement/correct a Contract's non-identity
+    values instead of creating a duplicate anchor."""
+
+    INITIAL = "INITIAL"
+    SUPPLEMENT = "SUPPLEMENT"
+    CORRECTION = "CORRECTION"
+
+
+# The versioned business-value fields living on a Contract revision —
+# everything on Contract except its identity (id, contract_no,
+# counterparty, created_at) and the derived updated_at (the current
+# revision's own created_at). contract_no/counterparty are
+# identity-bearing and deliberately excluded: changing either is
+# RE-IDENTIFICATION (docs/PHASE2D1-R0-DECISIONS.md section 4.4), never a
+# plain correction — excluding them from this field set makes that
+# structurally impossible through the ordinary supplement/correct path.
+CONTRACT_FACT_FIELDS: tuple[str, ...] = ("contract_type", "buyer", "gross_amount", "currency", "contract_date")
+
+
+@dataclass
+class ContractRevision:
+    """One versioned assertion about a Contract anchor — the same shape
+    as ContractItemRevision (docs/PHASE2D1-R0-DECISIONS.md section 1.3).
+    ``gross_amount``/``currency`` stay Optional here (matching every
+    other revision dataclass's relaxed schema-level typing for direct
+    repository callers) even though the assembled ``Contract`` dataclass
+    requires them non-NULL; ``bel.application.contract_facts`` is what
+    enforces that requirement for every new revision it writes."""
+
+    id: UUID
+    contract_id: UUID
+    revision_type: str
+    contract_type: str | None
+    buyer: str | None
+    gross_amount: Decimal | None
+    currency: str | None
+    contract_date: date | None
+    source_fragment_id: UUID | None
+    superseded_by_revision_id: UUID | None
+    created_at: datetime
+    asserted_field_names: list[str] | None = None
+
+
 @dataclass
 class ContractItem:
     """First-class per docs/DOMAIN.md. Phase 1 never synthesizes these —

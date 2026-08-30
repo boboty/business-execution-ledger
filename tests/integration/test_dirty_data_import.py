@@ -38,8 +38,8 @@ def test_dirty_ledger_data_imports_without_error_and_stays_traceable(db_session,
     assert row4.raw_data["备注"] == "已执行完"
 
     # None of the dirty columns leak into canonical Contract fields.
-    from bel.infrastructure.persistence.models import ContractModel
+    from bel.infrastructure.persistence.repositories import ContractRepository
 
-    c001 = db_session.query(ContractModel).filter_by(contract_no="C001").one()
+    c001 = ContractRepository(db_session).find_by_contract_no("C001")[0]
     assert c001.counterparty == "SellerA"
     assert c001.gross_amount == 100

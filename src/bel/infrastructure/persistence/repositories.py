@@ -21,6 +21,8 @@ from bel.domain.contract import (
     ContractItem,
     ContractItemRevision,
     ContractItemRevisionType,
+    ContractRevision,
+    ContractRevisionType,
 )
 from bel.domain.event import BusinessEvent
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment
@@ -51,6 +53,7 @@ from bel.infrastructure.persistence.models import (
     ContractItemModel,
     ContractItemRevisionModel,
     ContractModel,
+    ContractRevisionModel,
     CostRecognitionFactModel,
     EvidenceDocumentModel,
     EvidenceFragmentModel,
@@ -96,19 +99,44 @@ def _fragment_to_domain(m: EvidenceFragmentModel) -> EvidenceFragment:
     )
 
 
-def _contract_to_domain(m: ContractModel) -> Contract:
-    return Contract(
+def _contract_revision_to_domain(m: ContractRevisionModel) -> ContractRevision:
+    return ContractRevision(
         id=m.id,
-        contract_no=m.contract_no,
+        contract_id=m.contract_id,
+        revision_type=m.revision_type,
         contract_type=m.contract_type,
-        counterparty=m.counterparty,
         buyer=m.buyer,
         gross_amount=m.gross_amount,
         currency=m.currency,
         contract_date=m.contract_date,
-        current_source_fragment_id=m.current_source_fragment_id,
+        source_fragment_id=m.source_fragment_id,
+        superseded_by_revision_id=m.superseded_by_revision_id,
         created_at=m.created_at,
-        updated_at=m.updated_at,
+        asserted_field_names=m.asserted_field_names,
+    )
+
+
+def _assemble_contract(anchor: ContractModel, current_revision: ContractRevisionModel) -> Contract:
+    """The anchor + current-revision join, in ONE place
+    (docs/PHASE2D1-R0-DECISIONS.md section 1.3: "current-revision
+    resolution is defined once, in the repository layer"). Returns the
+    Contract dataclass of exactly its pre-R5 shape, so every existing
+    consumer (contract_360.py, contract_business_ledger.py,
+    matching.py, period_close.py, ...) is unaffected. ``updated_at`` is
+    derived as the current revision's own ``created_at`` — there is no
+    separate mutable "last updated" column to fall out of sync."""
+    return Contract(
+        id=anchor.id,
+        contract_no=anchor.contract_no,
+        contract_type=current_revision.contract_type,
+        counterparty=anchor.counterparty,
+        buyer=current_revision.buyer,
+        gross_amount=current_revision.gross_amount,
+        currency=current_revision.currency,
+        contract_date=current_revision.contract_date,
+        current_source_fragment_id=current_revision.source_fragment_id,
+        created_at=anchor.created_at,
+        updated_at=current_revision.created_at,
     )
 
 
@@ -288,6 +316,7 @@ def _payment_to_domain(m: PaymentModel) -> Payment:
         running_balance=m.running_balance,
         source_fragment_id=m.source_fragment_id,
         created_at=m.created_at,
+        source_account_id=m.source_account_id,
     )
 
 
@@ -387,37 +416,194 @@ class EvidenceRepository:
 
 
 class ContractRepository:
+    """Anchor + current-revision assembly (docs/PHASE2D1-R0-DECISIONS.md
+    section 1.3/4.4), the same pattern as ContractItemRepository. ``get``
+    / ``find_by_contract_no`` / ``find_by_identity`` / ``list_all`` join
+    the anchor to its current (un-superseded) revision and return the
+    pre-R5-shaped ``Contract`` dataclass — every existing consumer
+    (contract_360.py, contract_business_ledger.py, matching.py,
+    period_close.py, import_contract_ledger.py, ...) is unaffected.
+
+    Business identity is ``(contract_no, counterparty)`` —
+    deliberately NOT a unique constraint (R0 explicitly permits
+    ambiguity, resolved by Task, never by schema prohibition), so
+    ``find_by_identity`` returns a list like ``find_by_contract_no``
+    already does."""
+
     def __init__(self, session: Session) -> None:
         self._session = session
 
+    def _current_revision_join(self):
+        return select(ContractModel, ContractRevisionModel).join(
+            ContractRevisionModel,
+            (ContractRevisionModel.contract_id == ContractModel.id)
+            & (ContractRevisionModel.superseded_by_revision_id.is_(None)),
+        )
+
     def add(self, contract: Contract) -> None:
-        self._session.add(
-            ContractModel(
-                id=contract.id,
-                contract_no=contract.contract_no,
+        """Back-compat convenience over create_anchor + create_initial_revision
+        — see ContractItemRepository.add()'s docstring for the full
+        rationale; the same Evidence-required invariant applies."""
+        if contract.current_source_fragment_id is None:
+            raise ValueError(
+                "ContractRepository.add() requires a real current_source_fragment_id — "
+                "create a synthetic EvidenceFragment first; NULL provenance is only ever "
+                "tolerated for legacy pre-R5 data carried forward by the migration"
+            )
+        self.create_anchor(
+            id=contract.id, contract_no=contract.contract_no, counterparty=contract.counterparty,
+            created_at=contract.created_at,
+        )
+        self.create_initial_revision(
+            ContractRevision(
+                id=uuid.uuid4(),
+                contract_id=contract.id,
+                revision_type=ContractRevisionType.INITIAL,
                 contract_type=contract.contract_type,
-                counterparty=contract.counterparty,
                 buyer=contract.buyer,
                 gross_amount=contract.gross_amount,
                 currency=contract.currency,
                 contract_date=contract.contract_date,
-                current_source_fragment_id=contract.current_source_fragment_id,
-                created_at=contract.created_at,
-                updated_at=contract.updated_at,
+                source_fragment_id=contract.current_source_fragment_id,
+                superseded_by_revision_id=None,
+                created_at=contract.updated_at,
             )
         )
 
+    def create_anchor(self, *, id: uuid.UUID, contract_no: str, counterparty: str | None, created_at) -> None:
+        self._session.add(ContractModel(id=id, contract_no=contract_no, counterparty=counterparty, created_at=created_at))
+
+    def create_initial_revision(self, revision: ContractRevision) -> None:
+        if revision.source_fragment_id is None:
+            raise ValueError("ContractRevision.source_fragment_id is required for a new revision")
+        if revision.revision_type != ContractRevisionType.INITIAL:
+            raise ValueError("create_initial_revision only accepts revision_type=INITIAL")
+        if revision.superseded_by_revision_id is not None:
+            raise ValueError("a newly created current revision cannot already be superseded")
+        self._session.add(self._revision_model(revision))
+
+    def append_revision_against_current(self, revision: ContractRevision, *, based_on_revision_id: uuid.UUID) -> bool:
+        """Atomic conditional retire-then-insert — identical pattern to
+        ContractItemRepository.append_revision_against_current(). Returns
+        False (writes nothing) if ``based_on_revision_id`` is not the
+        anchor's current revision; the caller must treat that as a
+        conflict, never retry blindly."""
+        if revision.source_fragment_id is None:
+            raise ValueError("ContractRevision.source_fragment_id is required for a new revision")
+        if revision.superseded_by_revision_id is not None:
+            raise ValueError("a newly created current revision cannot already be superseded")
+        if revision.revision_type not in (ContractRevisionType.SUPPLEMENT, ContractRevisionType.CORRECTION):
+            raise ValueError(
+                "append_revision_against_current only accepts revision_type SUPPLEMENT or CORRECTION, got "
+                f"{revision.revision_type!r}"
+            )
+        self._session.execute(text("PRAGMA defer_foreign_keys = ON"))
+        result = self._session.execute(
+            update(ContractRevisionModel)
+            .where(
+                ContractRevisionModel.id == based_on_revision_id,
+                ContractRevisionModel.contract_id == revision.contract_id,
+                ContractRevisionModel.superseded_by_revision_id.is_(None),
+            )
+            .values(superseded_by_revision_id=revision.id)
+        )
+        if result.rowcount != 1:
+            return False
+        self._session.add(self._revision_model(revision))
+        self._session.flush()
+        return True
+
+    def _revision_model(self, revision: ContractRevision) -> ContractRevisionModel:
+        return ContractRevisionModel(
+            id=revision.id,
+            contract_id=revision.contract_id,
+            revision_type=revision.revision_type,
+            contract_type=revision.contract_type,
+            buyer=revision.buyer,
+            gross_amount=revision.gross_amount,
+            currency=revision.currency,
+            contract_date=revision.contract_date,
+            source_fragment_id=revision.source_fragment_id,
+            superseded_by_revision_id=revision.superseded_by_revision_id,
+            created_at=revision.created_at,
+            asserted_field_names=revision.asserted_field_names,
+        )
+
+    def get_current_revision(self, contract_id: uuid.UUID) -> ContractRevision | None:
+        m = self._session.scalar(
+            select(ContractRevisionModel).where(
+                ContractRevisionModel.contract_id == contract_id,
+                ContractRevisionModel.superseded_by_revision_id.is_(None),
+            )
+        )
+        return _contract_revision_to_domain(m) if m else None
+
+    def get_initial_revision(self, contract_id: uuid.UUID) -> ContractRevision | None:
+        m = self._session.scalar(
+            select(ContractRevisionModel).where(
+                ContractRevisionModel.contract_id == contract_id,
+                ContractRevisionModel.revision_type == ContractRevisionType.INITIAL,
+            )
+        )
+        return _contract_revision_to_domain(m) if m else None
+
+    def find_predecessor(self, revision_id: uuid.UUID) -> ContractRevision | None:
+        m = self._session.scalar(
+            select(ContractRevisionModel).where(ContractRevisionModel.superseded_by_revision_id == revision_id)
+        )
+        return _contract_revision_to_domain(m) if m else None
+
+    def find_revision_by_fragment(self, contract_id: uuid.UUID, source_fragment_id: uuid.UUID) -> ContractRevision | None:
+        m = self._session.scalar(
+            select(ContractRevisionModel).where(
+                ContractRevisionModel.contract_id == contract_id,
+                ContractRevisionModel.source_fragment_id == source_fragment_id,
+            )
+        )
+        return _contract_revision_to_domain(m) if m else None
+
+    def list_revisions(self, contract_id: uuid.UUID) -> list[ContractRevision]:
+        """Full audit history, oldest first — walked along the
+        append-only ``superseded_by_revision_id`` chain, NOT sorted by
+        ``created_at`` (two revisions in one transaction can share a
+        timestamp)."""
+        rows = {
+            m.id: m
+            for m in self._session.scalars(
+                select(ContractRevisionModel).where(ContractRevisionModel.contract_id == contract_id)
+            )
+        }
+        if not rows:
+            return []
+        current = next(m for m in rows.values() if m.revision_type == ContractRevisionType.INITIAL)
+        ordered = [current]
+        while current.superseded_by_revision_id is not None:
+            current = rows[current.superseded_by_revision_id]
+            ordered.append(current)
+        return [_contract_revision_to_domain(m) for m in ordered]
+
     def get(self, contract_id: uuid.UUID) -> Contract | None:
-        m = self._session.get(ContractModel, contract_id)
-        return _contract_to_domain(m) if m else None
+        row = self._session.execute(self._current_revision_join().where(ContractModel.id == contract_id)).first()
+        return _assemble_contract(*row) if row else None
 
     def find_by_contract_no(self, contract_no: str) -> list[Contract]:
-        rows = self._session.scalars(select(ContractModel).where(ContractModel.contract_no == contract_no))
-        return [_contract_to_domain(m) for m in rows]
+        rows = self._session.execute(self._current_revision_join().where(ContractModel.contract_no == contract_no))
+        return [_assemble_contract(anchor, rev) for anchor, rev in rows]
+
+    def find_by_identity(self, contract_no: str, counterparty: str | None) -> list[Contract]:
+        """The (contract_no, counterparty) identity lookup R5 backfill
+        uses to resolve 0 / 1 / many existing anchors — never assumed
+        unique (docs/PHASE2D1-R0-DECISIONS.md section 4.4)."""
+        rows = self._session.execute(
+            self._current_revision_join().where(
+                ContractModel.contract_no == contract_no, ContractModel.counterparty == counterparty
+            )
+        )
+        return [_assemble_contract(anchor, rev) for anchor, rev in rows]
 
     def list_all(self) -> list[Contract]:
-        rows = self._session.scalars(select(ContractModel))
-        return [_contract_to_domain(m) for m in rows]
+        rows = self._session.execute(self._current_revision_join())
+        return [_assemble_contract(anchor, rev) for anchor, rev in rows]
 
     def count(self) -> int:
         return len(self._session.scalars(select(ContractModel.id)).all())
@@ -1589,6 +1775,7 @@ class PaymentRepository:
                 running_balance=payment.running_balance,
                 source_fragment_id=payment.source_fragment_id,
                 created_at=payment.created_at,
+                source_account_id=payment.source_account_id,
             )
         )
 
@@ -1598,6 +1785,33 @@ class PaymentRepository:
 
     def list_all(self) -> list[Payment]:
         rows = self._session.scalars(select(PaymentModel))
+        return [_payment_to_domain(m) for m in rows]
+
+    def find_by_identity(
+        self,
+        *,
+        source_account_id: str,
+        transaction_date,
+        direction: str,
+        amount: Decimal,
+        bank_reference: str,
+    ) -> list[Payment]:
+        """Phase 2D.1-R5's robust business identity
+        (docs/PHASE2D1-R0-DECISIONS.md section 4.4): the composite that
+        actually separates two genuinely different transactions on
+        different accounts. Returns a list — not assumed unique at the
+        DB level, mirroring Contract's identity lookup; the caller (R5
+        backfill) treats more than one match as ambiguous, never a
+        first() guess."""
+        rows = self._session.scalars(
+            select(PaymentModel).where(
+                PaymentModel.source_account_id == source_account_id,
+                PaymentModel.transaction_date == transaction_date,
+                PaymentModel.direction == direction,
+                PaymentModel.amount == amount,
+                PaymentModel.bank_reference == bank_reference,
+            )
+        )
         return [_payment_to_domain(m) for m in rows]
 
     def count(self) -> int:
@@ -2120,6 +2334,7 @@ def _invoice_item_allocation_to_domain(m: InvoiceItemAllocationModel) -> Invoice
         confirmation_type=m.confirmation_type,
         source_fragment_id=m.source_fragment_id,
         created_at=m.created_at,
+        superseded_by_fact_id=m.superseded_by_fact_id,
     )
 
 
@@ -2132,6 +2347,7 @@ def _cost_recognition_fact_to_domain(m: CostRecognitionFactModel) -> CostRecogni
         source_fragment_id=m.source_fragment_id,
         created_at=m.created_at,
         shipment_id=m.shipment_id,
+        superseded_by_fact_id=m.superseded_by_fact_id,
     )
 
 
@@ -2146,6 +2362,7 @@ def _accrual_basis_fact_to_domain(m: AccrualBasisFactModel) -> AccrualBasisFact:
         basis=m.basis,
         source_fragment_id=m.source_fragment_id,
         created_at=m.created_at,
+        superseded_by_fact_id=m.superseded_by_fact_id,
     )
 
 
@@ -2159,6 +2376,7 @@ def _historical_accrual_fact_to_domain(m: HistoricalAccrualFactModel) -> Histori
         basis=m.basis,
         source_fragment_id=m.source_fragment_id,
         confirmed_at=m.confirmed_at,
+        superseded_by_fact_id=m.superseded_by_fact_id,
     )
 
 
@@ -2189,6 +2407,16 @@ def _accrual_reversal_to_domain(m: AccrualReversalModel) -> AccrualReversal:
 
 
 class InvoiceItemAllocationRepository:
+    """docs/PHASE2D1-R0-DECISIONS.md section 21 (Phase 2D.1-R5 pre-flight
+    debt): whole-fact supersession. Every "current" read method excludes
+    a row whose ``superseded_by_fact_id`` is set — for today's data,
+    where nothing has ever been superseded, this filters nothing and
+    changes no existing behaviour. ``mark_superseded`` is the ONLY write
+    path that sets it, via a single atomic conditional UPDATE (the same
+    CAS shape as ContractItemRepository.append_revision_against_current)
+    so two concurrent supersession attempts against the same fact can
+    never both succeed."""
+
     def __init__(self, session: Session) -> None:
         self._session = session
 
@@ -2212,17 +2440,31 @@ class InvoiceItemAllocationRepository:
 
     def list_for_contract_item(self, contract_item_id: uuid.UUID) -> list[InvoiceItemAllocation]:
         rows = self._session.scalars(
-            select(InvoiceItemAllocationModel).where(InvoiceItemAllocationModel.contract_item_id == contract_item_id)
+            select(InvoiceItemAllocationModel).where(
+                InvoiceItemAllocationModel.contract_item_id == contract_item_id,
+                InvoiceItemAllocationModel.superseded_by_fact_id.is_(None),
+            )
         )
         return [_invoice_item_allocation_to_domain(m) for m in rows]
 
     def list_for_invoice_item(self, invoice_item_id: uuid.UUID) -> list[InvoiceItemAllocation]:
         rows = self._session.scalars(
-            select(InvoiceItemAllocationModel).where(InvoiceItemAllocationModel.invoice_item_id == invoice_item_id)
+            select(InvoiceItemAllocationModel).where(
+                InvoiceItemAllocationModel.invoice_item_id == invoice_item_id,
+                InvoiceItemAllocationModel.superseded_by_fact_id.is_(None),
+            )
         )
         return [_invoice_item_allocation_to_domain(m) for m in rows]
 
     def list_all(self) -> list[InvoiceItemAllocation]:
+        rows = self._session.scalars(
+            select(InvoiceItemAllocationModel).where(InvoiceItemAllocationModel.superseded_by_fact_id.is_(None))
+        )
+        return [_invoice_item_allocation_to_domain(m) for m in rows]
+
+    def list_all_including_superseded(self) -> list[InvoiceItemAllocation]:
+        """Full audit view — used by reconciliation/history tooling, never
+        by the Rule Engine."""
         rows = self._session.scalars(select(InvoiceItemAllocationModel))
         return [_invoice_item_allocation_to_domain(m) for m in rows]
 
@@ -2231,9 +2473,21 @@ class InvoiceItemAllocationRepository:
             select(InvoiceItemAllocationModel).where(
                 InvoiceItemAllocationModel.invoice_item_id == invoice_item_id,
                 InvoiceItemAllocationModel.contract_item_id == contract_item_id,
+                InvoiceItemAllocationModel.superseded_by_fact_id.is_(None),
             )
         )
         return _invoice_item_allocation_to_domain(m) if m else None
+
+    def mark_superseded(self, fact_id: uuid.UUID, *, superseded_by_fact_id: uuid.UUID) -> bool:
+        result = self._session.execute(
+            update(InvoiceItemAllocationModel)
+            .where(
+                InvoiceItemAllocationModel.id == fact_id,
+                InvoiceItemAllocationModel.superseded_by_fact_id.is_(None),
+            )
+            .values(superseded_by_fact_id=superseded_by_fact_id)
+        )
+        return result.rowcount == 1
 
     def sum_allocated_quantity_for_invoice_item(self, invoice_item_id: uuid.UUID) -> Decimal:
         rows = self.list_for_invoice_item(invoice_item_id)
@@ -2261,10 +2515,21 @@ class CostRecognitionFactRepository:
         )
 
     def list_for_shipment(self, shipment_id: uuid.UUID) -> list[CostRecognitionFact]:
-        rows = self._session.scalars(select(CostRecognitionFactModel).where(CostRecognitionFactModel.shipment_id == shipment_id))
+        rows = self._session.scalars(
+            select(CostRecognitionFactModel).where(
+                CostRecognitionFactModel.shipment_id == shipment_id,
+                CostRecognitionFactModel.superseded_by_fact_id.is_(None),
+            )
+        )
         return [_cost_recognition_fact_to_domain(m) for m in rows]
 
     def list_all(self) -> list[CostRecognitionFact]:
+        rows = self._session.scalars(
+            select(CostRecognitionFactModel).where(CostRecognitionFactModel.superseded_by_fact_id.is_(None))
+        )
+        return [_cost_recognition_fact_to_domain(m) for m in rows]
+
+    def list_all_including_superseded(self) -> list[CostRecognitionFact]:
         rows = self._session.scalars(select(CostRecognitionFactModel))
         return [_cost_recognition_fact_to_domain(m) for m in rows]
 
@@ -2277,6 +2542,14 @@ class CostRecognitionFactRepository:
             )
         )
         return _cost_recognition_fact_to_domain(m) if m else None
+
+    def mark_superseded(self, fact_id: uuid.UUID, *, superseded_by_fact_id: uuid.UUID) -> bool:
+        result = self._session.execute(
+            update(CostRecognitionFactModel)
+            .where(CostRecognitionFactModel.id == fact_id, CostRecognitionFactModel.superseded_by_fact_id.is_(None))
+            .values(superseded_by_fact_id=superseded_by_fact_id)
+        )
+        return result.rowcount == 1
 
     def count(self) -> int:
         return len(self._session.scalars(select(CostRecognitionFactModel.id)).all())
@@ -2302,12 +2575,21 @@ class AccrualBasisFactRepository:
         )
 
     def list_all(self) -> list[AccrualBasisFact]:
+        rows = self._session.scalars(
+            select(AccrualBasisFactModel).where(AccrualBasisFactModel.superseded_by_fact_id.is_(None))
+        )
+        return [_accrual_basis_fact_to_domain(m) for m in rows]
+
+    def list_all_including_superseded(self) -> list[AccrualBasisFact]:
         rows = self._session.scalars(select(AccrualBasisFactModel))
         return [_accrual_basis_fact_to_domain(m) for m in rows]
 
     def list_for_contract_item(self, contract_item_id: uuid.UUID) -> list[AccrualBasisFact]:
         rows = self._session.scalars(
-            select(AccrualBasisFactModel).where(AccrualBasisFactModel.contract_item_id == contract_item_id)
+            select(AccrualBasisFactModel).where(
+                AccrualBasisFactModel.contract_item_id == contract_item_id,
+                AccrualBasisFactModel.superseded_by_fact_id.is_(None),
+            )
         )
         return [_accrual_basis_fact_to_domain(m) for m in rows]
 
@@ -2328,6 +2610,14 @@ class AccrualBasisFactRepository:
         )
         m = self._session.scalar(query)
         return _accrual_basis_fact_to_domain(m) if m else None
+
+    def mark_superseded(self, fact_id: uuid.UUID, *, superseded_by_fact_id: uuid.UUID) -> bool:
+        result = self._session.execute(
+            update(AccrualBasisFactModel)
+            .where(AccrualBasisFactModel.id == fact_id, AccrualBasisFactModel.superseded_by_fact_id.is_(None))
+            .values(superseded_by_fact_id=superseded_by_fact_id)
+        )
+        return result.rowcount == 1
 
     def count(self) -> int:
         return len(self._session.scalars(select(AccrualBasisFactModel.id)).all())
@@ -2352,12 +2642,21 @@ class HistoricalAccrualFactRepository:
         )
 
     def list_all(self) -> list[HistoricalAccrualFact]:
+        rows = self._session.scalars(
+            select(HistoricalAccrualFactModel).where(HistoricalAccrualFactModel.superseded_by_fact_id.is_(None))
+        )
+        return [_historical_accrual_fact_to_domain(m) for m in rows]
+
+    def list_all_including_superseded(self) -> list[HistoricalAccrualFact]:
         rows = self._session.scalars(select(HistoricalAccrualFactModel))
         return [_historical_accrual_fact_to_domain(m) for m in rows]
 
     def list_for_contract_item(self, contract_item_id: uuid.UUID) -> list[HistoricalAccrualFact]:
         rows = self._session.scalars(
-            select(HistoricalAccrualFactModel).where(HistoricalAccrualFactModel.contract_item_id == contract_item_id)
+            select(HistoricalAccrualFactModel).where(
+                HistoricalAccrualFactModel.contract_item_id == contract_item_id,
+                HistoricalAccrualFactModel.superseded_by_fact_id.is_(None),
+            )
         )
         return [_historical_accrual_fact_to_domain(m) for m in rows]
 
@@ -2379,6 +2678,16 @@ class HistoricalAccrualFactRepository:
             )
         )
         return _historical_accrual_fact_to_domain(m) if m else None
+
+    def mark_superseded(self, fact_id: uuid.UUID, *, superseded_by_fact_id: uuid.UUID) -> bool:
+        result = self._session.execute(
+            update(HistoricalAccrualFactModel)
+            .where(
+                HistoricalAccrualFactModel.id == fact_id, HistoricalAccrualFactModel.superseded_by_fact_id.is_(None)
+            )
+            .values(superseded_by_fact_id=superseded_by_fact_id)
+        )
+        return result.rowcount == 1
 
     def count(self) -> int:
         return len(self._session.scalars(select(HistoricalAccrualFactModel.id)).all())

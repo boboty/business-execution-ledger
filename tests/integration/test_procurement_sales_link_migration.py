@@ -86,7 +86,6 @@ def test_slice1_baseline_with_contract_and_sales_contract_upgrades_to_head_untou
     assert _alembic(db_path, "upgrade", SLICE1_REVISION).returncode == 0
 
     from bel.application.sales_contract_facts import create_sales_contract_fact
-    from bel.domain.contract import Contract
     from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
     from bel.infrastructure.persistence.repositories import EvidenceRepository
 
@@ -102,19 +101,32 @@ def test_slice1_baseline_with_contract_and_sales_contract_upgrades_to_head_untou
         )
         EvidenceRepository(session).add_fragment(frag)
         session.flush()
-        contract = Contract(
-            id=uuid.uuid4(), contract_no="C-MIGRATION-PSL-1", contract_type=None, counterparty="Supplier",
-            buyer="Buyer", gross_amount=Decimal("100.00"), currency="CNY", contract_date=None,
-            current_source_fragment_id=frag.id, created_at=now, updated_at=now,
+        # SLICE1_REVISION predates the Phase 2D.1-R5 Contract
+        # anchor+revision migration — contracts is still the OLD flat
+        # shape at this baseline, so it must be seeded with raw SQL, not
+        # the current (head-schema) ContractRepository.
+        contract_id = uuid.uuid4()
+        session.execute(
+            sa.text(
+                "INSERT INTO contracts (id, contract_no, contract_type, counterparty, buyer, gross_amount, "
+                "currency, contract_date, current_source_fragment_id, created_at, updated_at) VALUES "
+                "(:id, :contract_no, :contract_type, :counterparty, :buyer, :gross_amount, :currency, "
+                ":contract_date, :current_source_fragment_id, :created_at, :updated_at)"
+            ),
+            {
+                "id": contract_id.hex, "contract_no": "C-MIGRATION-PSL-1", "contract_type": None,
+                "counterparty": "Supplier", "buyer": "Buyer", "gross_amount": "100.00", "currency": "CNY",
+                "contract_date": None, "current_source_fragment_id": frag.id.hex, "created_at": now,
+                "updated_at": now,
+            },
         )
-        ContractRepository(session).add(contract)
         session.flush()
         sales_contract = create_sales_contract_fact(
             session, our_entity="Entity A", sales_contract_no="SC-MIGRATION-PSL", fields={"customer": "Customer Co"},
             source_fragment_id=frag.id, created_at=now,
         ).sales_contract
         session.commit()
-        contract_id, sales_contract_id = contract.id, sales_contract.id
+        sales_contract_id = sales_contract.id
 
     result = _alembic(db_path, "upgrade", "head")
     assert result.returncode == 0, result.stderr

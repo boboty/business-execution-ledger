@@ -73,8 +73,6 @@ def test_r2_baseline_with_shipment_upgrades_to_head_untouched(tmp_path):
     db_path = tmp_path / "r2-baseline.db"
     assert _alembic(db_path, "upgrade", R2_REVISION).returncode == 0
 
-    from bel.application.shipment_facts import create_shipment_fact
-    from bel.domain.contract import Contract
     from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
     from bel.infrastructure.persistence.repositories import EvidenceRepository
 
@@ -90,20 +88,54 @@ def test_r2_baseline_with_shipment_upgrades_to_head_untouched(tmp_path):
         )
         EvidenceRepository(session).add_fragment(frag)
         session.flush()
-        contract = Contract(
-            id=uuid.uuid4(), contract_no="C-MIGRATION-SC-1", contract_type=None, counterparty="Supplier",
-            buyer="Buyer", gross_amount=Decimal("100.00"), currency="CNY", contract_date=None,
-            current_source_fragment_id=frag.id, created_at=now, updated_at=now,
+        # R2_REVISION predates the Phase 2D.1-R5 Contract anchor+revision
+        # migration — contracts is still the OLD flat shape at this
+        # baseline, so it must be seeded with raw SQL, not the current
+        # (head-schema) ContractRepository.
+        contract_id = uuid.uuid4()
+        session.execute(
+            sa.text(
+                "INSERT INTO contracts (id, contract_no, contract_type, counterparty, buyer, gross_amount, "
+                "currency, contract_date, current_source_fragment_id, created_at, updated_at) VALUES "
+                "(:id, :contract_no, :contract_type, :counterparty, :buyer, :gross_amount, :currency, "
+                ":contract_date, :current_source_fragment_id, :created_at, :updated_at)"
+            ),
+            {
+                "id": contract_id.hex, "contract_no": "C-MIGRATION-SC-1", "contract_type": None,
+                "counterparty": "Supplier", "buyer": "Buyer", "gross_amount": "100.00", "currency": "CNY",
+                "contract_date": None, "current_source_fragment_id": frag.id.hex, "created_at": now,
+                "updated_at": now,
+            },
         )
-        ContractRepository(session).add(contract)
         session.flush()
-        shipment = create_shipment_fact(
-            session, contract_id=contract.id, external_reference="EXP-MIGRATION-SC",
-            execution_date=date(2031, 3, 1), fields={"quantity": Decimal("10")},
-            source_fragment_id=frag.id, created_at=now,
-        ).shipment
+        # create_shipment_fact (current code) reads Contract through
+        # ContractRepository, which now assumes the HEAD schema — at this
+        # R2 baseline it does not exist yet, so the Shipment anchor +
+        # INITIAL revision are seeded with raw SQL too, matching
+        # ShipmentModel/ShipmentRevisionModel's shape (unchanged since R2).
+        shipment_id = uuid.uuid4()
+        session.execute(
+            sa.text(
+                "INSERT INTO shipments (id, contract_id, external_reference, execution_date, created_at) "
+                "VALUES (:id, :contract_id, :external_reference, :execution_date, :created_at)"
+            ),
+            {
+                "id": shipment_id.hex, "contract_id": contract_id.hex, "external_reference": "EXP-MIGRATION-SC",
+                "execution_date": date(2031, 3, 1), "created_at": now,
+            },
+        )
+        session.execute(
+            sa.text(
+                "INSERT INTO shipment_revisions (id, shipment_id, revision_type, contract_item_id, quantity, "
+                "source_fragment_id, superseded_by_revision_id, asserted_field_names, created_at) VALUES "
+                "(:id, :shipment_id, 'INITIAL', NULL, :quantity, :source_fragment_id, NULL, NULL, :created_at)"
+            ),
+            {
+                "id": uuid.uuid4().hex, "shipment_id": shipment_id.hex, "quantity": "10.0000",
+                "source_fragment_id": frag.id.hex, "created_at": now,
+            },
+        )
         session.commit()
-        contract_id, shipment_id = contract.id, shipment.id
 
     result = _alembic(db_path, "upgrade", "head")
     assert result.returncode == 0, result.stderr

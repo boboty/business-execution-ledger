@@ -116,3 +116,83 @@ def test_report_rejects_scenario_identifier_path_escape(tmp_path):
     runner._write_report(tmp_path, "../escaped-report", {"detail": "synthetic-secret"})
 
     assert not escaped.exists()
+
+
+# ---------------------------------------------------------------------------
+# P2D_CUTOVER_RECONCILIATION — synthetic end-to-end, public-safe throughout.
+# ---------------------------------------------------------------------------
+
+
+def _write_synthetic_ledger(path):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "报关出口购销合同"
+    ws.append(["Title"])
+    ws.append(["序号", "合同编码", "卖方", "买方", "金额"])
+    ws.append([1, "C-SYNTH", "SupplierSynth", "BuyerSynth", 100])
+    wb.save(path)
+
+
+def test_p2d_missing_plan_is_not_ready_and_redacted(tmp_path, capsys):
+    period_dir = tmp_path / "2026-01"
+    period_dir.mkdir()
+
+    result = runner.run_scenario(tmp_path, "2026-01", "P2D_CUTOVER_RECONCILIATION")
+    assert result is False
+    captured = capsys.readouterr()
+    assert captured.out == "P2D_CUTOVER_RECONCILIATION: FAIL\n"
+    report = (tmp_path / "reports" / "P2D_CUTOVER_RECONCILIATION.json").read_text()
+    assert "NOT_READY" in report
+
+
+def test_p2d_missing_baseline_is_reported_privately_only(tmp_path, capsys):
+    period_dir = tmp_path / "2026-01"
+    period_dir.mkdir()
+    (period_dir / "contracts").mkdir()
+    _write_synthetic_ledger(period_dir / "contracts" / "ledger.xlsx")
+    (period_dir / "backfill-plan.json").write_text('{"version": 1, "contracts": {"path": "contracts/ledger.xlsx"}}')
+
+    result = runner.run_scenario(tmp_path, "2026-01", "P2D_CUTOVER_RECONCILIATION")
+    assert result is False
+    captured = capsys.readouterr()
+    assert captured.out == "P2D_CUTOVER_RECONCILIATION: FAIL\n"
+    assert captured.err == ""
+
+
+def test_p2d_pass_end_to_end_stdout_is_scenario_id_only(tmp_path, capsys):
+    period_dir = tmp_path / "2026-01"
+    (period_dir / "contracts").mkdir(parents=True)
+    (period_dir / "expected").mkdir()
+    _write_synthetic_ledger(period_dir / "contracts" / "ledger.xlsx")
+    (period_dir / "backfill-plan.json").write_text('{"version": 1, "contracts": {"path": "contracts/ledger.xlsx"}}')
+    baseline = {
+        "entries": [
+            {
+                "key": "contract:contract_no=C-SYNTH|counterparty=SupplierSynth",
+                "expected": {
+                    "contract_type": "出口报关购销合同", "buyer": "BuyerSynth", "gross_amount": "100.00",
+                    "currency": "CNY", "contract_date": None,
+                },
+                "outcome": "MATCH",
+            },
+            {
+                "key": "unresolved_indicator:contract_no=C-SYNTH|counterparty=SupplierSynth",
+                "expected": {"has_unresolved": False}, "outcome": "MATCH",
+            },
+        ]
+    }
+    (period_dir / "expected" / "cutover-baseline.json").write_text(__import__("json").dumps(baseline))
+
+    result = runner.run_scenario(tmp_path, "2026-01", "P2D_CUTOVER_RECONCILIATION")
+    captured = capsys.readouterr()
+    assert result is True
+    assert captured.out == "P2D_CUTOVER_RECONCILIATION: PASS\n"
+    assert captured.err == ""
+    # The full diagnostic (business identities, amounts) lands ONLY in
+    # the private report — never in stdout (spec section 35, HARD).
+    report_path = tmp_path / "reports" / "P2D_CUTOVER_RECONCILIATION.json"
+    assert report_path.exists()
+    assert "C-SYNTH" in report_path.read_text()
+    assert "C-SYNTH" not in captured.out

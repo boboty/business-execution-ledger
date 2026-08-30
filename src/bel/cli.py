@@ -1740,5 +1740,104 @@ def web_cmd(ctx: click.Context, host: str, port: int) -> None:
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
+def _resolve_cutover_period_dir(period: str) -> Path:
+    """Same rejection semantics as
+    tests/private_acceptance/runner.py's resolve_private_root/
+    resolve_period_dir (root unset, root inside the repository, period
+    not found) — implemented independently here rather than importing
+    from that test module, but deliberately not re-inventing the rules
+    themselves (section 36)."""
+    import os
+
+    raw_root = os.environ.get("BEL_PRIVATE_DATA_ROOT")
+    if not raw_root:
+        raise click.ClickException("BEL_PRIVATE_DATA_ROOT is not set")
+    try:
+        root = Path(raw_root).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise click.ClickException(f"BEL_PRIVATE_DATA_ROOT does not resolve: {exc}") from exc
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        root.relative_to(repo_root)
+        raise click.ClickException("BEL_PRIVATE_DATA_ROOT must not be inside the repository")
+    except ValueError:
+        pass
+    if not root.is_dir():
+        raise click.ClickException("BEL_PRIVATE_DATA_ROOT is not a directory")
+    period_dir = (root / period).resolve(strict=False)
+    try:
+        period_dir.relative_to(root)
+    except ValueError:
+        raise click.ClickException(f"period {period!r} does not resolve inside BEL_PRIVATE_DATA_ROOT")
+    if not period_dir.is_dir():
+        raise click.ClickException(f"period directory not found: {period_dir}")
+    return period_dir
+
+
+@cli.group("cutover")
+def cutover_group() -> None:
+    """Phase 2D.1-R5 cutover infrastructure/rehearsal — backfill and
+    reconciliation only. Never a final-cutover switch: passing
+    reconciliation here does not declare BEL the System of Record."""
+
+
+@cutover_group.command("backfill")
+@click.option("--period", required=True, help="Period directory name under BEL_PRIVATE_DATA_ROOT, e.g. 2026-07.")
+@click.pass_context
+def cutover_backfill_cmd(ctx: click.Context, period: str) -> None:
+    """Run the identity-aware backfill plan (backfill-plan.json) for one
+    period against the local BEL database. Never prints private business
+    values — only per-section created/replay/task counts."""
+    from bel.application.cutover_plan import run_backfill_plan
+
+    period_dir = _resolve_cutover_period_dir(period)
+    plan_path = period_dir / "backfill-plan.json"
+    if not plan_path.exists():
+        raise click.ClickException(f"backfill-plan.json not found under {period_dir}")
+
+    import json
+
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        result = run_backfill_plan(session, plan, period_dir=period_dir, created_at=datetime.now(timezone.utc))
+
+    click.echo(f"cutover backfill — period={period}")
+    for section, outcome in result.sections.items():
+        if isinstance(outcome, list):
+            for entry in outcome:
+                click.echo(f"  {section}: created={entry.get('created')} tasks={len(entry.get('tasks', []))}")
+        elif isinstance(outcome, dict) and "created" in outcome:
+            click.echo(f"  {section}: created={outcome['created']} tasks={len(outcome.get('tasks', []))}")
+        else:
+            click.echo(f"  {section}: done")
+
+
+@cutover_group.command("reconcile")
+@click.option("--period", required=True, help="Period directory name under BEL_PRIVATE_DATA_ROOT, e.g. 2026-07.")
+@click.pass_context
+def cutover_reconcile_cmd(ctx: click.Context, period: str) -> None:
+    """Reconcile the local BEL database's current contract-execution
+    state against the private Cutover Baseline for one period. Prints
+    only the scenario verdict and the UNRESOLVED count — full diagnostics
+    (business identities, amounts) are never printed to stdout."""
+    from bel.application.cutover_reconciliation import reconcile
+
+    period_dir = _resolve_cutover_period_dir(period)
+    baseline_path = period_dir / "expected" / "cutover-baseline.json"
+    if not baseline_path.exists():
+        raise click.ClickException(f"expected/cutover-baseline.json not found under {period_dir}")
+
+    import json
+
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    session_factory = _session_factory(ctx.obj["db_path"])
+    with session_factory() as session:
+        result = reconcile(session, baseline)
+
+    click.echo(f"P2D_CUTOVER_RECONCILIATION: {'PASS' if result.passed else 'FAIL'}")
+    click.echo(f"unresolved_count={result.unresolved_count}")
+
+
 if __name__ == "__main__":
     cli()

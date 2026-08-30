@@ -28,6 +28,7 @@ import re
 import sys
 import traceback
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -602,6 +603,49 @@ def run_p2b_recompute(period_dir: Path) -> dict[str, Any]:
     return diagnostic
 
 
+def run_p2d_cutover_reconciliation(period_dir: Path) -> dict[str, Any]:
+    """Phase 2D.1-R5 rehearsal: identity-aware backfill against a
+    ``backfill-plan.json`` manifest, then reconciliation against a
+    private Cutover Baseline. Public stdout stays scenario-ID-only
+    (spec section 35, HARD) — this diagnostic dict is written ONLY to
+    ``$BEL_PRIVATE_DATA_ROOT/reports/``, never printed, exactly like
+    every other scenario in this file."""
+    from bel.application.cutover_plan import run_backfill_plan
+    from bel.application.cutover_reconciliation import reconcile
+
+    plan_path = period_dir / "backfill-plan.json"
+    if not plan_path.exists():
+        raise AcceptanceError(REASON_NOT_READY, {"missing": "backfill-plan.json"})
+    baseline_path = period_dir / "expected" / "cutover-baseline.json"
+    if not baseline_path.exists():
+        raise AcceptanceError(REASON_EXPECTED_FILE_MISSING, {"path": str(baseline_path)})
+
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise AcceptanceError(REASON_UNEXPECTED_ERROR, {"stage": "parse", "error": str(exc)}) from exc
+
+    session = _new_session()
+    now = datetime.now(timezone.utc)
+    try:
+        run_backfill_plan(session, plan, period_dir=period_dir, created_at=now)
+    except Exception as exc:  # noqa: BLE001 — a plan/backfill failure is a scenario FAIL, not a crash
+        raise AcceptanceError(REASON_UNEXPECTED_ERROR, {"stage": "backfill", "error": str(exc)}) from exc
+
+    result = reconcile(session, baseline)
+    diagnostic: dict[str, Any] = {
+        "scenario": "P2D_CUTOVER_RECONCILIATION",
+        "unresolved_count": result.unresolved_count,
+        "entries": [
+            {"key": e.key, "outcome": e.outcome, "baseline_outcome": e.baseline_outcome} for e in result.entries
+        ],
+    }
+    if not result.passed:
+        raise AcceptanceError(REASON_RESULT_MISMATCH, diagnostic)
+    return diagnostic
+
+
 SCENARIOS = {
     "P1_IMPORT": run_p1_import,
     "P2A_INVOICE_IMPORT": run_invoice_import,
@@ -613,6 +657,7 @@ SCENARIOS = {
     "P2B_NEW_ACCRUAL": run_p2b_new_accrual,
     "P2B_PERIOD_CLOSE": run_p2b_period_close,
     "P2B_RECOMPUTE": run_p2b_recompute,
+    "P2D_CUTOVER_RECONCILIATION": run_p2d_cutover_reconciliation,
 }
 
 

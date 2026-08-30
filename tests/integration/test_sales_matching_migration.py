@@ -96,10 +96,7 @@ def test_r3a_populated_baseline_upgrades_to_head_untouched(tmp_path):
     db_path = tmp_path / "r3a-baseline.db"
     assert _alembic(db_path, "upgrade", R3A_REVISION).returncode == 0
 
-    from bel.application.procurement_sales_link import add_procurement_sales_link
     from bel.application.sales_contract_facts import create_sales_contract_fact
-    from bel.application.shipment_facts import create_shipment_fact
-    from bel.domain.contract import Contract
     from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
     from bel.domain.invoice import Invoice, InvoiceDirection
     from bel.domain.matching import (
@@ -129,12 +126,33 @@ def test_r3a_populated_baseline_upgrades_to_head_untouched(tmp_path):
         EvidenceRepository(session).add_fragment(frag)
         session.flush()
 
-        contract = Contract(
-            id=uuid.uuid4(), contract_no="C-MIGRATION-R3B", contract_type=None, counterparty="Supplier",
-            buyer="Buyer", gross_amount=Decimal("1000.00"), currency="CNY", contract_date=None,
-            current_source_fragment_id=frag.id, created_at=now, updated_at=now,
+        # R3A_REVISION predates the Phase 2D.1-R5 Contract anchor+revision
+        # migration — contracts is still the OLD flat shape at this
+        # baseline, so Contract AND every current-code function that
+        # reads a Contract through ContractRepository (add_procurement_
+        # sales_link, create_shipment_fact) would break here. Contract
+        # and Shipment are seeded with raw SQL instead; ProcurementSalesLink
+        # is a flat, un-revisioned table whose shape hasn't changed, so a
+        # plain raw INSERT is used for it too, for consistency.
+        class _Contract:
+            def __init__(self, id):
+                self.id = id
+
+        contract = _Contract(uuid.uuid4())
+        session.execute(
+            sa.text(
+                "INSERT INTO contracts (id, contract_no, contract_type, counterparty, buyer, gross_amount, "
+                "currency, contract_date, current_source_fragment_id, created_at, updated_at) VALUES "
+                "(:id, :contract_no, :contract_type, :counterparty, :buyer, :gross_amount, :currency, "
+                ":contract_date, :current_source_fragment_id, :created_at, :updated_at)"
+            ),
+            {
+                "id": contract.id.hex, "contract_no": "C-MIGRATION-R3B", "contract_type": None,
+                "counterparty": "Supplier", "buyer": "Buyer", "gross_amount": "1000.00", "currency": "CNY",
+                "contract_date": None, "current_source_fragment_id": frag.id.hex, "created_at": now,
+                "updated_at": now,
+            },
         )
-        ContractRepository(session).add(contract)
         session.flush()
 
         sales_contract = create_sales_contract_fact(
@@ -142,15 +160,41 @@ def test_r3a_populated_baseline_upgrades_to_head_untouched(tmp_path):
             source_fragment_id=frag.id, created_at=now,
         ).sales_contract
 
-        add_procurement_sales_link(
-            session, procurement_contract_id=contract.id, sales_contract_id=sales_contract.id,
-            source_fragment_id=frag.id, confirmation_type=LinkConfirmationType.AUTO_CONFIRMED, created_at=now,
+        session.execute(
+            sa.text(
+                "INSERT INTO procurement_sales_links (id, procurement_contract_id, sales_contract_id, "
+                "source_fragment_id, confirmation_type, created_at) VALUES "
+                "(:id, :procurement_contract_id, :sales_contract_id, :source_fragment_id, 'AUTO_CONFIRMED', :created_at)"
+            ),
+            {
+                "id": uuid.uuid4().hex, "procurement_contract_id": contract.id.hex,
+                "sales_contract_id": sales_contract.id.hex, "source_fragment_id": frag.id.hex, "created_at": now,
+            },
         )
 
-        shipment = create_shipment_fact(
-            session, contract_id=contract.id, external_reference="EXP-MIGRATION-R3B", execution_date=date(2031, 3, 1),
-            fields={"quantity": Decimal("10")}, source_fragment_id=frag.id, created_at=now,
-        ).shipment
+        shipment = _Contract(uuid.uuid4())
+        session.execute(
+            sa.text(
+                "INSERT INTO shipments (id, contract_id, external_reference, execution_date, created_at) "
+                "VALUES (:id, :contract_id, :external_reference, :execution_date, :created_at)"
+            ),
+            {
+                "id": shipment.id.hex, "contract_id": contract.id.hex, "external_reference": "EXP-MIGRATION-R3B",
+                "execution_date": date(2031, 3, 1), "created_at": now,
+            },
+        )
+        session.execute(
+            sa.text(
+                "INSERT INTO shipment_revisions (id, shipment_id, revision_type, contract_item_id, quantity, "
+                "source_fragment_id, superseded_by_revision_id, asserted_field_names, created_at) VALUES "
+                "(:id, :shipment_id, 'INITIAL', NULL, :quantity, :source_fragment_id, NULL, NULL, :created_at)"
+            ),
+            {
+                "id": uuid.uuid4().hex, "shipment_id": shipment.id.hex, "quantity": "10.0000",
+                "source_fragment_id": frag.id.hex, "created_at": now,
+            },
+        )
+        session.flush()
 
         invoice = Invoice(
             id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no="INV-R3B",
@@ -174,12 +218,22 @@ def test_r3a_populated_baseline_upgrades_to_head_untouched(tmp_path):
             )
         )
 
-        payment = Payment(
-            id=uuid.uuid4(), transaction_date=date(2031, 1, 1), direction=PaymentDirection.OUT,
-            amount=Decimal("300.00"), counterparty="Supplier", business_type=None, bank_reference="REF-R3B",
-            description=None, running_balance=None, source_fragment_id=frag.id, created_at=now,
+        # R3A_REVISION also predates the Phase 2D.1-R5 Payment
+        # source_account_id migration — payments has no such column yet.
+        payment = _Contract(uuid.uuid4())
+        session.execute(
+            sa.text(
+                "INSERT INTO payments (id, transaction_date, direction, amount, counterparty, business_type, "
+                "bank_reference, description, running_balance, source_fragment_id, created_at) VALUES "
+                "(:id, :transaction_date, :direction, :amount, :counterparty, :business_type, :bank_reference, "
+                ":description, :running_balance, :source_fragment_id, :created_at)"
+            ),
+            {
+                "id": payment.id.hex, "transaction_date": date(2031, 1, 1), "direction": PaymentDirection.OUT,
+                "amount": "300.00", "counterparty": "Supplier", "business_type": None, "bank_reference": "REF-R3B",
+                "description": None, "running_balance": None, "source_fragment_id": frag.id.hex, "created_at": now,
+            },
         )
-        PaymentRepository(session).add(payment)
         session.flush()
         payment_match_case = MatchCase(
             id=uuid.uuid4(), subject_type=SubjectType.PAYMENT, subject_id=payment.id,

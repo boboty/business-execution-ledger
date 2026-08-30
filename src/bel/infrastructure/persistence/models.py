@@ -63,24 +63,74 @@ class EvidenceFragmentModel(Base):
 
 
 class ContractModel(Base):
+    """The stable identity anchor (docs/PHASE2D1-R0-DECISIONS.md section
+    1.3 / 4.4), closing the Phase 2D.1-R5 pre-flight debt: Contract now
+    uses the SAME anchor + current-revision pattern as ContractItem /
+    Shipment / SalesContract. Business identity is
+    ``(contract_no, counterparty)`` — deliberately NOT a unique
+    constraint. Duplicates are expected and produce a Task/BusinessKeyConflict
+    instead of a DB error (R0 explicitly permits ambiguity; schema-level
+    prohibition would "fix" it by forbidding a legitimate business
+    state). Business values live on ContractRevisionModel instead — this
+    anchor deliberately carries none besides the identity pair, so there
+    is nothing here to get out of sync with the current revision."""
+
     __tablename__ = "contracts"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    # Business key — deliberately NOT unique. Duplicates are expected and
-    # produce a BusinessKeyConflict TaskException instead of a DB error.
-    # See docs/DOMAIN.md and docs/RULES.md R004.
     contract_no: Mapped[str] = mapped_column(String, nullable=False, index=True)
-    contract_type: Mapped[str | None] = mapped_column(String, nullable=True)
-    counterparty: Mapped[str | None] = mapped_column(String, nullable=True)
-    buyer: Mapped[str | None] = mapped_column(String, nullable=True)
-    gross_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    currency: Mapped[str] = mapped_column(String(8), nullable=False)
-    contract_date: Mapped[date | None] = mapped_column(Date, nullable=True)
-    current_source_fragment_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("evidence_fragments.id"), nullable=False
-    )
+    counterparty: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ContractRevisionModel(Base):
+    """Versioned assertions about a Contract anchor — the same shape as
+    ContractItemRevisionModel (docs/PHASE2D1-R0-DECISIONS.md section
+    1.3). The current revision is the one row per anchor with
+    ``superseded_by_revision_id IS NULL``, resolved only in
+    ContractRepository, never re-derived elsewhere."""
+
+    __tablename__ = "contract_revisions"
+    __table_args__ = (
+        Index(
+            "uq_contract_revisions_one_current",
+            "contract_id",
+            unique=True,
+            sqlite_where=text("superseded_by_revision_id IS NULL"),
+        ),
+        Index(
+            "uq_contract_revisions_one_initial",
+            "contract_id",
+            unique=True,
+            sqlite_where=text("revision_type = 'INITIAL'"),
+        ),
+        CheckConstraint(
+            "revision_type IN ('INITIAL', 'SUPPLEMENT', 'CORRECTION')",
+            name="ck_contract_revisions_revision_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("contracts.id"), nullable=False, index=True)
+    revision_type: Mapped[str] = mapped_column(String, nullable=False)  # INITIAL / SUPPLEMENT / CORRECTION
+    contract_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    buyer: Mapped[str | None] = mapped_column(String, nullable=True)
+    gross_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    contract_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Provenance reference — the exact Evidence for THIS revision. Never
+    # re-pointed. Nullable at the schema level for the same reason every
+    # other revision table's source_fragment_id is (no DB-level Evidence
+    # enforcement); bel.application.contract_facts requires a real
+    # fragment for every revision it writes.
+    source_fragment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=True)
+    superseded_by_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("contract_revisions.id"), nullable=True, index=True
+    )
+    # The exact field names the writing command actually asserted, for
+    # exact-replay comparison. See ContractItemRevisionModel's docstring.
+    asserted_field_names: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class ContractItemModel(Base):
@@ -583,6 +633,10 @@ class PaymentModel(Base):
     running_balance: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # Phase 2D.1-R5 pre-flight debt — see Payment.source_account_id in
+    # bel.domain.payment. Nullable: no value is fabricated for
+    # pre-existing rows.
+    source_account_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
 
 
 class InvoiceAllocationModel(Base):
@@ -762,6 +816,14 @@ class InvoiceItemAllocationModel(Base):
     confirmation_type: Mapped[str] = mapped_column(String, nullable=False)
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # Phase 2D.1-R5 pre-flight debt (docs/PHASE2D1-R0-DECISIONS.md
+    # section 21): whole-fact supersession lineage pointer. NULL for a
+    # current fact; set exactly once via an atomic conditional UPDATE,
+    # never re-pointed. "Current" repository reads exclude any row with
+    # this set.
+    superseded_by_fact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("invoice_item_allocations.id"), nullable=True, index=True
+    )
 
 
 class CostRecognitionFactModel(Base):
@@ -778,6 +840,10 @@ class CostRecognitionFactModel(Base):
     # is shipment-evidenced. Never re-pointed once set.
     shipment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("shipments.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # See InvoiceItemAllocationModel.superseded_by_fact_id.
+    superseded_by_fact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("cost_recognition_facts.id"), nullable=True, index=True
+    )
 
 
 class AccrualBasisFactModel(Base):
@@ -794,6 +860,10 @@ class AccrualBasisFactModel(Base):
     basis: Mapped[str] = mapped_column(String, nullable=False)
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # See InvoiceItemAllocationModel.superseded_by_fact_id.
+    superseded_by_fact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("accrual_basis_facts.id"), nullable=True, index=True
+    )
 
 
 class HistoricalAccrualFactModel(Base):
@@ -807,6 +877,10 @@ class HistoricalAccrualFactModel(Base):
     basis: Mapped[str] = mapped_column(String, nullable=False)
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
     confirmed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # See InvoiceItemAllocationModel.superseded_by_fact_id.
+    superseded_by_fact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("historical_accrual_facts.id"), nullable=True, index=True
+    )
 
 
 class AccrualModel(Base):
