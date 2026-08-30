@@ -48,88 +48,63 @@ Finance, tax-rebate, ERP and BI systems are consumers of BEL output. Future inte
 
 ## Product goal
 
-BEL's first-stage (V1) Definition of Done is to **replace the
-manually-maintained contract business ledger spreadsheet as the System
-of Record for business facts and deterministic business state**. Business
-staff should stop hand-maintaining business status in Excel; from the
-facts it continuously receives, BEL should reconstruct contract
-execution state, produce period-close/accrual judgments at any point in
-time, give the data needed to prepare outbound invoicing, expose what it
-cannot determine, and export business results as a Data Product.
+BEL's first-stage (V1) Definition of Done is to **replace the manually-maintained contract business ledger spreadsheet as the System of Record for business facts and deterministic business state**. Business staff should stop hand-maintaining business status in Excel; from the facts it continuously receives, BEL should reconstruct contract execution state, produce period-close/accrual judgments at any point in time, give the data needed to prepare outbound invoicing, expose what it cannot determine, and export business results as Data Products.
 
-Excel remains supported as an import format, an export format, a
-cutover/backfill source, a downstream handoff format, and a
-human-readable data product — but not as the authoritative System of
-Record.
+Excel remains supported as an import format, an export format, a cutover/backfill source, a downstream handoff format, and a human-readable data product. **It is demoted from System of Record only after the first-stage cutover gate passes.** Feature completion alone is not enough: legacy data and source Evidence must be backfilled, reconciled against a business-confirmed Cutover Baseline, and every cutover discrepancy must be adjudicated.
 
-Reaching this goal requires a **cutover**, not only feature completion:
-the legacy ledger and its Evidence must be backfilled into BEL and
-reconciled against a business-confirmed baseline before BEL can be
-declared the System of Record. See
-[docs/V1-SCOPE.md](docs/V1-SCOPE.md) for the frozen scope (including the
-per-capability status of that Definition of Done) and
-[docs/PHASE2D0-DECISIONS.md](docs/PHASE2D0-DECISIONS.md) for the
-reasoning and the verified code-reality baseline.
+See [docs/V1-SCOPE.md](docs/V1-SCOPE.md) for the frozen V1 boundary and [ROADMAP.md](ROADMAP.md) for the capability sequence.
 
-## Current capabilities (v0.1.1 / Phase 2C.2)
+## Current capabilities — through Phase 2D.1
 
-- contract-ledger evidence import and canonical contract facts
-- purchase-invoice, sales-invoice and bank-statement import adapters
-- deterministic invoice/payment matching with explicit matched /
-  ambiguous / unmatched outcomes — **purchase-side only**: the matching
-  pipeline processes `PURCHASE` invoices and `OUT` payments; sales
-  invoices and incoming receipts can be imported but are not yet
-  associated with a contract
-- confirmed ContractItem ↔ InvoiceItem allocation
-- accrual, reversal and historical close facts
-- a read-only period-close preview that recomputes confirmed numbered
-  rules from current facts, answerable at period end or any other point
-  in time
-- synthetic golden tests, public CI and privacy scanning
-- two human-facing workbench pages — 月结工作台 (period-close) and
-  合同360° (Contract 360), with the Fact / Current State / Projected
-  Decision / Blocker distinction — served by
-  `bel --db /path/to/bel.db web` at `http://127.0.0.1:8000`
+Phase 2D.1, **Business Fact Foundation & Contract Ledger**, is implementation-complete. The current system includes:
 
-The close preview is intentionally stateless and read-only: it writes no vouchers, accounting entries or events.
+- traceable `Evidence → Fact → Decision` chains and deterministic purchase-side matching
+- procurement-side `Contract` facts with stable identity and revision history
+- everyday `ContractItem` fact maintenance with supplement/correction semantics
+- `Shipment` / export execution facts associated with procurement contracts
+- a separate sales-side `SalesContract` scope carrying the external customer
+- many-to-many `ProcurementSalesLink` relationships between procurement and sales scopes, with no invented amount/quantity apportionment
+- purchase-side `InvoiceAllocation` / `PaymentAllocation` and human-confirmed sales-side `SalesInvoiceAllocation` / `SalesPaymentAllocation`
+- `ContractItem ↔ InvoiceItem` confirmed allocation
+- accrual, reversal, historical close facts, and current whole-fact supersession semantics where required for cutover
+- a read-only period-close preview that recomputes numbered rules from current facts
+- three human-facing work surfaces:
+  - **合同业务总账 / Contract Business Ledger** — cross-contract current business-fact projection with filters, CSV export and XLSX export
+  - **合同360° / Contract 360** — drill-down view for one procurement contract and its current related facts
+  - **月结工作台 / Period Close Workbench** — read-only projected close judgment and blockers
+- legacy backfill infrastructure with business-identity-aware replay handling
+- a closed, human-confirmed Cutover Fact path for the explicitly allowed fact types
+- private Cutover Baseline reconciliation with `MATCH / BEL_CORRECTED_LEGACY / UNRESOLVED` outcomes
+- persistent Tasks for incomplete, ambiguous or conflicting backfill identities
+- synthetic golden tests, migration tests, privacy scanning, and private-data acceptance boundaries suitable for a public repository
 
-These pages render through the same Application Services as the CLI;
-the only human write is the manual InvoiceItem allocation, which reuses
-the exact CLI command's `allocate_invoice_item`. See
-[docs/PHASE2C-DECISIONS.md](docs/PHASE2C-DECISIONS.md),
-[docs/PHASE2C-ACCEPTANCE.md](docs/PHASE2C-ACCEPTANCE.md),
-[docs/PHASE2C2-DECISIONS.md](docs/PHASE2C2-DECISIONS.md) and
-[docs/PHASE2C2-ACCEPTANCE.md](docs/PHASE2C2-ACCEPTANCE.md).
+The Phase 2D.1 cutover work is **infrastructure and rehearsal only**. BEL has **not** yet passed the first-stage cutover gate and must not yet be declared the System of Record.
 
 ## Not built yet
 
-Stated plainly, because the concepts appear in the design documents and
-concept coverage is not implementation coverage:
+The remaining V1 critical path is intentionally narrow:
 
-- no everyday intake path for `ContractItem` (only a human-authored
-  Close Fact Pack creates one)
-- no `Shipment / Export` implementation of any kind
-- no sales-side contract association
-- no fact correction / supersession mechanism
-- no cross-contract Contract Business Ledger
-- no outbound-invoicing eligibility or preparation logic
-- no exception/task centre surface, and no data export of any kind
-- no backfill or cutover reconciliation
+- **Phase 2D.2 — Period Close Business Data Product**: turn the existing read-only close projection into a deliverable business data product while preserving the `Fact / Current State / Projected Decision / Blocker` boundary
+- **Phase 2D.3 — Outbound Invoicing Workbench**: freeze invoicing eligibility semantics, provide invoice-preparation data, and export the preparation data product; BEL prepares data but does not perform legal invoicing
+- **Phase 2D.4 — Exception & Task Center**: one human-facing center and data product for authoritative unresolved work already produced by BEL
+- **FIRST-STAGE CUTOVER GATE**: complete backfill, private reconciliation, unresolved cutover discrepancy = 0, and explicit System-of-Record switch
 
-`docs/PHASE2D0-DECISIONS.md`'s Code Reality section tags each of these
-with an implementation status and a decision status, citing the source
-location behind every claim.
+Also deliberately not built yet:
+
+- Business Cockpit
+- Agent Runtime
+- MCP / external agent tool ecosystem
+- downstream finance, tax, ERP or BI adapters
+- automatic sales-side amount matching
+- procurement/sales bridge apportionment
 
 ## Next up
 
-Phase 2D.1 (Business Fact Foundation & Contract Ledger) starts with a
-business-semantics freeze, then `ContractItem` fact maintenance,
-`Shipment / Export`, the sales-side association foundation, the Contract
-Business Ledger, and legacy backfill — followed by the Period Close data
-product, the Outbound Invoicing Workbench, the Exception & Task Center,
-and finally the first-stage cutover gate. See
-[ROADMAP.md](ROADMAP.md) for the frozen sequence. Anything not listed
-under "Current capabilities" above is not built.
+**Phase 2D.2 — Period Close Business Data Product.**
+
+The period-close business engine and workbench already exist and remain read-only/stateless. Phase 2D.2 packages that deterministic judgment as a deliverable Data Product; it does not introduce vouchers, debit/credit concepts, finance subject codes, or finance-system vocabulary.
+
+After 2D.2, V1 proceeds to Outbound Invoicing, the Exception & Task Center, and then the first-stage cutover gate. See [ROADMAP.md](ROADMAP.md).
 
 ## Getting started
 
@@ -138,28 +113,37 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 git config core.hooksPath .githooks
 .venv/bin/alembic upgrade head
+
+# Import deterministic source evidence
 .venv/bin/bel import-contract-ledger <path-to-合同台账.xlsx>
 .venv/bin/bel import-invoices <path-to-发票.xlsx> --direction purchase
-.venv/bin/bel import-bank <path-to-对账单.pdf> --profile cmb
+.venv/bin/bel import-bank <path-to-对账单.pdf> --profile cmb --source-account-id <stable-bank-account-id>
 .venv/bin/bel match run
-.venv/bin/bel --db bel.db web        # Phase 2C workbench at http://127.0.0.1:8000
+
+# Human workbench
+.venv/bin/bel --db bel.db web
+# http://127.0.0.1:8000/contract-ledger
+# http://127.0.0.1:8000/period-close
+
+# Verification
 .venv/bin/pytest
 ```
 
 The SQLite runtime database (`bel.db`) is a local development artifact and must stay outside the repository tree. Real business data must never be committed. Public tests run against independently constructed synthetic data under `fixtures/synthetic/`.
 
+Cutover/backfill acceptance uses a private data root outside the repository. Expected Cutover Baseline material is reconciliation input only; it is never a source of canonical Facts.
+
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — frozen architecture principles
-- [V1 Scope](docs/V1-SCOPE.md) — what V1 does and explicitly does not cover
-- [Domain](docs/DOMAIN.md) — core business objects and semantics
-- [Rules](docs/RULES.md) — numbered business rules
+- [V1 Scope](docs/V1-SCOPE.md) — V1 product boundary and Definition of Done
+- [Domain](docs/DOMAIN.md) — canonical business objects and semantics
+- [Rules](docs/RULES.md) — numbered deterministic business rules
+- [Roadmap](ROADMAP.md) — capability sequence through first-stage cutover and beyond
 - [Golden Tests](docs/GOLDEN-TEST.md) — verification methodology
 - [Private Data Policy](docs/PRIVATE-DATA-POLICY.md) — sensitive-data handling boundary
-- [Phase 2C Decisions](docs/PHASE2C-DECISIONS.md) / [Acceptance](docs/PHASE2C-ACCEPTANCE.md)
-- [Phase 2C.2 Decisions](docs/PHASE2C2-DECISIONS.md) / [Acceptance](docs/PHASE2C2-ACCEPTANCE.md)
 - [Phase 2D.0 Decisions](docs/PHASE2D0-DECISIONS.md) / [Acceptance](docs/PHASE2D0-ACCEPTANCE.md) — V1 product rebaseline
-- [Roadmap](ROADMAP.md) — planned capability progression
+- [Phase 2D.1 R0 Decisions](docs/PHASE2D1-R0-DECISIONS.md) / [Acceptance](docs/PHASE2D1-R0-ACCEPTANCE.md) — frozen sales, Shipment, correction and cutover semantics
 - [Contributing](CONTRIBUTING.md) — contribution rules and development setup
 
 Implementation decisions and acceptance criteria for each phase are kept in `docs/PHASE*-DECISIONS.md` and `docs/PHASE*-ACCEPTANCE.md` so design changes are explicit rather than silently retrofitted to code.
