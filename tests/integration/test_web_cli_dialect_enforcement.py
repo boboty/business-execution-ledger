@@ -59,7 +59,11 @@ def test_web_cli_rejects_sqlite_memory_database_url():
 def test_web_cli_accepts_postgresql_database_url(postgres_url):
     """`bel web` against a real, migrated PostgreSQL database starts and
     serves normally — the dialect check does not false-positive-reject
-    the production contract it exists to protect."""
+    the production contract it exists to protect. Covers both Contract
+    Ledger and Period Close Workbench against the SAME real PostgreSQL
+    runtime (one server startup, two requests) — Period Close's other
+    HTTP coverage uses an injected SQLite runtime and does not by itself
+    prove the page works against PostgreSQL."""
     from sqlalchemy import create_engine
 
     engine = create_engine(postgres_url, future=True)
@@ -101,6 +105,15 @@ def test_web_cli_accepts_postgresql_database_url(postgres_url):
                 last_error = exc
                 time.sleep(0.3)
         assert status == 200, f"server never became ready: {last_error}"
+
+        # Same server, same real PostgreSQL runtime, second request — the
+        # Period Close Workbench page must also serve against PostgreSQL,
+        # not only Contract Ledger. Existing Period Close HTTP coverage
+        # elsewhere uses an injected SQLite runtime and does not satisfy
+        # this requirement on its own.
+        with urllib.request.urlopen("http://127.0.0.1:8823/period-close", timeout=5) as resp:
+            period_close_status = resp.status
+        assert period_close_status == 200
     finally:
         proc.terminate()
         try:
