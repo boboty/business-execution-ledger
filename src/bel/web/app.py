@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from bel.infrastructure.persistence.database import DatabaseRuntime
+from bel.infrastructure.persistence.schema_gate import assert_schema_at_head
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -44,29 +45,36 @@ _SECURITY_HEADERS = {
 }
 
 
-def create_app(db_path: str | None = None, *, runtime: DatabaseRuntime | None = None) -> FastAPI:
+def create_app(database_url: str | None = None, *, runtime: DatabaseRuntime | None = None) -> FastAPI:
     """Build the Phase 2C workbench app.
 
-    Pass either ``db_path`` (the app builds its own ``DatabaseRuntime``
-    from it) or a pre-built ``runtime`` — the injected identity is used
-    by BOTH the read-only pages and the write API, so tests can inject a
-    file ``DatabaseRuntime`` and GET/POST see the same DB. ``:memory:``
-    runtimes are rejected: the Web runtime requires a file database.
+    Pass either ``database_url`` (the app builds its own
+    ``DatabaseRuntime`` from it) or a pre-built ``runtime`` — the injected
+    identity is used by BOTH the read-only pages and the write API, so
+    tests can inject a file ``DatabaseRuntime`` and GET/POST see the same
+    DB. In-memory SQLite runtimes are rejected: the Web runtime requires a
+    file/server database with a real concurrent-write guarantee.
+
+    Before serving, asserts the database's Alembic schema revision is at
+    head (Part G) — PostgreSQL only; a SQLite runtime bypasses this gate
+    by construction (test-only, unsupported for production — see
+    ``schema_gate.py``).
     """
     if runtime is None:
-        if db_path is None:
-            raise ValueError("provide db_path or a DatabaseRuntime")
-        runtime = DatabaseRuntime(db_path)
+        if database_url is None:
+            raise ValueError("provide database_url or a DatabaseRuntime")
+        runtime = DatabaseRuntime(database_url)
     if runtime.is_memory:
         raise ValueError(
-            "the Web runtime requires a file SQLite database; ':memory:' is "
+            "the Web runtime requires a file/server database; SQLite in-memory ('sqlite://') is "
             "test-only and unsupported (it has no concurrent Web guarantee)"
         )
+    assert_schema_at_head(runtime.engine)
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.runtime = runtime
     app.state.session_factory = runtime.session_factory
-    app.state.db_path = runtime.db_path
+    app.state.database_url = runtime.database_url
     app.state.templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

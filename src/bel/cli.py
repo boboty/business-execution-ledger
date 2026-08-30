@@ -69,26 +69,38 @@ from bel.application.shipment_facts import (
 )
 from bel.domain.invoice import InvoiceDirection
 from bel.infrastructure.persistence.database import is_database_busy, make_engine, make_session_factory
+from bel.infrastructure.persistence.schema_gate import SchemaNotAtHeadError, assert_schema_at_head
 
-DEFAULT_DB_PATH = "bel.db"
 
-
-def _session_factory(db_path: str):
-    engine = make_engine(db_path)
+def _session_factory(database_url: str):
+    engine = make_engine(database_url)
     return make_session_factory(engine)
 
 
 @click.group()
-@click.option("--db", "db_path", default=DEFAULT_DB_PATH, show_default=True, help="SQLite database file path.")
+@click.option(
+    "--database-url",
+    "database_url",
+    envvar="BEL_DATABASE_URL",
+    required=True,
+    help="SQLAlchemy database URL, e.g. postgresql+psycopg://user:password@host:5432/bel "
+    "(production) or sqlite:///path/to/file.db (test convenience). Falls back to the "
+    "BEL_DATABASE_URL environment variable. No default — production execution must never "
+    "silently fall back to a local file.",
+)
 @click.pass_context
-def cli(ctx: click.Context, db_path: str) -> None:
+def cli(ctx: click.Context, database_url: str) -> None:
     """Business Execution Ledger CLI.
 
     Schema is owned by Alembic migrations, not this CLI — run
     `alembic upgrade head` before first use.
     """
     ctx.ensure_object(dict)
-    ctx.obj["db_path"] = db_path
+    ctx.obj["database_url"] = database_url
+    try:
+        assert_schema_at_head(make_engine(database_url))
+    except SchemaNotAtHeadError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli.command("import-contract-ledger")
@@ -96,7 +108,7 @@ def cli(ctx: click.Context, db_path: str) -> None:
 @click.pass_context
 def import_contract_ledger_cmd(ctx: click.Context, xlsx_path: Path) -> None:
     """Import a contract ledger workbook (合同台账 Excel)."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         result = import_contract_ledger(session, xlsx_path)
 
@@ -144,7 +156,7 @@ def contract_group() -> None:
 @click.option("--no", "contract_no", required=True, help="contract_no to search for.")
 @click.pass_context
 def contract_search(ctx: click.Context, contract_no: str) -> None:
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         contracts = search_contracts_by_no(session, contract_no)
 
@@ -161,7 +173,7 @@ def contract_search(ctx: click.Context, contract_no: str) -> None:
 @click.argument("contract_id", type=click.UUID)
 @click.pass_context
 def contract_get(ctx: click.Context, contract_id: uuid.UUID) -> None:
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         trace = get_contract(session, contract_id)
 
@@ -205,7 +217,7 @@ def exception_group() -> None:
 @click.option("--all", "show_all", is_flag=True, help="Include resolved exceptions too (default: open only).")
 @click.pass_context
 def exception_list(ctx: click.Context, show_all: bool) -> None:
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         exceptions = list_exceptions(session, open_only=not show_all)
 
@@ -234,7 +246,7 @@ def import_invoices_cmd(ctx: click.Context, xlsx_path: Path, direction: str) -> 
         "unknown": InvoiceDirection.UNKNOWN,
     }[direction.lower()]
 
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         result = import_invoices(session, xlsx_path, direction_value)
 
@@ -277,7 +289,7 @@ def import_invoices_cmd(ctx: click.Context, xlsx_path: Path, direction: str) -> 
 @click.pass_context
 def import_bank_cmd(ctx: click.Context, pdf_path: Path, profile: str, source_account_id: str | None) -> None:
     """Import a bank statement PDF (deterministic text-layer parsing, no OCR)."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         result = import_bank_statement(session, pdf_path, profile.lower(), source_account_id=source_account_id)
 
@@ -317,7 +329,7 @@ def invoice_group() -> None:
 @click.argument("invoice_id", type=click.UUID)
 @click.pass_context
 def invoice_get(ctx: click.Context, invoice_id: uuid.UUID) -> None:
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         trace = get_invoice(session, invoice_id)
 
@@ -360,7 +372,7 @@ def payment_group() -> None:
 @click.argument("payment_id", type=click.UUID)
 @click.pass_context
 def payment_get(ctx: click.Context, payment_id: uuid.UUID) -> None:
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         trace = get_payment(session, payment_id)
 
@@ -402,7 +414,7 @@ def match_group() -> None:
 @click.pass_context
 def match_invoices_cmd(ctx: click.Context) -> None:
     """Run M001 against all unmatched PURCHASE invoices."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         summary = match_invoices(session)
     _echo_match_summary(summary)
@@ -412,7 +424,7 @@ def match_invoices_cmd(ctx: click.Context) -> None:
 @click.pass_context
 def match_payments_cmd(ctx: click.Context) -> None:
     """Run M001 against all unmatched OUT payments."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         summary = match_payments(session)
     _echo_match_summary(summary)
@@ -422,7 +434,7 @@ def match_payments_cmd(ctx: click.Context) -> None:
 @click.pass_context
 def match_run_cmd(ctx: click.Context) -> None:
     """Run M001 against both invoices and payments."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         inv_summary = match_invoices(session)
         pay_summary = match_payments(session)
@@ -446,7 +458,7 @@ def _echo_match_summary(summary, indent: str = "") -> None:
 @click.option("--status", default=None, help="Filter by MatchCase status (e.g. HUMAN_CONFIRMATION_REQUIRED).")
 @click.pass_context
 def match_list(ctx: click.Context, status: str | None) -> None:
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         cases = list_match_cases(session, status=status.upper() if status else None)
 
@@ -463,7 +475,7 @@ def match_list(ctx: click.Context, status: str | None) -> None:
 @click.option("--contract", "contract_id", type=click.UUID, required=True, help="Contract to confirm the match against.")
 @click.pass_context
 def match_confirm(ctx: click.Context, match_case_id: uuid.UUID, contract_id: uuid.UUID) -> None:
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         try:
             confirm_match(session, match_case_id, contract_id)
@@ -480,7 +492,7 @@ def match_confirm(ctx: click.Context, match_case_id: uuid.UUID, contract_id: uui
 @click.pass_context
 def import_close_facts_cmd(ctx: click.Context, json_path: Path) -> None:
     """Import a Close Fact Pack (人工补充事实 for period close)."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = import_close_facts(session, json_path)
@@ -518,7 +530,7 @@ def accrual_group() -> None:
 @accrual_group.command("list")
 @click.pass_context
 def accrual_list(ctx: click.Context) -> None:
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         views = list_accrual_views(session)
 
@@ -539,7 +551,7 @@ def accrual_list(ctx: click.Context) -> None:
 @click.argument("accrual_id", type=click.UUID)
 @click.pass_context
 def accrual_get(ctx: click.Context, accrual_id: uuid.UUID) -> None:
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         view = get_accrual_view(session, accrual_id)
 
@@ -600,7 +612,7 @@ def invoice_item_allocate(
 
     from bel.infrastructure.persistence.database import is_database_busy
 
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             allocation = execute_manual_item_allocation(
@@ -694,7 +706,7 @@ def contract_item_create(ctx: click.Context, contract_id, source_item_key, **fie
     whether the caller meant supplement or correction; use those
     commands explicitly."""
     fields = _fields_from_options(**field_options)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_create_contract_item_fact(
@@ -736,7 +748,7 @@ def contract_item_supplement(ctx: click.Context, contract_item_id, based_on_revi
     if any given field already holds a DIFFERENT known value — that is a
     correction, not a supplement."""
     fields = _fields_from_options(**field_options)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_supplement_contract_item_fact(
@@ -775,7 +787,7 @@ def contract_item_correct(ctx: click.Context, contract_item_id, based_on_revisio
     (allocations/accruals) still reference this item, a
     ContractItemFactSuperseded Task is raised naming them."""
     fields = _fields_from_options(**field_options)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_correct_contract_item_fact(
@@ -805,7 +817,7 @@ def contract_item_correct(ctx: click.Context, contract_item_id, based_on_revisio
 @click.pass_context
 def contract_item_show(ctx: click.Context, item_id) -> None:
     """Show the current authoritative ContractItem state."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         item = get_contract_item(session, item_id)
     if item is None:
@@ -834,7 +846,7 @@ def contract_item_show(ctx: click.Context, item_id) -> None:
 def contract_item_history(ctx: click.Context, item_id) -> None:
     """List every revision ever asserted for this ContractItem, oldest
     first — the full audit trail, including superseded revisions."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         revisions = get_contract_item_history(session, item_id)
     if not revisions:
@@ -913,7 +925,7 @@ def shipment_create(
     unchanged) — this never guesses whether the caller meant supplement
     or correction."""
     fields = _shipment_fields_from_options(**field_options)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_create_shipment_fact(
@@ -960,7 +972,7 @@ def shipment_supplement(ctx: click.Context, shipment_id, based_on_revision_id, *
     if any given field already holds a DIFFERENT known value — that is a
     correction, not a supplement."""
     fields = _shipment_fields_from_options(**field_options)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_supplement_shipment_fact(
@@ -996,7 +1008,7 @@ def shipment_correct(ctx: click.Context, shipment_id, based_on_revision_id, **fi
     CostRecognitionFact still references this Shipment, a
     ShipmentFactSuperseded Task is raised naming it."""
     fields = _shipment_fields_from_options(**field_options)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_correct_shipment_fact(
@@ -1023,7 +1035,7 @@ def shipment_correct(ctx: click.Context, shipment_id, based_on_revision_id, **fi
 @click.pass_context
 def shipment_show(ctx: click.Context, shipment_id) -> None:
     """Show the current authoritative Shipment state."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         shipment = get_shipment(session, shipment_id)
     if shipment is None:
@@ -1046,7 +1058,7 @@ def shipment_show(ctx: click.Context, shipment_id) -> None:
 def shipment_history(ctx: click.Context, shipment_id) -> None:
     """List every revision ever asserted for this Shipment, oldest first
     — the full audit trail, including superseded revisions."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         revisions = get_shipment_history(session, shipment_id)
     if not revisions:
@@ -1068,7 +1080,7 @@ def shipment_history(ctx: click.Context, shipment_id) -> None:
 def shipment_list(ctx: click.Context, contract_id) -> None:
     """List every Shipment for a Contract, oldest first — one Contract
     may have many Shipments (docs/PHASE2D1-R0-DECISIONS.md section 3.3)."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         shipments = list_shipments_for_contract(session, contract_id)
     if not shipments:
@@ -1141,7 +1153,7 @@ def sales_contract_create(ctx: click.Context, our_entity, sales_contract_no, **f
     BusinessKeyConflict Task is raised; the existing SalesContract is
     unchanged)."""
     fields = _sales_contract_fields_from_options(**field_options)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_create_sales_contract_fact(
@@ -1185,7 +1197,7 @@ def sales_contract_supplement(ctx: click.Context, sales_contract_id, based_on_re
     field already holds a DIFFERENT known value — that is a correction,
     not a supplement."""
     fields = _sales_contract_fields_from_options(**field_options)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_supplement_sales_contract_fact(
@@ -1219,7 +1231,7 @@ def sales_contract_correct(ctx: click.Context, sales_contract_id, based_on_revis
     B-correction). Rejected if any given field currently has no value —
     that is a supplement, not a correction."""
     fields = _sales_contract_fields_from_options(**field_options)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_correct_sales_contract_fact(
@@ -1246,7 +1258,7 @@ def sales_contract_correct(ctx: click.Context, sales_contract_id, based_on_revis
 @click.pass_context
 def sales_contract_show(ctx: click.Context, sales_contract_id) -> None:
     """Show the current authoritative SalesContract state."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         sales_contract = get_sales_contract(session, sales_contract_id)
     if sales_contract is None:
@@ -1270,7 +1282,7 @@ def sales_contract_show(ctx: click.Context, sales_contract_id) -> None:
 def sales_contract_history(ctx: click.Context, sales_contract_id) -> None:
     """List every revision ever asserted for this SalesContract, oldest
     first — the full audit trail, including superseded revisions."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         revisions = get_sales_contract_history(session, sales_contract_id)
     if not revisions:
@@ -1290,7 +1302,7 @@ def sales_contract_history(ctx: click.Context, sales_contract_id) -> None:
 @click.pass_context
 def sales_contract_list(ctx: click.Context) -> None:
     """List every SalesContract, oldest first."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         sales_contracts = list_sales_contracts(session)
     if not sales_contracts:
@@ -1325,7 +1337,7 @@ def sales_link_add(ctx: click.Context, procurement_contract_id, sales_contract_i
     business key has retired history, this is rejected — use `reestablish`
     instead. A duplicate ADD for an already-current pair is an idempotent
     replay or corroborating Evidence, never a second episode."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_add_procurement_sales_link(
@@ -1365,7 +1377,7 @@ def sales_link_correct(
     """CORRECT: retire a CURRENT episode with a replacement relationship
     (pass both --replacement-* options) — use `invalidate` instead for a
     pure invalidation with no replacement. Always HUMAN_CONFIRMED."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_correct_procurement_sales_link(
@@ -1395,7 +1407,7 @@ def sales_link_invalidate(ctx: click.Context, superseded_link_id) -> None:
     """Pure INVALIDATE: retire a CURRENT episode with no replacement —
     the relationship simply does not exist. Shorthand for `correct` with
     no --replacement-* options."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_correct_procurement_sales_link(session, superseded_link_id=superseded_link_id)
@@ -1421,7 +1433,7 @@ def sales_link_reestablish(ctx: click.Context, procurement_contract_id, sales_co
     current one. Always HUMAN_CONFIRMED, always requires genuinely new
     Evidence — never resurrects the old episode, always writes a new
     one."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = execute_reestablish_procurement_sales_link(
@@ -1446,7 +1458,7 @@ def sales_link_reestablish(ctx: click.Context, procurement_contract_id, sales_co
 def sales_link_history(ctx: click.Context, procurement_contract_id, sales_contract_id) -> None:
     """List every assertion episode ever recorded for this business key,
     oldest first, each annotated CURRENT or retired-by-<correction id>."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         history = get_relationship_history(session, procurement_contract_id, sales_contract_id)
     if not history:
@@ -1474,7 +1486,7 @@ def sales_link_list(ctx: click.Context, procurement_contract_id, sales_contract_
         click.echo("Error: pass exactly one of --procurement-contract or --sales-contract")
         raise SystemExit(1)
 
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         if procurement_contract_id is not None:
             links = list_current_links_for_procurement_contract(session, procurement_contract_id)
@@ -1527,7 +1539,7 @@ def sales_match_invoice_propose(ctx: click.Context, invoice_id, sales_contract_i
     """Propose one or more candidate SalesContracts for a SALES invoice
     — creates a HUMAN_CONFIRMATION_REQUIRED MatchCase. Candidates are
     never computed automatically; pass every one explicitly."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = propose_sales_invoice_match(
@@ -1554,7 +1566,7 @@ def sales_match_invoice_confirm(ctx: click.Context, match_case_id, raw_allocatio
     """Confirm a proposed MatchCase with the COMPLETE allocation set for
     this invoice in one submission — never a single-target call."""
     pairs = _parse_allocation_pairs(raw_allocations)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = confirm_sales_invoice_match(
@@ -1583,7 +1595,7 @@ def sales_match_payment_group() -> None:
 @click.pass_context
 def sales_match_payment_propose(ctx: click.Context, payment_id, sales_contract_ids) -> None:
     """Propose one or more candidate SalesContracts for an IN payment."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = propose_sales_payment_match(
@@ -1606,7 +1618,7 @@ def sales_match_payment_confirm(ctx: click.Context, match_case_id, raw_allocatio
     """Confirm a proposed MatchCase with the COMPLETE allocation set for
     this payment in one submission."""
     pairs = _parse_allocation_pairs(raw_allocations)
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = confirm_sales_payment_match(
@@ -1630,7 +1642,7 @@ def sales_match_payment_confirm(ctx: click.Context, match_case_id, raw_allocatio
 def sales_match_list(ctx: click.Context, status: str | None) -> None:
     """List sales-leg MatchCases only — a procurement case never appears
     here (docs/PHASE2D1-R0-DECISIONS.md section 2.7's leg separation)."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         cases = list_sales_match_cases(session, status=status.upper() if status else None)
 
@@ -1646,7 +1658,7 @@ def sales_match_list(ctx: click.Context, status: str | None) -> None:
 @click.pass_context
 def sales_match_show(ctx: click.Context, match_case_id) -> None:
     """Show a sales MatchCase's candidates."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         candidates = list_sales_match_candidates(session, match_case_id)
     if not candidates:
@@ -1668,7 +1680,7 @@ def period_close_group() -> None:
 def period_close_preview(ctx: click.Context, period: str) -> None:
     """Compute a stateless Period Close Preview for <YYYY-MM>. Pure query:
     writes nothing, creates no vouchers/accounting entries/events."""
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
         preview = build_period_close_preview(session, period)
 
@@ -1726,12 +1738,7 @@ def web_cmd(ctx: click.Context, host: str, port: int) -> None:
     read-only except for the manual InvoiceItem allocation API, and it
     never opens a browser.
     """
-    db_path = ctx.obj["db_path"]
-    if db_path == ":memory:":
-        raise click.ClickException(
-            "the Web runtime requires a file SQLite database; ':memory:' is "
-            "test-only and unsupported (it has no concurrent Web guarantee)"
-        )
+    database_url = ctx.obj["database_url"]
     if host not in ("127.0.0.1", "::1", "localhost"):
         click.echo(
             "WARNING: BEL may display private business data.\n"
@@ -1743,7 +1750,7 @@ def web_cmd(ctx: click.Context, host: str, port: int) -> None:
 
     from bel.web.app import create_app
 
-    app = create_app(db_path)
+    app = create_app(database_url)
     click.echo("Business Execution Ledger")
     click.echo(f"http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
@@ -1840,7 +1847,7 @@ def cutover_backfill_cmd(ctx: click.Context, period: str) -> None:
     import json
 
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = run_backfill_plan(session, plan, period_dir=period_dir, created_at=datetime.now(timezone.utc))
@@ -1872,7 +1879,7 @@ def cutover_reconcile_cmd(ctx: click.Context, period: str) -> None:
     import json
 
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-    session_factory = _session_factory(ctx.obj["db_path"])
+    session_factory = _session_factory(ctx.obj["database_url"])
     try:
         with session_factory() as session:
             result = reconcile(session, baseline)
