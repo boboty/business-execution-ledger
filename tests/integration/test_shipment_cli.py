@@ -17,6 +17,7 @@ from pathlib import Path
 from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
 from bel.infrastructure.persistence.database import make_engine, make_session_factory
+from bel.infrastructure.persistence.models import Base
 from bel.infrastructure.persistence.repositories import ContractRepository, EvidenceRepository
 
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -25,15 +26,16 @@ NOW = datetime.now(timezone.utc)
 
 def _run_bel(db_path: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-m", "bel.cli", "--db", str(db_path), *args],
+        [sys.executable, "-m", "bel.cli", *args],
         cwd=REPO_ROOT,
+        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
         capture_output=True,
         text=True,
     )
 
 
 def _seed_contract(db_path: Path) -> uuid.UUID:
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     session_factory = make_session_factory(engine)
     with session_factory() as session:
         doc = EvidenceDocument(id=uuid.uuid4(), file_name="seed.json", sha256="d" * 64, source_type="test", imported_at=NOW)
@@ -70,14 +72,7 @@ def _seed_contract(db_path: Path) -> uuid.UUID:
 
 def test_shipment_cli_create_supplement_correct_list_flow(tmp_path):
     db_path = tmp_path / "bel.db"
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=REPO_ROOT,
-        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
+    Base.metadata.create_all(make_engine(f"sqlite:///{db_path}"))
 
     contract_id = _seed_contract(db_path)
 
@@ -142,14 +137,7 @@ def test_shipment_cli_null_reference_requires_explicit_confirmation(tmp_path):
     real `bel` entry point: omitting --external-ref must fail without
     --confirm-incomplete-identity, and succeed with it."""
     db_path = tmp_path / "bel.db"
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=REPO_ROOT,
-        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
+    Base.metadata.create_all(make_engine(f"sqlite:///{db_path}"))
     contract_id = _seed_contract(db_path)
 
     unconfirmed = _run_bel(

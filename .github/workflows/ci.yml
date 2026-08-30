@@ -41,5 +41,61 @@ jobs:
       # Public synthetic suite only (tests/unit, tests/integration,
       # tests/golden/synthetic-v1) — tests/private_acceptance/runner.py is
       # a standalone script, not pytest-discoverable, and is never run here.
+      # No BEL_DATABASE_URL here, so every @pytest.mark.postgres test
+      # auto-skips (see tests/conftest.py) — this job proves the SQLite
+      # test-convenience path needs zero PostgreSQL dependency.
       - name: Run tests
+        run: pytest
+
+  postgresql-gate:
+    name: postgresql-gate
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: bel_ci
+          POSTGRES_PASSWORD: bel_ci_password
+          POSTGRES_DB: bel_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Local, disposable CI-only credentials — never real values.
+      BEL_DATABASE_URL: postgresql+psycopg://bel_ci:bel_ci_password@localhost:5432/bel_ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0 # migration immutability history mode needs the full commit range
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Fetch target branch for merge-base resolution
+        run: git fetch origin main:refs/remotes/origin/main || true
+      # Migration immutability gate — history mode. Inspects only
+      # merge-base(origin/main, HEAD)..HEAD, never full repo history back
+      # to project genesis; catches a commit-N-adds/commit-N+1-modifies
+      # pattern a final PR diff alone would hide as one added file. See
+      # docs/PERSISTENCE-MIGRATION-POLICY.md.
+      - name: Migration immutability gate (history)
+        run: python tools/check_migration_immutability.py --history
+      - name: Privacy scan (staged-equivalent safety net)
+        run: python tools/privacy_scan.py --tracked
+      - name: Fresh PostgreSQL database -> alembic upgrade head
+        run: alembic upgrade head
+      - name: alembic current == head
+        run: |
+          current="$(alembic current 2>/dev/null | tail -1)"
+          echo "current: $current"
+          case "$current" in *"(head)"*) ;; *) echo "not at head"; exit 1 ;; esac
+      - name: alembic check (model/schema drift)
+        run: alembic check
+      - name: PostgreSQL persistence / transaction / concurrency / full suite
         run: pytest

@@ -39,7 +39,7 @@ CONTRACT_HEADERS = ["序号", "合同编码", "卖方", "买方", "金额", "外
 
 @pytest.fixture
 def db_session():
-    engine = make_engine(":memory:")
+    engine = make_engine("sqlite://")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as session:

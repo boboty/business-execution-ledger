@@ -25,6 +25,7 @@ from bel.domain.matching import (
     MatchMethod,
 )
 from bel.infrastructure.persistence.database import make_engine, make_session_factory
+from bel.infrastructure.persistence.models import Base
 from bel.infrastructure.persistence.repositories import (
     ContractRepository,
     InvoiceAllocationRepository,
@@ -41,8 +42,9 @@ CLOSE_PERIOD = "2031-03"
 
 def _run_bel(db_path: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-m", "bel.cli", "--db", str(db_path), *args],
+        [sys.executable, "-m", "bel.cli", *args],
         cwd=REPO_ROOT,
+        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
         capture_output=True,
         text=True,
     )
@@ -61,7 +63,7 @@ def _setup_files(tmp_path: Path):
 
 
 def _confirm_contract_allocations(db_path: Path) -> None:
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     now = datetime.now(timezone.utc)
     with make_session_factory(engine)() as session:
         for external_key, contract_no in [
@@ -100,14 +102,7 @@ def _confirm_contract_allocations(db_path: Path) -> None:
 
 def test_phase2b_cli_flow(tmp_path):
     db_path = tmp_path / "bel.db"
-    upgrade = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=REPO_ROOT,
-        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
-        capture_output=True,
-        text=True,
-    )
-    assert upgrade.returncode == 0, upgrade.stderr
+    Base.metadata.create_all(make_engine(f"sqlite:///{db_path}"))
 
     contracts, invoices, facts = _setup_files(tmp_path)
 

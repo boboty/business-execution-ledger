@@ -227,7 +227,7 @@ def _build_many_to_many_contract_ctx(tmp_path):
 
     now = datetime.now(timezone.utc)
     db_path = tmp_path / f"m2m-{uuid.uuid4().hex[:8]}.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
 
     with make_session_factory(engine)() as session:
@@ -321,7 +321,7 @@ def _build_many_to_many_contract_ctx(tmp_path):
         session.commit()
         ids = {"A": str(contract_a.id), "B": str(contract_b.id)}
 
-    return TestClient(create_app(str(db_path))), ids
+    return TestClient(create_app(f"sqlite:///{db_path}")), ids
 
 
 def test_contract360_item_allocation_is_scoped_to_own_contract(tmp_path):

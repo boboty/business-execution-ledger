@@ -17,6 +17,7 @@ from pathlib import Path
 from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
 from bel.infrastructure.persistence.database import make_engine, make_session_factory
+from bel.infrastructure.persistence.models import Base
 from bel.infrastructure.persistence.repositories import ContractRepository, EvidenceRepository
 
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -25,26 +26,20 @@ NOW = datetime.now(timezone.utc)
 
 def _run_bel(db_path: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-m", "bel.cli", "--db", str(db_path), *args],
+        [sys.executable, "-m", "bel.cli", *args],
         cwd=REPO_ROOT,
+        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
         capture_output=True,
         text=True,
     )
 
 
 def _upgrade_head(db_path: Path) -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=REPO_ROOT,
-        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
+    Base.metadata.create_all(make_engine(f"sqlite:///{db_path}"))
 
 
 def _seed_contract_and_sales_contract(db_path: Path) -> tuple[uuid.UUID, uuid.UUID]:
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     session_factory = make_session_factory(engine)
     with session_factory() as session:
         doc = EvidenceDocument(id=uuid.uuid4(), file_name="seed.json", sha256="1" * 64, source_type="test", imported_at=NOW)
@@ -126,7 +121,7 @@ def test_sales_link_cli_correct_with_replacement(tmp_path):
     _upgrade_head(db_path)
     contract_id, sales_contract_x_id = _seed_contract_and_sales_contract(db_path)
 
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     with make_session_factory(engine)() as session:
         from bel.infrastructure.persistence.repositories import SalesContractRepository
 

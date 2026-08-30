@@ -614,7 +614,7 @@ def test_multiple_item_allocations_require_explicit_scope(db_session):
     from bel.infrastructure.persistence.models import Base
 
     def run_case(created_at_a, created_at_b):
-        engine = make_engine(":memory:")
+        engine = make_engine("sqlite://")
         Base.metadata.create_all(engine)
         session = make_session_factory(engine)()
         frag = _make_fragment(session)

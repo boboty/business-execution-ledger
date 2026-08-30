@@ -184,12 +184,12 @@ def _build_app(tmp_path, seed_fn) -> tuple[TestClient, object, str]:
     from bel.web.app import create_app
 
     db_path = tmp_path / f"gate-{uuid.uuid4().hex[:8]}.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     with make_session_factory(engine)() as session:
         contract_id = seed_fn(_Seed(session))
         session.commit()
-    app = create_app(str(db_path))
+    app = create_app(f"sqlite:///{db_path}")
     return TestClient(app), app, contract_id
 
 

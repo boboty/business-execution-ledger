@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,12 +14,37 @@ from bel.infrastructure.persistence.models import Base
 PRIMARY_SHEET_NAME = "报关出口购销合同"
 
 
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Auto-skip everything marked ``@pytest.mark.postgres`` unless
+    BEL_DATABASE_URL is set to a real PostgreSQL target — see the
+    ``postgres`` marker's registration in pyproject.toml and the
+    ``postgres_url`` fixture below. Keeps plain local `pytest` runs
+    passing with zero PostgreSQL dependency (Part F: SQLite test
+    convenience vs. PostgreSQL production contract, kept separate)."""
+    if os.environ.get("BEL_DATABASE_URL", "").startswith("postgresql"):
+        return
+    skip_postgres = pytest.mark.skip(
+        reason="requires BEL_DATABASE_URL set to a postgresql+psycopg:// URL (see docs/PERSISTENCE-MIGRATION-POLICY.md)"
+    )
+    for item in items:
+        if "postgres" in item.keywords:
+            item.add_marker(skip_postgres)
+
+
+@pytest.fixture
+def postgres_url() -> str:
+    """The PostgreSQL URL under test — only reached by a test whose
+    ``postgres`` marker survived collection, so BEL_DATABASE_URL is
+    guaranteed set to a real postgresql+psycopg:// target here."""
+    return os.environ["BEL_DATABASE_URL"]
+
+
 @pytest.fixture
 def db_session() -> Session:
     """In-memory SQLite with schema created directly from the ORM models.
     Schema-shape fidelity against Alembic migrations is covered
     separately by tests/integration/test_migration.py."""
-    engine = make_engine(":memory:")
+    engine = make_engine("sqlite://")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as session:

@@ -809,7 +809,7 @@ def test_unconfirmed_relationship_exact_replay_no_duplicate_task(db_session):
 
 def _two_sessions_setup(tmp_path):
     db_path = tmp_path / "psl-concurrency.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as setup_session:

@@ -54,7 +54,7 @@ def _build_minimal_db(tmp_path, *, confirm: bool) -> tuple[TestClient, str, obje
     from bel.web.app import create_app
 
     db_path = tmp_path / f"alloc-{uuid.uuid4().hex[:8]}.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     with make_session_factory(engine)() as session:
         ev = EvidenceRepository(session)
@@ -123,7 +123,7 @@ def _build_minimal_db(tmp_path, *, confirm: bool) -> tuple[TestClient, str, obje
         session.commit()
         contract_id = str(contract.id)
 
-    app = create_app(str(db_path))
+    app = create_app(f"sqlite:///{db_path}")
     return TestClient(app), contract_id, app
 
 

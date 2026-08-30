@@ -909,7 +909,7 @@ def test_execute_supplement_and_correct_round_trip(db_session):
 
 def test_two_independent_sessions_stale_correction_is_rejected(tmp_path):
     db_path = tmp_path / "sales-contract-concurrency.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
 

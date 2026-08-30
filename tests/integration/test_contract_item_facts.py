@@ -1136,7 +1136,7 @@ def test_two_independent_sessions_stale_correction_is_rejected(tmp_path):
     (based on the now-stale revision) is rejected; the final database has
     exactly one current revision."""
     db_path = tmp_path / "concurrency.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
 

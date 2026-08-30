@@ -236,14 +236,14 @@ def _build_app(tmp_path, seed_fn):
     from bel.web.app import create_app
 
     db_path = tmp_path / f"ui-{uuid.uuid4().hex[:8]}.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     from bel.infrastructure.persistence.models import Base
 
     Base.metadata.create_all(engine)
     with make_session_factory(engine)() as session:
         result = seed_fn(_Seed(session))
         session.commit()
-    app = create_app(str(db_path))
+    app = create_app(f"sqlite:///{db_path}")
     return TestClient(app), app, result
 
 
@@ -807,7 +807,7 @@ def test_h_e_evidence_business_labels_with_raw_technical_traceability(tmp_path):
 
     now = datetime.now(timezone.utc)
     db_path = tmp_path / f"ui-h-e-{uuid.uuid4().hex[:8]}.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
 
     with make_session_factory(engine)() as session:
@@ -902,7 +902,7 @@ def test_h_e_evidence_business_labels_with_raw_technical_traceability(tmp_path):
         session.commit()
         contract_id = str(contract.id)
 
-    client = TestClient(create_app(str(db_path)))
+    client = TestClient(create_app(f"sqlite:///{db_path}"))
     html = client.get(f"/contracts/{contract_id}?period={UI_PERIOD}").text
 
     assert "合同证据" in html

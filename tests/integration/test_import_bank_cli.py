@@ -17,23 +17,20 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 
 def _run_bel(db_path: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-m", "bel.cli", "--db", str(db_path), *args],
+        [sys.executable, "-m", "bel.cli", *args],
         cwd=REPO_ROOT,
-        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
         capture_output=True,
         text=True,
     )
 
 
 def _upgrade_head(db_path: Path) -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=REPO_ROOT,
-        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from bel.infrastructure.persistence.database import make_engine
+    from bel.infrastructure.persistence.models import Base
+
+    Base.metadata.create_all(make_engine(f"sqlite:///{db_path}"))
 
 
 def _source_accounts(db_path: Path) -> list[str | None]:
@@ -41,7 +38,7 @@ def _source_accounts(db_path: Path) -> list[str | None]:
     from bel.infrastructure.persistence.database import make_engine, make_session_factory
     from bel.infrastructure.persistence.repositories import PaymentRepository
 
-    session_factory = make_session_factory(make_engine(str(db_path)))
+    session_factory = make_session_factory(make_engine(f"sqlite:///{db_path}"))
     with session_factory() as session:
         return [p.source_account_id for p in PaymentRepository(session).list_all()]
 

@@ -74,7 +74,7 @@ def _make_contract(session, fragment_id, contract_no, counterparty="Supplier"):
 
 
 def _build_ledger_db(db_path: Path) -> None:
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     with make_session_factory(engine)() as session:
         frag = _make_fragment(session)
@@ -103,7 +103,7 @@ def _build_ledger_db(db_path: Path) -> None:
 def ledger_ctx(tmp_path):
     db_path = tmp_path / "ledger-web.db"
     _build_ledger_db(db_path)
-    app = create_app(str(db_path))
+    app = create_app(f"sqlite:///{db_path}")
     client = TestClient(app)
     with app.state.session_factory() as session:
         contract_id_by_no = {c.contract_no: str(c.id) for c in ContractRepository(session).list_all()}

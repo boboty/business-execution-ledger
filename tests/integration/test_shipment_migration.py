@@ -26,6 +26,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 
@@ -33,6 +34,12 @@ from bel.infrastructure.persistence.database import make_engine, make_session_fa
 from bel.infrastructure.persistence.repositories import ContractRepository, CostRecognitionFactRepository, ShipmentRepository
 
 REPO_ROOT = Path(__file__).parent.parent.parent
+
+pytestmark = pytest.mark.skip(
+    reason="Tests the pre-2D.1-P SQLite migration chain (migrations/versions/), which is frozen "
+    "legacy history and no longer wired into active Alembic tooling as of the Phase 2D.1-P "
+    "PostgreSQL rebaseline — see docs/PERSISTENCE-MIGRATION-POLICY.md."
+)
 R1_REVISION = "db1c3258569e"
 HEAD_REVISION = "147d94b436e0"
 

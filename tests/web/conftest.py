@@ -181,7 +181,7 @@ def build_phase2b_db(db_path: Path, tmp_path: Path, *, with_payment: bool = True
     write_invoice_workbook(invoices_xlsx, scenarios.BUYER, PHASE2B_INVOICE_ROWS)
     facts_json.write_text(json.dumps(CLOSE_FACT_PACK), encoding="utf-8")
 
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     with make_session_factory(engine)() as session:
         import_contract_ledger(session, contracts_xlsx)
@@ -200,7 +200,7 @@ def web_app(tmp_path):
     def _make(db_path: Path | None = None, *, with_payment: bool = True):
         path = db_path or tmp_path / f"web-{uuid.uuid4().hex[:8]}.db"
         build_phase2b_db(path, tmp_path, with_payment=with_payment)
-        return create_app(str(path))
+        return create_app(f"sqlite:///{path}")
 
     return _make
 

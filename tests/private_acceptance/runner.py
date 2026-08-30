@@ -81,7 +81,7 @@ class AcceptanceError(Exception):
 
 
 def _new_session():
-    engine = make_engine(":memory:")
+    engine = make_engine("sqlite://")
     Base.metadata.create_all(engine)
     return make_session_factory(engine)()
 

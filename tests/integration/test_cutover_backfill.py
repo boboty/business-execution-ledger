@@ -53,7 +53,7 @@ INVOICE_HEADERS_ROW = [
 
 @pytest.fixture
 def db_session():
-    engine = make_engine(":memory:")
+    engine = make_engine("sqlite://")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as session:

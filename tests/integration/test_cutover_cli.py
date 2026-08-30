@@ -19,23 +19,19 @@ CONTRACT_HEADERS = ["序号", "合同编码", "卖方", "买方", "金额"]
 
 def _run_bel(db_path: Path, private_root: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-m", "bel.cli", "--db", str(db_path), *args],
+        [sys.executable, "-m", "bel.cli", *args],
         cwd=REPO_ROOT,
-        env={**os.environ, "BEL_PRIVATE_DATA_ROOT": str(private_root)},
+        env={**os.environ, "BEL_PRIVATE_DATA_ROOT": str(private_root), "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
         capture_output=True,
         text=True,
     )
 
 
 def _upgrade_head(db_path: Path) -> None:
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=REPO_ROOT,
-        env={**os.environ, "BEL_DATABASE_URL": f"sqlite:///{db_path}"},
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
+    from bel.infrastructure.persistence.database import make_engine
+    from bel.infrastructure.persistence.models import Base
+
+    Base.metadata.create_all(make_engine(f"sqlite:///{db_path}"))
 
 
 def _write_ledger(path: Path, rows: list[list]) -> None:

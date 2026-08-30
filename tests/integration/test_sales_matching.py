@@ -561,7 +561,7 @@ def test_transaction_failure_no_partial_allocation_capacity_exceeded(db_session)
 
 def _two_sessions_invoice_setup(tmp_path, gross_amount=Decimal("100.00")):
     db_path = tmp_path / "sales-match-concurrency.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as setup_session:
@@ -605,7 +605,7 @@ def test_concurrent_invoice_confirmation_exactly_one_set_wins(tmp_path):
 
 def test_concurrent_payment_confirmation_exactly_one_set_wins(tmp_path):
     db_path = tmp_path / "sales-match-payment-concurrency.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as setup_session:
@@ -645,7 +645,7 @@ def test_concurrent_payment_confirmation_exactly_one_set_wins(tmp_path):
 
 def test_concurrent_proposal_same_subject_final_one_case(tmp_path):
     db_path = tmp_path / "sales-propose-concurrency.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as setup_session:
@@ -1572,7 +1572,7 @@ def test_real_threads_concurrent_proposal_exactly_one_wins(tmp_path):
     import threading
 
     db_path = tmp_path / "sales-propose-real-thread.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as setup_session:
@@ -1625,7 +1625,7 @@ def test_real_threads_concurrent_payment_confirmation_exactly_one_wins(tmp_path)
     import threading
 
     db_path = tmp_path / "sales-match-payment-real-thread.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as setup_session:
@@ -1676,7 +1676,7 @@ def test_real_threads_concurrent_payment_proposal_exactly_one_wins(tmp_path):
     import threading
 
     db_path = tmp_path / "sales-payment-propose-real-thread.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as setup_session:
@@ -1738,7 +1738,7 @@ def test_real_threads_direct_repository_invoice_capacity_never_exceeded(tmp_path
 
     for trial in range(10):
         db_path = tmp_path / f"invoice-capacity-race-{trial}.db"
-        engine = make_engine(str(db_path))
+        engine = make_engine(f"sqlite:///{db_path}")
         Base.metadata.create_all(engine)
         session_factory = make_session_factory(engine)
         with session_factory() as setup_session:
@@ -1788,7 +1788,7 @@ def test_real_threads_direct_repository_payment_capacity_never_exceeded(tmp_path
 
     for trial in range(10):
         db_path = tmp_path / f"payment-capacity-race-{trial}.db"
-        engine = make_engine(str(db_path))
+        engine = make_engine(f"sqlite:///{db_path}")
         Base.metadata.create_all(engine)
         session_factory = make_session_factory(engine)
         with session_factory() as setup_session:
@@ -1854,7 +1854,7 @@ def test_deterministic_stale_matchcase_rejected_invoice(tmp_path):
     from bel.infrastructure.persistence.repositories import MatchCaseNotPendingError
 
     db_path = tmp_path / "stale-matchcase-invoice.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as setup_session:
@@ -1911,7 +1911,7 @@ def test_deterministic_stale_matchcase_rejected_payment(tmp_path):
     from bel.infrastructure.persistence.repositories import MatchCaseNotPendingError
 
     db_path = tmp_path / "stale-matchcase-payment.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as setup_session:

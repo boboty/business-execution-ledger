@@ -108,7 +108,8 @@ def seed_runtime(runtime: DatabaseRuntime, tmp_path: Path) -> Path:
 
 @pytest.fixture
 def file_runtime(tmp_path) -> DatabaseRuntime:
-    return DatabaseRuntime(str(tmp_path / f"rt-{uuid.uuid4().hex[:8]}.db"), busy_timeout_ms=250)
+    db_path = tmp_path / f"rt-{uuid.uuid4().hex[:8]}.db"
+    return DatabaseRuntime(f"sqlite:///{db_path}", busy_timeout_ms=250)
 
 
 @pytest.fixture

@@ -74,7 +74,7 @@ NOW = datetime.now(timezone.utc)
 
 @pytest.fixture
 def db_session():
-    engine = make_engine(":memory:")
+    engine = make_engine("sqlite://")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
     with session_factory() as session:
@@ -514,7 +514,7 @@ def test_cost_recognition_fact_supersede_rejects_shipment_of_another_contract(db
 
 def test_cost_recognition_fact_stale_session_supersession_leaves_no_orphan_fact(tmp_path):
     db_path = tmp_path / "wfs-concurrency.db"
-    engine = make_engine(str(db_path))
+    engine = make_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
     session_factory = make_session_factory(engine)
 
