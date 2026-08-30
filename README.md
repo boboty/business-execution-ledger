@@ -54,7 +54,7 @@ Excel remains supported as an import format, an export format, a cutover/backfil
 
 See [docs/V1-SCOPE.md](docs/V1-SCOPE.md) for the frozen V1 boundary and [ROADMAP.md](ROADMAP.md) for the capability sequence.
 
-## Current capabilities — through Phase 2D.1
+## Current capabilities — through Phase 2D.1-P
 
 Phase 2D.1, **Business Fact Foundation & Contract Ledger**, is implementation-complete. The current system includes:
 
@@ -80,7 +80,9 @@ Phase 2D.1, **Business Fact Foundation & Contract Ledger**, is implementation-co
 
 The Phase 2D.1 cutover work is **infrastructure and rehearsal only**. BEL has **not** yet passed the first-stage cutover gate and must not yet be declared the System of Record.
 
-**Phase 2D.1-P — PostgreSQL Runtime Baseline & Migration Discipline** followed as an infrastructure-only phase: PostgreSQL is now the production/runtime persistence contract (SQLite remains a test-only convenience), with mechanically-enforced migration immutability. No V1 business scope changed. See [docs/PERSISTENCE-MIGRATION-POLICY.md](docs/PERSISTENCE-MIGRATION-POLICY.md).
+**Phase 2D.1-P — PostgreSQL Runtime Baseline & Migration Discipline** followed as an infrastructure-only phase: PostgreSQL 18 is now the production/runtime persistence contract (SQLite remains a test-only convenience), with mechanically-enforced migration immutability. No V1 business scope changed. See [docs/PERSISTENCE-MIGRATION-POLICY.md](docs/PERSISTENCE-MIGRATION-POLICY.md).
+
+The PostgreSQL rebuild path has now also been exercised end-to-end against private real-business acceptance data: source contract ledger, invoice evidence, bank evidence, procurement matching, Close Facts, and period-close preview were rebuilt into a fresh PostgreSQL runtime. Exact source re-import and matching reruns were verified idempotent, and period-close preview was verified read-only. The historical local `bel.db` was audited for unreconstructible canonical business facts and is now retired. **This validates the runtime/rebuild path; it does not replace the later business-confirmed first-stage cutover gate.**
 
 ## Not built yet
 
@@ -115,11 +117,14 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 git config core.hooksPath .githooks
 
-# PostgreSQL is BEL's runtime database (Phase 2D.1-P) — create one and
-# point BEL_DATABASE_URL at it. No default: production execution must
-# never silently fall back to a local file.
+# PostgreSQL 18 is BEL's V1 runtime target. For a source checkout,
+# repo-root .env is a development convenience automatically loaded by
+# both `bel` and `alembic`; packaged/production deployments must inject
+# BEL_DATABASE_URL explicitly from their deployment environment.
 createdb bel
-export BEL_DATABASE_URL=postgresql+psycopg://localhost/bel
+cp .env.example .env
+# Edit .env and set, for example:
+# BEL_DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/bel
 .venv/bin/alembic upgrade head
 
 # Import deterministic source evidence
@@ -127,6 +132,11 @@ export BEL_DATABASE_URL=postgresql+psycopg://localhost/bel
 .venv/bin/bel import-invoices <path-to-发票.xlsx> --direction purchase
 .venv/bin/bel import-bank <path-to-对账单.pdf> --profile cmb --source-account-id <stable-bank-account-id>
 .venv/bin/bel match run
+
+# Import an approved Close Fact Pack when the period needs facts that
+# are not deterministically derivable from source evidence alone.
+.venv/bin/bel import-close-facts <path-to-close-facts.json>
+.venv/bin/bel period-close preview <YYYY-MM>
 
 # Human workbench
 .venv/bin/bel web
@@ -137,19 +147,11 @@ export BEL_DATABASE_URL=postgresql+psycopg://localhost/bel
 .venv/bin/pytest
 ```
 
-Real business data must never be committed. Public tests run against
-independently constructed synthetic data under `fixtures/synthetic/`.
-SQLite remains available as an explicit test-only convenience
-(`sqlite:///path` or in-memory `sqlite://`) — it has no active Alembic
-chain and no concurrent-Web guarantee, so it is never the runtime for
-`bel web` or a shared development database. See
-[docs/PERSISTENCE-MIGRATION-POLICY.md](docs/PERSISTENCE-MIGRATION-POLICY.md)
-for the full runtime contract, migration immutability rules, and the
-dev-database rebuild path (PostgreSQL dev/test databases are disposable —
-rebuilt from source Excel/Evidence, never migrated from the old SQLite
-file).
+Real business data must never be committed. Public tests run against independently constructed synthetic data under `fixtures/synthetic/`.
 
-Cutover/backfill acceptance uses a private data root outside the repository. Expected Cutover Baseline material is reconciliation input only; it is never a source of canonical Facts.
+SQLite remains available as an explicit test-only convenience (`sqlite:///path` or in-memory `sqlite://`) — it has no active Alembic chain and no concurrent-Web guarantee, so it is never the runtime for `bel web` or a shared development database. The historical local runtime file `bel.db` is retired and is not a supported runtime or migration source. PostgreSQL development databases are rebuilt from source Excel / PDF Evidence and approved Fact Packs rather than copied from the legacy SQLite database. See [docs/PERSISTENCE-MIGRATION-POLICY.md](docs/PERSISTENCE-MIGRATION-POLICY.md) for the full runtime contract and migration immutability rules.
+
+Cutover/backfill acceptance uses a private data root outside the repository. Expected Cutover Baseline material is reconciliation input only; it is never a source of canonical Facts. A Cutover Baseline must be independently business-confirmed — it must not be generated from current BEL state merely to make reconciliation pass. If no such baseline exists yet, cutover reconciliation is simply **not run**; that is not a business-result mismatch.
 
 ## Documentation
 
