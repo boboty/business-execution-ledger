@@ -54,7 +54,7 @@ Excel remains supported as an import format, an export format, a cutover/backfil
 
 See [docs/V1-SCOPE.md](docs/V1-SCOPE.md) for the frozen V1 boundary and [ROADMAP.md](ROADMAP.md) for the capability sequence.
 
-## Current capabilities — through Phase 2D.1-P
+## Current capabilities — through Phase 2D.2
 
 Phase 2D.1, **Business Fact Foundation & Contract Ledger**, is implementation-complete. The current system includes:
 
@@ -71,7 +71,7 @@ Phase 2D.1, **Business Fact Foundation & Contract Ledger**, is implementation-co
 - three human-facing work surfaces:
   - **合同业务总账 / Contract Business Ledger** — cross-contract current business-fact projection with filters, CSV export and XLSX export
   - **合同360° / Contract 360** — drill-down view for one procurement contract and its current related facts
-  - **月结工作台 / Period Close Workbench** — read-only projected close judgment and blockers
+  - **月结工作台 / Period Close Workbench** — read-only projected close judgment and blockers, with an exportable **Period Close Business Data Product** (XLSX: six logical sheets; CSV: one unified long table) via both the Web workbench and `bel period-close export`
 - legacy backfill infrastructure with business-identity-aware replay handling
 - a closed, human-confirmed Cutover Fact path for the explicitly allowed fact types
 - private Cutover Baseline reconciliation with `MATCH / BEL_CORRECTED_LEGACY / UNRESOLVED` outcomes
@@ -82,13 +82,14 @@ The Phase 2D.1 cutover work is **infrastructure and rehearsal only**. BEL has **
 
 **Phase 2D.1-P — PostgreSQL Runtime Baseline & Migration Discipline** followed as an infrastructure-only phase: PostgreSQL 18 is now the production/runtime persistence contract (SQLite remains a test-only convenience), with mechanically-enforced migration immutability. No V1 business scope changed. See [docs/PERSISTENCE-MIGRATION-POLICY.md](docs/PERSISTENCE-MIGRATION-POLICY.md).
 
-The PostgreSQL rebuild path has now also been exercised end-to-end against private real-business acceptance data: source contract ledger, invoice evidence, bank evidence, procurement matching, Close Facts, and period-close preview were rebuilt into a fresh PostgreSQL runtime. Exact source re-import and matching reruns were verified idempotent, and period-close preview was verified read-only. The historical local `bel.db` was audited for unreconstructible canonical business facts and is now retired. **This validates the runtime/rebuild path; it does not replace the later business-confirmed first-stage cutover gate.**
+PostgreSQL is BEL's runtime persistence contract, and runtime data is always rebuildable from authoritative source Evidence and approved Fact Packs via the documented rebuild path (`docs/PERSISTENCE-MIGRATION-POLICY.md`) — local database files are never a source of truth. Private acceptance evidence and results remain outside the repository, under `$BEL_PRIVATE_DATA_ROOT/reports/`. **This does not replace the later business-confirmed first-stage cutover gate.**
+
+**Phase 2D.2 — Period Close Business Data Product** is implementation-complete (pending pre-Gate/Gate review): the existing read-only period-close preview/workbench is now also exportable as a deliverable, traceable, reproducible Data Product (XLSX and CSV), through the same Application-layer path for both Web and CLI. It introduces no new close rule, no persisted close result, and no finance-system vocabulary — see [docs/PHASE2D2-DECISIONS.md](docs/PHASE2D2-DECISIONS.md) and [docs/PHASE2D2-ACCEPTANCE.md](docs/PHASE2D2-ACCEPTANCE.md).
 
 ## Not built yet
 
 The remaining V1 critical path is intentionally narrow:
 
-- **Phase 2D.2 — Period Close Business Data Product**: turn the existing read-only close projection into a deliverable business data product while preserving the `Fact / Current State / Projected Decision / Blocker` boundary
 - **Phase 2D.3 — Outbound Invoicing Workbench**: freeze invoicing eligibility semantics, provide invoice-preparation data, and export the preparation data product; BEL prepares data but does not perform legal invoicing
 - **Phase 2D.4 — Exception & Task Center**: one human-facing center and data product for authoritative unresolved work already produced by BEL
 - **FIRST-STAGE CUTOVER GATE**: complete backfill, private reconciliation, unresolved cutover discrepancy = 0, and explicit System-of-Record switch
@@ -104,11 +105,11 @@ Also deliberately not built yet:
 
 ## Next up
 
-**Phase 2D.2 — Period Close Business Data Product.**
+**Phase 2D.3 — Outbound Invoicing Workbench.**
 
-The period-close business engine and workbench already exist and remain read-only/stateless. Phase 2D.2 packages that deterministic judgment as a deliverable Data Product; it does not introduce vouchers, debit/credit concepts, finance subject codes, or finance-system vocabulary.
+Freezes invoicing eligibility semantics against the business, then provides invoice-preparation data and its export; BEL prepares data but never performs the legal act of invoicing.
 
-After 2D.2, V1 proceeds to Outbound Invoicing, the Exception & Task Center, and then the first-stage cutover gate. See [ROADMAP.md](ROADMAP.md).
+After 2D.3, V1 proceeds to the Exception & Task Center and then the first-stage cutover gate. See [ROADMAP.md](ROADMAP.md).
 
 ## Getting started
 
@@ -165,6 +166,7 @@ Cutover/backfill acceptance uses a private data root outside the repository. Exp
 - [Phase 2D.0 Decisions](docs/PHASE2D0-DECISIONS.md) / [Acceptance](docs/PHASE2D0-ACCEPTANCE.md) — V1 product rebaseline
 - [Phase 2D.1 R0 Decisions](docs/PHASE2D1-R0-DECISIONS.md) / [Acceptance](docs/PHASE2D1-R0-ACCEPTANCE.md) — frozen sales, Shipment, correction and cutover semantics
 - [Persistence & Migration Policy](docs/PERSISTENCE-MIGRATION-POLICY.md) — PostgreSQL runtime contract, migration immutability rules (Phase 2D.1-P)
+- [Phase 2D.2 Decisions](docs/PHASE2D2-DECISIONS.md) / [Acceptance](docs/PHASE2D2-ACCEPTANCE.md) — Period Close Business Data Product
 - [Contributing](CONTRIBUTING.md) — contribution rules and development setup
 
 Implementation decisions and acceptance criteria for each phase are kept in `docs/PHASE*-DECISIONS.md` and `docs/PHASE*-ACCEPTANCE.md` so design changes are explicit rather than silently retrofitted to code.

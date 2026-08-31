@@ -176,8 +176,15 @@ at startup.
 Passing an SQLite test is not proof of a PostgreSQL persistence
 invariant. Concurrency, migration, constraint and transactional
 acceptance must run on PostgreSQL — see `tests/postgres/` (marked
-`@pytest.mark.postgres`, auto-skipped unless `BEL_DATABASE_URL` points at
-a real PostgreSQL database) and `tests/integration/test_migration.py`.
+`@pytest.mark.postgres`) and `tests/integration/test_migration.py`.
+
+These tests are destructive by design (they DROP and recreate
+schemas/databases), so they are gated behind an explicit disposable
+test-database contract (`tests/pg_disposable.py`): they run only against
+`BEL_TEST_DATABASE_URL` with `BEL_TEST_DATABASE_DISPOSABLE=1` set, and
+skip BEFORE any DROP otherwise. `BEL_DATABASE_URL` — the single runtime
+configuration — is never consulted by a destructive fixture and can
+never activate these tests.
 
 ## Mechanical enforcement
 

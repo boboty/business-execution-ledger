@@ -66,7 +66,13 @@ jobs:
           --health-retries 5
     env:
       # Local, disposable CI-only credentials — never real values.
+      # BEL_DATABASE_URL drives the runtime steps (alembic); the
+      # destructive PostgreSQL tests additionally require the explicit
+      # disposable test-database contract (tests/pg_disposable.py) so
+      # they can never target a runtime database.
       BEL_DATABASE_URL: postgresql+psycopg://bel_ci:bel_ci_password@localhost:5432/bel_ci
+      BEL_TEST_DATABASE_URL: postgresql+psycopg://bel_ci:bel_ci_password@localhost:5432/bel_ci
+      BEL_TEST_DATABASE_DISPOSABLE: "1"
     steps:
       - uses: actions/checkout@v4
         with:

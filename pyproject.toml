@@ -38,7 +38,7 @@ packages = ["src/bel"]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
-    "postgres: requires a real PostgreSQL database via BEL_DATABASE_URL (skipped automatically when not configured — see tests/postgres/conftest.py)",
+    "postgres: destructive PostgreSQL tests — run only against an explicitly configured disposable test database (BEL_TEST_DATABASE_URL + BEL_TEST_DATABASE_DISPOSABLE=1, see tests/pg_disposable.py); skipped automatically otherwise. Never activated by BEL_DATABASE_URL alone.",
 ]
 filterwarnings = [
     # starlette recommends httpx2, but Phase 2C deliberately tests with httpx

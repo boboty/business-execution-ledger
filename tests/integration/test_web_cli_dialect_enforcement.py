@@ -59,11 +59,12 @@ def test_web_cli_rejects_sqlite_memory_database_url():
 def test_web_cli_accepts_postgresql_database_url(postgres_url):
     """`bel web` against a real, migrated PostgreSQL database starts and
     serves normally — the dialect check does not false-positive-reject
-    the production contract it exists to protect. Covers both Contract
-    Ledger and Period Close Workbench against the SAME real PostgreSQL
-    runtime (one server startup, two requests) — Period Close's other
-    HTTP coverage uses an injected SQLite runtime and does not by itself
-    prove the page works against PostgreSQL."""
+    the production contract it exists to protect. Covers Contract
+    Ledger, Period Close Workbench, and the Phase 2D.2 Period Close Data
+    Product export routes against the SAME real PostgreSQL runtime (one
+    server startup, several requests) — this HTTP coverage elsewhere
+    uses an injected SQLite runtime and does not by itself prove any of
+    these pages/routes work against PostgreSQL."""
     from sqlalchemy import create_engine
 
     engine = create_engine(postgres_url, future=True)
@@ -114,6 +115,21 @@ def test_web_cli_accepts_postgresql_database_url(postgres_url):
         with urllib.request.urlopen("http://127.0.0.1:8823/period-close", timeout=5) as resp:
             period_close_status = resp.status
         assert period_close_status == 200
+
+        # Phase 2D.2: the Data Product export routes must also serve
+        # against the same real PostgreSQL runtime — an empty database is
+        # still a valid (empty) export, never an error.
+        with urllib.request.urlopen("http://127.0.0.1:8823/period-close/export.xlsx", timeout=5) as resp:
+            xlsx_status = resp.status
+            xlsx_content_type = resp.headers.get("Content-Type")
+        assert xlsx_status == 200
+        assert xlsx_content_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+        with urllib.request.urlopen("http://127.0.0.1:8823/period-close/export.csv", timeout=5) as resp:
+            csv_status = resp.status
+            csv_content_type = resp.headers.get("Content-Type")
+        assert csv_status == 200
+        assert csv_content_type == "text/csv; charset=utf-8"
     finally:
         proc.terminate()
         try:

@@ -26,6 +26,11 @@ from bel.application.contract_ledger_export import (
     export_contract_business_ledger_csv,
     export_contract_business_ledger_xlsx,
 )
+from bel.application.period_close_export import (
+    build_period_close_data_product,
+    export_period_close_csv,
+    export_period_close_xlsx,
+)
 from bel.application.period_close_workbench import get_period_close_workbench, list_known_periods
 from bel.application.search_contracts import search_contracts_by_no
 from bel.infrastructure.persistence.database import is_database_busy
@@ -84,6 +89,42 @@ def period_close_page(
     vm = viewmodels.PeriodCloseVM(workbench)
     return _templates(request).TemplateResponse(
         request, "period_close.html", {"page": "period-close", "vm": vm}
+    )
+
+
+@router.get("/period-close/export.xlsx")
+def period_close_export_xlsx(
+    request: Request,
+    period: str | None = None,
+    session: Session = Depends(_session),
+) -> Response:
+    with session.no_autoflush:
+        period = _checked_period(period, session)
+        workbench = get_period_close_workbench(session, period)
+    product = build_period_close_data_product(workbench)
+    content = export_period_close_xlsx(product)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=period-close-{period}.xlsx"},
+    )
+
+
+@router.get("/period-close/export.csv")
+def period_close_export_csv(
+    request: Request,
+    period: str | None = None,
+    session: Session = Depends(_session),
+) -> Response:
+    with session.no_autoflush:
+        period = _checked_period(period, session)
+        workbench = get_period_close_workbench(session, period)
+    product = build_period_close_data_product(workbench)
+    content = export_period_close_csv(product)
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=period-close-{period}.csv"},
     )
 
 

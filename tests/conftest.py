@@ -10,22 +10,25 @@ from sqlalchemy.orm import Session
 
 from bel.infrastructure.persistence.database import make_engine, make_session_factory
 from bel.infrastructure.persistence.models import Base
+from tests.pg_disposable import DISPOSABLE_SKIP_REASON, resolve_disposable_postgres_url
 
 PRIMARY_SHEET_NAME = "报关出口购销合同"
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Auto-skip everything marked ``@pytest.mark.postgres`` unless
-    BEL_DATABASE_URL is set to a real PostgreSQL target — see the
-    ``postgres`` marker's registration in pyproject.toml and the
-    ``postgres_url`` fixture below. Keeps plain local `pytest` runs
-    passing with zero PostgreSQL dependency (Part F: SQLite test
-    convenience vs. PostgreSQL production contract, kept separate)."""
-    if os.environ.get("BEL_DATABASE_URL", "").startswith("postgresql"):
+    """Auto-skip everything marked ``@pytest.mark.postgres`` unless the
+    disposable test-database contract is satisfied — see the ``postgres``
+    marker's registration in pyproject.toml, ``tests/pg_disposable.py``
+    for the contract, and the ``postgres_url`` fixture below for the
+    fixture-level double guard. Keeps plain local `pytest` runs passing
+    with zero PostgreSQL dependency (Part F: SQLite test convenience vs.
+    PostgreSQL production contract, kept separate), and — critically —
+    means the destructive PostgreSQL fixtures can never activate from
+    ``BEL_DATABASE_URL`` alone: the runtime database is never dropped or
+    reset by the test suite."""
+    if resolve_disposable_postgres_url(os.environ) is not None:
         return
-    skip_postgres = pytest.mark.skip(
-        reason="requires BEL_DATABASE_URL set to a postgresql+psycopg:// URL (see docs/PERSISTENCE-MIGRATION-POLICY.md)"
-    )
+    skip_postgres = pytest.mark.skip(reason=DISPOSABLE_SKIP_REASON)
     for item in items:
         if "postgres" in item.keywords:
             item.add_marker(skip_postgres)
@@ -33,10 +36,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 @pytest.fixture
 def postgres_url() -> str:
-    """The PostgreSQL URL under test — only reached by a test whose
-    ``postgres`` marker survived collection, so BEL_DATABASE_URL is
-    guaranteed set to a real postgresql+psycopg:// target here."""
-    return os.environ["BEL_DATABASE_URL"]
+    """The disposable PostgreSQL test database URL — never the runtime
+    ``BEL_DATABASE_URL``. Second, fixture-level guard behind the
+    collection-level skip above: if a test somehow reaches fixture setup
+    without the disposable contract being satisfied, skip here — BEFORE
+    the test body (and its DROPs) can run — rather than ever handing out
+    a runtime database."""
+    url = resolve_disposable_postgres_url(os.environ)
+    if url is None:
+        pytest.skip(DISPOSABLE_SKIP_REASON)
+    return url
 
 
 @pytest.fixture

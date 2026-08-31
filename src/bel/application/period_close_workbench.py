@@ -125,6 +125,7 @@ class BlockerContext:
 class WorkbenchBlocker:
     blocker: CloseBlocker
     contract_no: str | None
+    counterparty: str | None
     item: ContractItem | None
     context: BlockerContext
 
@@ -403,11 +404,13 @@ def get_period_close_workbench(session: Session, period: str) -> PeriodCloseWork
 
         blockers = []
         for blocker in preview.blockers:
-            contract_no, _, item = _contract_and_item(blocker.contract_id, blocker.contract_item_id)
+            contract_no, counterparty, item = _contract_and_item(blocker.contract_id, blocker.contract_item_id)
+            in_scope = blocker.contract_id in contracts
             blockers.append(
                 WorkbenchBlocker(
                     blocker=blocker,
-                    contract_no=contract_no if blocker.contract_id in contracts else None,
+                    contract_no=contract_no if in_scope else None,
+                    counterparty=counterparty if in_scope else None,
                     item=item,
                     context=_blocker_context(blocker),
                 )

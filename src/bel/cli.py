@@ -31,6 +31,12 @@ from bel.application.list_exceptions import list_exceptions
 from bel.application.list_matches import list_match_cases
 from bel.application.matching import confirm_match, match_invoices, match_payments
 from bel.application.period_close import build_period_close_preview
+from bel.application.period_close_export import (
+    build_period_close_data_product,
+    export_period_close_csv,
+    export_period_close_xlsx,
+)
+from bel.application.period_close_workbench import get_period_close_workbench
 from bel.application.search_contracts import search_contracts_by_no
 from bel.application.procurement_sales_link import (
     ProcurementSalesLinkFactError,
@@ -1771,6 +1777,31 @@ def period_close_preview(ctx: click.Context, period: str) -> None:
     click.echo("Summary:")
     for key, value in preview.summary.items():
         click.echo(f"  {key}: {value}")
+
+
+@period_close_group.command("export")
+@click.argument("period", type=str)
+@click.option("--format", "fmt", type=click.Choice(["xlsx", "csv"]), required=True, help="Output format.")
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="File to write the Data Product to.",
+)
+@click.pass_context
+def period_close_export(ctx: click.Context, period: str, fmt: str, output_path: Path) -> None:
+    """Generate the Period Close Data Product for <YYYY-MM> as XLSX or
+    CSV. Strictly read-only: calls the SAME Application Data Product
+    path Web uses (get_period_close_workbench -> data product ->
+    serializer) and writes nothing to the database."""
+    session_factory = _session_factory(ctx.obj["database_url"])
+    with session_factory() as session:
+        workbench = get_period_close_workbench(session, period)
+    product = build_period_close_data_product(workbench)
+    content = export_period_close_xlsx(product) if fmt == "xlsx" else export_period_close_csv(product)
+    output_path.write_bytes(content)
+    click.echo(f"Period Close Data Product written: {output_path} ({fmt})")
 
 
 @cli.command("web")

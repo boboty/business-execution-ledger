@@ -163,6 +163,15 @@ Data Product carrying a *rule-derived business judgment* rather than a
 projection of stored facts, which is why it is sequenced ahead of
 invoicing and the exception centre.
 
+**Implementation-complete** (pending pre-Gate/Gate review): one
+Application-layer path
+(`get_period_close_workbench` -> `build_period_close_data_product` ->
+XLSX/CSV serializer) shared by Web (`GET /period-close/export.xlsx`,
+`.../export.csv`) and CLI (`bel period-close export`). No new close
+rule, no persisted close result/snapshot, no schema change. See
+[docs/PHASE2D2-DECISIONS.md](docs/PHASE2D2-DECISIONS.md) and
+[docs/PHASE2D2-ACCEPTANCE.md](docs/PHASE2D2-ACCEPTANCE.md).
+
 ## Phase 2D.3 — Outbound Invoicing Workbench
 
 对外开票工作台 plus the Outbound Invoice Preparation export.

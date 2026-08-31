@@ -21,6 +21,13 @@
   <button type="submit" class="btn">重新预演</button>
 </form>
 
+<p class="section-note section-note-muted">
+  下载本期 Period Close Data Product：
+  <a href="/period-close/export.xlsx?period={{ vm.period }}">下载 XLSX</a>
+  ·
+  <a href="/period-close/export.csv?period={{ vm.period }}">下载 CSV</a>
+</p>
+
 <section class="cards">
   {% for card in vm.summary %}
   <a class="card {{ 'card-danger' if card.key == 'blockers' and card.value > 0 else '' }}" href="#{{ card.anchor }}">

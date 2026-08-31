@@ -11,9 +11,12 @@ concurrency invariants the Phase 2D.1-P advisory-lock work is meant to
 preserve actually hold under PostgreSQL's weaker default isolation,
 including against writers that bypass the application layer entirely.
 
-Requires a real PostgreSQL database via BEL_DATABASE_URL — skipped
-automatically otherwise (see tests/conftest.py's ``postgres`` marker
-handling). Every test rebuilds the schema from empty via
+Requires a disposable PostgreSQL test database via the explicit
+test-harness contract (BEL_TEST_DATABASE_URL +
+BEL_TEST_DATABASE_DISPOSABLE=1 — see tests/pg_disposable.py); skipped
+automatically otherwise. BEL_DATABASE_URL, the runtime configuration, is
+NEVER consulted here and is never dropped or reset by these tests. Every
+test rebuilds the schema from empty via
 ``Base.metadata.create_all`` (structurally identical to what the
 baseline migration creates — migration-driven creation itself is
 verified separately by test_migration.py) so each test starts clean and
@@ -53,6 +56,11 @@ from bel.application.import_close_facts import import_close_facts
 from bel.application.import_contract_ledger import import_contract_ledger
 from bel.application.import_invoices import import_invoices
 from bel.application.matching import match_invoices, match_payments
+from bel.application.period_close_export import (
+    build_period_close_data_product,
+    export_period_close_csv,
+    export_period_close_xlsx,
+)
 from bel.application.period_close_workbench import get_period_close_workbench
 from bel.application.procurement_sales_link import add_procurement_sales_link
 from bel.application.sales_contract_facts import create_sales_contract_fact
@@ -250,6 +258,53 @@ def test_contract_business_ledger_contract_360_and_period_close_workbench(pg_run
 
         workbench = get_period_close_workbench(session, "2031-03")
         assert workbench is not None
+
+
+def test_period_close_data_product_export_against_postgres(pg_runtime, tmp_path):
+    """Phase 2D.2: the Period Close Data Product (XLSX + CSV) built and
+    serialized from a real PostgreSQL-backed Workbench — not only SQLite
+    (dialect portability for openpyxl/csv against real Decimal/UUID/date
+    values coming back through psycopg)."""
+    with pg_runtime.session_factory() as session:
+        contracts_xlsx = tmp_path / "contracts.xlsx"
+        invoices_xlsx = tmp_path / "invoices.xlsx"
+        facts_json = tmp_path / "close-facts.json"
+        write_ledger_workbook(contracts_xlsx, PHASE2B_CONTRACT_HEADERS, PHASE2B_CONTRACT_ROWS)
+        write_invoice_workbook(invoices_xlsx, scenarios.BUYER, PHASE2B_INVOICE_ROWS)
+        facts_json.write_text(json.dumps(CLOSE_FACT_PACK))
+
+        import_contract_ledger(session, contracts_xlsx)
+        import_invoices(session, invoices_xlsx, InvoiceDirection.PURCHASE)
+        _confirm_contract_allocations(session)
+        session.commit()
+        import_close_facts(session, facts_json)
+        session.commit()
+
+        def _counts():
+            from bel.infrastructure.persistence.models import AccrualModel, AccrualReversalModel, InvoiceItemAllocationModel
+
+            return {
+                "accruals": session.query(AccrualModel).count(),
+                "accrual_reversals": session.query(AccrualReversalModel).count(),
+                "invoice_item_allocations": session.query(InvoiceItemAllocationModel).count(),
+            }
+
+        before = _counts()
+        workbench = get_period_close_workbench(session, "2031-03")
+        product = build_period_close_data_product(workbench)
+        assert len(product.all_rows) > 0
+
+        xlsx_bytes = export_period_close_xlsx(product)
+        assert len(xlsx_bytes) > 0
+        csv_bytes = export_period_close_csv(product)
+        assert len(csv_bytes) > 0
+        after = _counts()
+        assert before == after, "Data Product generation must remain strictly read-only"
+
+        # semantic rerun determinism against real PostgreSQL.
+        workbench2 = get_period_close_workbench(session, "2031-03")
+        product2 = build_period_close_data_product(workbench2)
+        assert export_period_close_csv(product) == export_period_close_csv(product2)
 
 
 def test_cutover_reconciliation_snapshot_builds_against_postgres(pg_runtime, tmp_path):

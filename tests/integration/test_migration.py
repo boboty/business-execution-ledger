@@ -1,8 +1,12 @@
 """Migration-driven schema creation against the PostgreSQL Migration
 Epoch chain (migrations/postgresql_versions/) — the active chain since
-Phase 2D.1-P. Runs against a real PostgreSQL database (BEL_DATABASE_URL);
-skipped automatically otherwise — see tests/conftest.py's ``postgres``
-marker handling and docs/PERSISTENCE-MIGRATION-POLICY.md.
+Phase 2D.1-P. Runs against a disposable PostgreSQL test database via the
+explicit test-harness contract (BEL_TEST_DATABASE_URL +
+BEL_TEST_DATABASE_DISPOSABLE=1 — see tests/pg_disposable.py); skipped
+automatically otherwise — see tests/conftest.py's ``postgres`` marker
+handling and docs/PERSISTENCE-MIGRATION-POLICY.md. These tests DROP and
+recreate schemas/databases, which is why they can never target the
+runtime BEL_DATABASE_URL.
 
 This is the literal "B. empty DB -> upgrade head PASS" / "current == head"
 / "alembic check clean" evidence item. The old chain

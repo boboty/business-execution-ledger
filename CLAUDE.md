@@ -100,8 +100,11 @@ rules, same standing as rules 1-7 above:
 uv pip install --python .venv/bin/python -e ".[dev]"
 export BEL_DATABASE_URL=postgresql+psycopg://user:password@host:5432/bel
 .venv/bin/alembic upgrade head
-.venv/bin/pytest                                        # public suite — no private data needed; PostgreSQL-marked
-                                                          # tests auto-skip unless BEL_DATABASE_URL is set
+.venv/bin/pytest                                        # public suite — no private data needed; destructive PostgreSQL-marked
+                                                          # tests auto-skip unless the disposable test-database contract
+                                                          # (BEL_TEST_DATABASE_URL + BEL_TEST_DATABASE_DISPOSABLE=1, see
+                                                          # tests/pg_disposable.py) is set — they NEVER run against
+                                                          # BEL_DATABASE_URL, which the suite never drops or resets
 BEL_PRIVATE_DATA_ROOT=... .venv/bin/python tests/private_acceptance/runner.py --all   # private acceptance — local only
 python tools/privacy_scan.py --staged                    # before every commit
 python tools/check_migration_immutability.py --staged    # before every commit
