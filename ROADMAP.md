@@ -231,6 +231,35 @@ context, strictly read-only), and a deliberately-empty Application-layer
 seam is reserved for the future 一致性校验 whose compared field set is
 not frozen.
 
+**F1b (supplier-direction rule foundation + rule provenance registry)
+implemented:** the `SUPPLIER_INVOICE_REQUEST` rule layer
+(`bel.application.supplier_invoice_request`) evaluates, per procurement
+Contract scope over the F0 fact context: the IP-P02 expected purchase
+invoice gross amount == the Contract gross amount (explicit
+missing-fact blocker when unknown — never an estimate); PURCHASE
+invoice cardinality (zero is factual state only, one is exposed as
+facts, more than one is the deterministic IP-P03 violation
+`MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT`); and the complete-context
+PURCHASE invoice -> procurement Contracts mapping with the IP-P04
+violation blocker (`PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS`, never
+silently apportioned). Exact amount and exact product-name consistency
+checks emit `MATCH` / `MISMATCH` / `NOT_COMPARABLE_MISSING_FACT` — a
+MISMATCH is a factual outcome, never "unpaid"/"outstanding"/"overdue".
+OUT payments are exposed as context only (IP-P01); no tax-rate
+inference exists (IP-P06 — an actual InvoiceItem's `tax_rate` is
+reachable only as an existing Fact); no requested quantity is
+calculated (IP-P07 unresolved safe blocker). The decision vocabulary is
+fact/preparation-only (`PREPARATION_AMOUNT_DETERMINABLE` /
+`INSUFFICIENT_FACTS` / `RULE_CONFLICT` — no READY/ELIGIBLE/OVERDUE
+member, and "amount determinable" does NOT mean "supplier should
+invoice now"). Rule provenance (accountant-confirmed vs
+owner-confirmed-provisional vs unresolved-safe-blocker) is registered
+publicly in `docs/PHASE2D3-RULE-FREEZE.md`, including the IP-S02 gap:
+the canonical Shipment carries no export/customs declaration amount, so
+IP-S02 is frozen as a rule but NOT fully evaluable — the declaration
+amount is never faked from the SalesContract or the Invoice. No schema
+change, no migration; the F1a sales layer is unchanged.
+
 ## Phase 2D.4 — Exception & Task Center
 
 异常与任务中心 plus the Exception/Task export.

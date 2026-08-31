@@ -66,10 +66,17 @@ from bel.application.period_close_workbench import get_period_close_workbench
 from bel.application.procurement_sales_link import add_procurement_sales_link
 from bel.application.sales_contract_facts import create_sales_contract_fact
 from bel.application.sales_matching import confirm_sales_invoice_match, propose_sales_invoice_match
+from bel.application.supplier_invoice_request import (
+    PurchaseInvoiceContractAssociation,
+    SupplierRequestCheckOutcome,
+    SupplierRequestDecisionStatus,
+    evaluate_supplier_invoice_request,
+)
 from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
 from bel.domain.invoice import Invoice, InvoiceDirection
-from bel.domain.matching import ConfirmationType
+from bel.domain.matching import AllocationMatchMethod, ConfirmationType, MatchCase, MatchCaseStatus, MatchMethod
+from bel.domain.matching import PaymentAllocation
 from bel.domain.payment import Payment, PaymentDirection
 from bel.domain.procurement_sales_link import ConfirmationType as LinkConfirmationType
 from bel.infrastructure.persistence.database import DatabaseRuntime, is_database_busy, make_engine, make_session_factory
@@ -384,6 +391,96 @@ def test_cutover_reconciliation_snapshot_builds_against_postgres(pg_runtime, tmp
 
         snapshot = build_contract_execution_snapshot(session)
         assert isinstance(snapshot, dict)
+
+
+def test_supplier_invoice_request_against_postgres(pg_runtime):
+    """Phase 2D.3-F1b: the SUPPLIER_INVOICE_REQUEST rule layer evaluates
+    against real PostgreSQL with a genuinely M001-matched PURCHASE
+    invoice — the IP-P02 expected amount comes from the Contract Fact,
+    the amount check matches exactly, the OUT payment stays context
+    (IP-P01), and the evaluation is strictly read-only."""
+    counterparty = f"Supplier-{uuid.uuid4().hex[:8]}"
+    gross_amount = Decimal("500.00")
+    contract_id = _seed_m001_contract(pg_runtime.database_url, gross_amount=gross_amount, counterparty=counterparty)
+
+    engine = make_engine(pg_runtime.database_url)
+    with make_session_factory(engine)() as session:
+        frag = _make_fragment(session)
+        invoice = Invoice(
+            id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+            digital_invoice_no=None, external_invoice_key=f"PINV-F1B-{uuid.uuid4().hex[:8]}",
+            issue_date=date(2026, 1, 10), seller=counterparty, buyer="Our Entity",
+            net_amount=gross_amount, tax_amount=Decimal("0"), gross_amount=gross_amount,
+            invoice_status=None, source_fragment_id=frag.id, created_at=NOW, updated_at=NOW,
+        )
+        InvoiceRepository(session).add(invoice)
+        session.flush()
+        payment = Payment(
+            id=uuid.uuid4(), transaction_date=date(2026, 1, 20), direction=PaymentDirection.OUT,
+            amount=Decimal("250.00"), counterparty=counterparty, business_type=None,
+            bank_reference=f"REF-{uuid.uuid4().hex[:8]}", description=None, running_balance=None,
+            source_fragment_id=frag.id, created_at=NOW,
+        )
+        PaymentRepository(session).add(payment)
+        session.commit()
+
+        # The canonical M001 path writes the confirmed InvoiceAllocation.
+        match_invoices(session)
+        session.commit()
+
+        match_case = MatchCase(
+            id=uuid.uuid4(), subject_type="PAYMENT", subject_id=payment.id,
+            status=MatchCaseStatus.AUTO_CONFIRMED, match_method=MatchMethod.M001,
+            created_at=NOW, resolved_at=NOW,
+        )
+        MatchCaseRepository(session).add(match_case)
+        session.flush()
+        PaymentAllocationRepository(session).add(
+            PaymentAllocation(
+                id=uuid.uuid4(), payment_id=payment.id, contract_id=contract_id,
+                match_case_id=match_case.id, allocated_amount=Decimal("250.00"),
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+            )
+        )
+        session.commit()
+
+        def _counts():
+            from bel.infrastructure.persistence import models as m
+
+            counts = {}
+            for name in dir(m):
+                obj = getattr(m, name)
+                if isinstance(obj, type) and hasattr(obj, "__tablename__"):
+                    counts[obj.__tablename__] = session.query(obj).count()
+            return counts
+
+        before = _counts()
+        report = evaluate_supplier_invoice_request(session)
+        after = _counts()
+        assert before == after, "supplier invoice request evaluation must be strictly read-only"
+
+        assert len(report.decisions) == 1
+        decision = report.decisions[0]
+        assert decision.contract_id == contract_id
+        assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+        assert decision.expected_purchase_invoice_gross_amount == gross_amount
+        assert decision.blockers == ()
+
+        # The M001-confirmed invoice compares MATCH against the Contract
+        # gross amount (exact Decimal equality, canonical semantics).
+        assert len(decision.amount_checks) == 1
+        assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.MATCH
+        assert decision.amount_checks[0].compared_invoice_gross_amount == gross_amount
+
+        # OUT payment exposed as context, never a gate (IP-P01).
+        assert len(decision.payment_allocations) == 1
+        assert decision.payment_allocations[0].payment.direction == PaymentDirection.OUT
+
+        assert report.purchase_invoice_contract_map == (
+            PurchaseInvoiceContractAssociation(invoice_id=invoice.id, contract_ids=(contract_id,)),
+        )
+    engine.dispose()
 
 
 # ---------------------------------------------------------------------------
