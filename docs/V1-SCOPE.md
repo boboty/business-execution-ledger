@@ -28,7 +28,7 @@ As new business facts continuously enter BEL, BEL must be able to:
 | 1 | Reconstruct a contract's current execution state | **Partially implemented** — 合同360° covers a single contract; there is no cross-contract ledger, no export execution, and no sales-side execution state |
 | 2 | Produce a period-close / accrual business judgment at any point in time | **Capability implemented** (Phase 2C.2 read-only preview) — first-stage coverage is not yet cutover-complete (see below) |
 | 3 | Generate a deliverable accrual business data product | **Not implemented** — no export path exists |
-| 4 | Give the business data needed to prepare outbound invoicing | **Not implemented** |
+| 4 | Give the business data needed to prepare invoicing in both directions — issuing sales invoices to external customers (向客户开票) and requesting supplier invoices (向供应商要票) | **Not implemented** |
 | 5 | Expose what cannot be determined, lacks evidence, or needs a human | **Partially implemented** — deterministic exceptions and period-close blockers exist; there is no unified center, and some producer rules are not frozen |
 | 6 | Export business results as an Excel / CSV Data Product | **Not implemented** |
 
@@ -168,7 +168,8 @@ depend on `ContractItem` completeness:
 - formal period-close accrual data (rather than contract-level candidates)
 - partial reversal (R006 tracks matched `ContractItem` quantity)
 - item-level invoice attribution
-- outbound invoice quantity/product preparation
+- invoice preparation quantity/product facts (both the sales and the
+  supplier direction)
 - the Contract Business Ledger's 商品/业务范围 dimension
 
 `ContractItem` Fact Maintenance is therefore the first implementation
@@ -207,9 +208,9 @@ a Contract Business Ledger projection.
 
 **Not frozen by this document:** `Export completed → automatically
 invoice eligible`. Export execution is one *candidate* fact for future
-outbound-invoicing eligibility; it does not by itself decide invoicing
-eligibility. That rule is frozen separately before Phase 2D.3 (section
-5.1).
+invoicing-eligibility rules (in either direction); it does not by itself
+decide invoicing eligibility. That rule is frozen separately before
+Phase 2D.3 (section 5.1).
 
 ### 2.4 Fact correction / supersession semantics — frozen in Phase 2D.1-R0
 
@@ -245,7 +246,7 @@ itself has been ingested — and is supplied later from sales-side
 Evidence as a normal supplementing fact. A sales-scope reference number
 is **not** a customer identity, and neither is a customs-receiving party
 named on shipping material. Until a customer is known, that scope cannot
-support outbound invoicing; it produces a `Task`, never a guess.
+support sales-invoice preparation; it produces a `Task`, never a guess.
 
 **`ProcurementSalesLink`** is the bridge: which procurement contract(s)
 supply which sales scope(s). It is many-to-many, and it **expresses a
@@ -260,9 +261,10 @@ not in V1.
 sales-side item object**. `Shipment / Export` is **not** the bridge and
 never creates one automatically; a shipment implying an unestablished
 link produces a `Task`. A shipment is, however, an important candidate
-fact source for the quantity a future outbound invoice would prepare —
-what that rule actually is remains Phase 2D.3's to freeze (section 5.1),
-and nothing here establishes shipped quantity as invoiceable quantity.
+fact source for the quantity a future invoice preparation (in either
+direction) would consider — what that rule actually is remains Phase
+2D.3's to freeze (section 5.1), and nothing here establishes shipped
+quantity as invoiceable quantity.
 
 ## 3. Matching
 
@@ -305,8 +307,8 @@ This directly limits:
 
 - the Contract Business Ledger's sales-invoice state
 - the Contract Business Ledger's incoming-receipt state
-- the Outbound Invoicing Workbench's "does a corresponding Sales Invoice
-  Fact already exist" judgment
+- the Invoice Preparation Workbench's "does a corresponding Sales
+  Invoice Fact already exist" judgment
 - sales-side business execution state generally
 
 **This is not merely a direction parameter.** Closing it required
@@ -372,8 +374,8 @@ V1's Definition of Done requires five core work surfaces. 业务驾驶舱
    `ContractItem` scope, the linked sales scope(s) and their external
    customer (`SalesContract.customer`), export execution,
    purchase-invoice state, sales-invoice state, outgoing payment state,
-   incoming receipt state, current accrual state, outbound invoice
-   preparation state where determinable, and an
+   incoming receipt state, current accrual state, invoice preparation
+   state where determinable, and an
    unresolved-work/exception indicator. The Ledger's primary axis is the
    **procurement contract**, matching the legacy ledger it replaces;
    linked sales scopes are projected onto that row and are never summed
@@ -405,8 +407,10 @@ V1's Definition of Done requires five core work surfaces. 业务驾驶舱
    decision for Phase 2D.2. It continues to produce no accounting
    voucher, debit/credit entry, finance subject code, posting, or
    tax-accounting logic.
-4. **对外开票工作台 Outbound Invoicing Workbench** — **not
-   implemented**; see section 5.1.
+4. **开票与请票工作台 Invoice Preparation Workbench** — **not
+   implemented** (Phase 2D.3-F0 establishes only the rule-neutral
+   factual context — a read-only fact page, no preparation surface
+   yet); see section 5.1.
 5. **异常与任务中心 Exception & Task Center** — **not implemented** as a
    surface, though real unresolved work already exists; see section 5.2.
 
@@ -414,48 +418,69 @@ Business Fact Maintenance (section 2.1) is the operating capability
 underneath these surfaces, not a sixth page — it is not inflated into a
 standalone large page merely to round out a count.
 
-### 5.1 Outbound Invoicing Workbench (product shape; rules not frozen)
+### 5.1 Invoice Preparation Workbench (product shape; rules not frozen)
+
+Product-scope clarification (frozen): the workbench covers **two
+invoice-preparation directions** —
+
+1. **SALES INVOICE PREPARATION** — our company → external sales
+   customer (primary axis: `SalesContract`; the external customer comes
+   only from `SalesContract.customer`).
+2. **SUPPLIER INVOICE REQUEST** — supplier → our company ("how should
+   the supplier invoice us?"; primary axis: procurement `Contract`;
+   `Contract.buyer` is our own entity, never a customer).
+
+The direction scope above is frozen; the business rules inside those
+directions are not.
 
 Product shape:
 
 ```
 Business Facts
       ↓
-Deterministic eligibility / preparation
+Deterministic eligibility / preparation (per direction)
       ↓
 Invoice Preparation Data
       ↓
-actual invoicing happens (outside BEL)
+actual invoicing / requesting happens (outside BEL)
       ↓
-Sales Invoice Fact enters BEL
+Sales Invoice / Purchase Invoice Facts enter BEL
       ↓
 business state recomputed
 ```
 
 From confirmed facts already in BEL, it must surface: which business has
-met outbound-invoicing conditions; who to bill; which
-contract/goods/business it corresponds to; quantity and amount; what
-invoicing information must be prepared; which confirmed facts support
-that judgment; whether a corresponding Sales Invoice Fact already
+met invoicing conditions in the relevant direction; who to bill (sales
+direction) or which supplier to request an invoice from (supplier
+direction); which contract/goods/business it corresponds to; quantity
+and amount; what invoicing information must be prepared; which confirmed
+facts support that judgment; whether a corresponding Sales Invoice Fact
+(sales direction) or Purchase Invoice Fact (supplier direction) already
 exists; which business does not yet qualify, and why it cannot be
 judged.
 
 V1 does not connect to the e-tax bureau, tax-control systems, or an
 external invoicing API, and does not perform the legal act of issuing an
-invoice. It produces a complete, deterministic, traceable **Outbound
-Invoice Preparation Data Product** (section 6).
+invoice — in either direction. It produces a complete, deterministic,
+traceable **Invoice Preparation Data Product** (section 6).
 
 **Prerequisites, all of which must land first:** the `ContractItem`
 pipeline (2.2), `Shipment / Export` facts (2.3), sales-side association
-(3.1), and an invoicing eligibility rule freeze.
+(3.1), and an invoicing eligibility / preparation rule freeze.
 
-**No outbound-invoicing eligibility rule is frozen by this document, and
-none may be invented.** Before Phase 2D.3 the business must confirm what
-combination of facts means: *not eligible*, *ready for invoice
-preparation*, *already invoiced*, and *blocked / unresolved*. A Sales
-Invoice Fact existing is **not** the same thing as an invoicing
-eligibility Decision. Tagged `REQUIRES BUSINESS RULE FREEZE`; no
-numbered rule for it exists in [RULES.md](RULES.md).
+**No invoicing eligibility or preparation rule (in either direction) is
+frozen by this document, and none may be invented.** Before Phase 2D.3
+the business must confirm what combination of facts means: *not
+eligible*, *ready for invoice preparation*, *already invoiced*, and
+*blocked / unresolved* — per direction. A Sales Invoice Fact existing is
+**not** the same thing as an invoicing eligibility Decision; a
+Shipment/Export fact does not by itself mean invoice eligibility; a
+receipt/payment does not by itself mean invoice eligibility; and no
+amount or quantity is apportioned across the many-to-many
+ProcurementSalesLink bridge in service of any such rule. Supplier
+request calculations and sales invoice calculations are **not
+implemented** until those rules are frozen. Tagged `REQUIRES BUSINESS
+RULE FREEZE`; no numbered rule for it exists in [RULES.md](RULES.md).
 
 ### 5.2 Exception & Task Center (infrastructure now, producers rule-by-rule)
 
@@ -515,7 +540,7 @@ export path anywhere in the codebase. Each is assigned to a phase:
 |---|---|
 | Contract Business Ledger export | 2D.1-R4 |
 | Period Close / Accrual business data export | 2D.2 |
-| Outbound Invoice Preparation export | 2D.3 |
+| Invoice Preparation Data Product | 2D.3 |
 | Exception / Task export | 2D.4 |
 
 Exact schemas and the Application-layer export boundary are
@@ -565,8 +590,8 @@ Phase 2D.0 does not implement one. Phase 2D.1-R5 delivers the
 Baseline, and a reconciliation harness, first verified against the
 contract-execution fact layer. The **final first-stage cutover
 acceptance runs after Phase 2D.4**, because a complete switch also
-depends on the 2D.2 accrual Data Product, the 2D.3 outbound-invoicing
-judgment and Data Product, and the 2D.4 exception loop.
+depends on the 2D.2 accrual Data Product, the 2D.3 invoice preparation
+rules and Data Product, and the 2D.4 exception loop.
 
 ### 7.1 The legacy ledger is not Golden Truth
 
@@ -625,7 +650,7 @@ stdout.
 
 业务驾驶舱 (Business Cockpit) is removed from V1's core Definition of
 Done and deferred until fact completeness, the Contract Ledger, Period
-Close, Outbound Invoicing, exception handling, and cutover are done. It
+Close, Invoice Preparation, exception handling, and cutover are done. It
 is not cancelled, and it must not be pulled forward. See
 [PHASE2D0-DECISIONS.md](PHASE2D0-DECISIONS.md).
 

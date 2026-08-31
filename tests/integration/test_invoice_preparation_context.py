@@ -653,6 +653,60 @@ def test_superseded_item_allocation_not_presented(db_session):
     assert [e.allocation.id for e in supplier.invoice_item_allocations] == [new.id]
 
 
+@pytest.mark.parametrize("leaked_direction", [InvoiceDirection.SALES, InvoiceDirection.UNKNOWN])
+def test_sales_or_unknown_invoice_item_allocation_never_in_supplier_context(db_session, leaked_direction):
+    """Pre-Gate attack: a SALES (or UNKNOWN) Invoice -> InvoiceItem ->
+    InvoiceItemAllocation -> PROCUREMENT ContractItem chain must never
+    appear in SupplierScopeContext.invoice_item_allocations.
+    InvoiceItemAllocation itself carries no direction and no sales-side
+    analogue, so ContractItem membership alone cannot tell the sides
+    apart — the supplier context must resolve the parent Invoice and
+    require PURCHASE. The PURCHASE case is covered by
+    test_contract_items_shipments_and_item_allocations_exposed_as_facts."""
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id, "PO-016")
+    item = _make_contract_item(db_session, contract, frag.id)
+    leaked_invoice = _make_invoice(
+        db_session, frag.id, leaked_direction, external_key=f"LEAK-{leaked_direction}"
+    )
+    from bel.domain.invoice import InvoiceItem
+
+    invoice_item = InvoiceItem(
+        id=uuid.uuid4(),
+        invoice_id=leaked_invoice.id,
+        line_no=1,
+        product_name="Widget",
+        specification=None,
+        unit=None,
+        quantity=Decimal("3"),
+        unit_price=None,
+        net_amount=Decimal("30.00"),
+        tax_rate=None,
+        tax_amount=Decimal("0"),
+        gross_amount=Decimal("30.00"),
+        source_fragment_id=frag.id,
+    )
+    InvoiceItemRepository(db_session).add(invoice_item)
+    db_session.flush()
+    _make_invoice_item_allocation(db_session, invoice_item, item)
+    db_session.commit()
+
+    ctx = get_invoice_preparation_context(db_session)
+    supplier = ctx.supplier_scopes[0]
+    assert supplier.invoice_item_allocations == ()
+    # The ContractItem itself is untouched — only the misdirected item
+    # allocation is excluded.
+    assert [i.id for i in supplier.items] == [item.id]
+    # And the leaked invoice appears on neither axis anywhere.
+    present_invoice_ids: set[uuid.UUID] = set()
+    for scope in ctx.sales_scopes:
+        present_invoice_ids |= {e.invoice.id for e in scope.invoice_allocations if e.invoice}
+    for scope in ctx.supplier_scopes:
+        present_invoice_ids |= {e.invoice.id for e in scope.invoice_allocations if e.invoice}
+        present_invoice_ids |= {e.invoice.id for e in scope.invoice_item_allocations if e.invoice}
+    assert leaked_invoice.id not in present_invoice_ids
+
+
 # ---------------------------------------------------------------------------
 # Unknown stays unknown; no eligibility concept; read-only
 # ---------------------------------------------------------------------------

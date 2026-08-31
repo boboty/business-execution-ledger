@@ -172,16 +172,34 @@ rule, no persisted close result/snapshot, no schema change. See
 [docs/PHASE2D2-DECISIONS.md](docs/PHASE2D2-DECISIONS.md) and
 [docs/PHASE2D2-ACCEPTANCE.md](docs/PHASE2D2-ACCEPTANCE.md).
 
-## Phase 2D.3 — Outbound Invoicing Workbench
+## Phase 2D.3 — Invoice Preparation Workbench (开票与请票工作台)
 
-对外开票工作台 plus the Outbound Invoice Preparation export.
+The Invoice Preparation Workbench (renamed from "Outbound Invoicing
+Workbench" 对外开票工作台 by a frozen product-scope clarification) plus
+the Invoice Preparation Data Product. Phase 2D.3 covers TWO
+invoice-preparation directions:
+
+1. **SALES INVOICE PREPARATION** — our company → external sales
+   customer (primary axis: `SalesContract`; the external customer comes
+   only from `SalesContract.customer`).
+2. **SUPPLIER INVOICE REQUEST** — supplier → our company, i.e. "how
+   should the supplier invoice us?" (primary axis: procurement
+   `Contract`; `Contract.buyer` is our own entity, never a customer).
+
+The product-scope clarification above is frozen; the BUSINESS RULES
+inside those directions are not.
 
 **Prerequisites:** the ContractItem pipeline (R1), Shipment/Export facts
-(R2), sales-side association (R3), and an **invoicing eligibility rule
-freeze** — the business must confirm what fact combination means *not
-eligible*, *ready for invoice preparation*, *already invoiced*, and
-*blocked/unresolved*. No eligibility rule may be invented in advance.
-BEL prepares invoice data; it never performs the legal act of invoicing.
+(R2), sales-side association (R3), and an **invoicing eligibility /
+preparation rule freeze** — the business must confirm what fact
+combination means *not eligible*, *ready for invoice preparation*,
+*already invoiced*, and *blocked/unresolved* **in each direction**. No
+eligibility rule may be invented in advance. A Shipment does not by
+itself mean invoice eligibility; a receipt/payment does not by itself
+mean invoice eligibility; no amount/quantity is apportioned across the
+many-to-many ProcurementSalesLink bridge. BEL prepares invoice data; it
+never performs the legal act of invoicing. Neither direction's request /
+preparation calculations are implemented until the rules freeze.
 
 **F0 (rule-neutral factual context) implemented:** a read-only
 Application path (`get_invoice_preparation_context`) plus the Web fact
@@ -227,7 +245,7 @@ the legacy Excel to a read-only reference / Data Product.**
 ## Post first-stage — Business Cockpit
 
 业务驾驶舱 returns to scope only after fact completeness, the Contract
-Ledger, Period Close, Outbound Invoicing, exception handling, and
+Ledger, Period Close, Invoice Preparation, exception handling, and
 cutover are complete. Deferred, not cancelled, and not to be pulled
 forward.
 

@@ -143,7 +143,12 @@ class SupplierScopeInvoiceAllocation:
 class SupplierScopeInvoiceItemAllocation:
     """One current InvoiceItemAllocation reachable from THIS contract's
     ContractItems, with its InvoiceItem Fact and that item's parent
-    Invoice Fact where resolvable."""
+    Invoice Fact. Direction-isolated like every other supplier-side
+    entry: the parent Invoice must exist and be PURCHASE — a SALES or
+    UNKNOWN parent invoice's item allocation must never read as
+    已确认明细关联 here, even though ContractItem membership alone
+    cannot tell the directions apart (InvoiceItemAllocation itself
+    carries no direction and no sales-side analogue)."""
 
     allocation: InvoiceItemAllocation
     invoice_item: InvoiceItem | None
@@ -347,21 +352,28 @@ def _build_supplier_scopes(
         )
 
         # Current InvoiceItemAllocations on THIS contract's items, with
-        # their InvoiceItem Facts where resolvable. Facts only — no
-        # remaining-quantity or remaining-amount concept.
+        # their InvoiceItem Facts and the parent Invoice Fact. Facts only —
+        # no remaining-quantity or remaining-amount concept. Direction
+        # isolation (pre-Gate repair): ContractItem membership alone cannot
+        # tell which side an allocation's invoice belongs to, so the parent
+        # Invoice is resolved and must exist and be PURCHASE — a SALES or
+        # UNKNOWN parent invoice's item allocation never appears in this
+        # supplier context.
         item_allocations = tuple(
             SupplierScopeInvoiceItemAllocation(
-                allocation=allocation,
-                invoice_item=invoice_item,
-                invoice=invoice_repo.get(invoice_item.invoice_id) if invoice_item is not None else None,
+                allocation=allocation, invoice_item=invoice_item, invoice=parent_invoice
             )
-            for allocation, invoice_item in (
-                (a, invoice_item_repo.get(a.invoice_item_id))
-                for a in sorted(
-                    (a for a in item_allocation_repo.list_all() if a.contract_item_id in item_ids),
-                    key=lambda a: (a.created_at, str(a.id)),
+            for allocation, invoice_item, parent_invoice in (
+                (a, invoice_item, invoice_repo.get(invoice_item.invoice_id) if invoice_item is not None else None)
+                for a, invoice_item in (
+                    (a, invoice_item_repo.get(a.invoice_item_id))
+                    for a in sorted(
+                        (a for a in item_allocation_repo.list_all() if a.contract_item_id in item_ids),
+                        key=lambda a: (a.created_at, str(a.id)),
+                    )
                 )
             )
+            if parent_invoice is not None and parent_invoice.direction == InvoiceDirection.PURCHASE
         )
 
         scopes.append(
