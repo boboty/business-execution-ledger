@@ -183,6 +183,16 @@ eligible*, *ready for invoice preparation*, *already invoiced*, and
 *blocked/unresolved*. No eligibility rule may be invented in advance.
 BEL prepares invoice data; it never performs the legal act of invoicing.
 
+**F0 (rule-neutral factual context) implemented:** a read-only
+Application path (`get_invoice_preparation_context`) plus the Web fact
+context page `GET /invoice-preparation` (向客户开票 / 向供应商要票),
+exposing only already-confirmed/current Facts and associations per
+SalesContract and per procurement Contract — no eligibility, readiness,
+remaining-quantity/amount, or cross-bridge apportionment concept, no
+schema change. The Phase 2D.3 business-rule discovery itself is
+external/private; eligibility/preparation rules remain unfrozen and
+unimplemented, and no final export Data Product is built in this round.
+
 ## Phase 2D.4 — Exception & Task Center
 
 异常与任务中心 plus the Exception/Task export.

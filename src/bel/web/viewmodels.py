@@ -29,6 +29,7 @@ from bel.application.contract_360 import (
     ContractInvoice,
     ContractPayment,
 )
+from bel.application.invoice_preparation import InvoicePreparationContext
 from bel.application.period_close import (
     ITEM_MATCH_REQUIRED_FOR_REVERSAL,
     MISSING_ACCRUAL_BASIS,
@@ -767,3 +768,173 @@ class Contract360VM:
         self.accruals = accrual_balances
         self.evidence = [EvidenceVM(e) for e in dto.evidence]
         self.decisions = ContractDecisionsVM(dto.decisions)
+
+
+# ---- Phase 2D.3-F0: /invoice-preparation — a FACT CONTEXT workbench. ----
+# Every label below describes known data ("已关联…事实", "已确认…",
+# "待处理事项"). Deliberately NO label may read as a business judgment:
+# 应开票 / 可开票 / 已开完 / 应请票 / 尚欠发票 / 本次请票 all require the
+# Phase 2D.3 rule freeze, which has not happened. Absence of a Fact is
+# rendered as factual absence ("暂无已关联销项发票事实"), never as
+# "未开票".
+
+INVOICE_PREPARATION_PAGE_NOTE = (
+    "开票/请票业务规则尚未冻结。本页仅展示当前已确认的事实与关联；"
+    "开票资格、准备状态等业务判断将在规则冻结后另行提供。"
+)
+
+# Fact-presence labels — "what we know", never "what should happen".
+INVOICE_PREP_SALES_INVOICES_LABEL = "已关联销项发票事实"
+INVOICE_PREP_SALES_RECEIPTS_LABEL = "已关联收款事实"
+INVOICE_PREP_PROCUREMENT_INVOICES_LABEL = "已确认采购发票"
+INVOICE_PREP_ITEM_ALLOCATIONS_LABEL = "已确认明细关联"
+INVOICE_PREP_OUTGOING_PAYMENTS_LABEL = "已确认付款"
+INVOICE_PREP_SHIPMENTS_LABEL = "已确认出货事实"
+INVOICE_PREP_ITEMS_LABEL = "当前商品明细"
+INVOICE_PREP_UNRESOLVED_LABEL = "待处理事项"
+INVOICE_PREP_LINKED_CONTRACTS_LABEL = "已关联采购合同（当前关联）"
+
+NO_LINKED_CONTRACTS_FACT_LABEL = "暂无当前关联采购合同"
+NO_SALES_INVOICE_FACT_LABEL = "暂无已关联销项发票事实"
+NO_SALES_RECEIPT_FACT_LABEL = "暂无已关联收款事实"
+NO_PROCUREMENT_INVOICE_FACT_LABEL = "暂无已确认采购发票"
+NO_ITEM_ALLOCATION_FACT_LABEL = "暂无已确认明细关联"
+NO_OUTGOING_PAYMENT_FACT_LABEL = "暂无已确认付款"
+NO_SHIPMENT_FACT_LABEL = "暂无已确认出货事实"
+NO_ITEM_FACT_LABEL = "暂无已确认商品明细"
+NO_UNRESOLVED_WORK_LABEL_2 = "无"
+
+INVOICE_PREP_TAB_SALES = "向客户开票"
+INVOICE_PREP_TAB_SUPPLIER = "向供应商要票"
+
+
+class InvoicePrepSalesInvoiceVM:
+    def __init__(self, entry) -> None:
+        invoice = entry.invoice
+        self.invoice_no = (invoice.external_invoice_key or invoice.invoice_no or "—") if invoice else "—"
+        self.issue_date = _fmt(invoice.issue_date) if invoice else "—"
+        self.gross_amount = _fmt(invoice.gross_amount) if invoice else "—"
+        self.allocated_gross_amount = _fmt(entry.allocation.allocated_gross_amount)
+
+
+class InvoicePrepSalesReceiptVM:
+    def __init__(self, entry) -> None:
+        payment = entry.payment
+        self.bank_reference = (payment.bank_reference or str(payment.id)) if payment else "—"
+        self.transaction_date = _fmt(payment.transaction_date) if payment else "—"
+        self.amount = _fmt(payment.amount) if payment else "—"
+        self.allocated_amount = _fmt(entry.allocation.allocated_amount)
+
+
+class InvoicePrepLinkedContractVM:
+    """One current ProcurementSalesLink + the procurement Contract it
+    names. Enumeration only — this edge carries no amount anywhere."""
+
+    def __init__(self, entry) -> None:
+        contract = entry.contract
+        self.contract_no = contract.contract_no if contract else "—"
+        self.supplier = (contract.counterparty or "—") if contract else "—"
+        self.confirmation_type_label = CONFIRMATION_TYPE_LABELS.get(
+            entry.link.confirmation_type, entry.link.confirmation_type
+        )
+        self.contract_id = str(entry.link.procurement_contract_id)
+
+
+class InvoicePrepUnresolvedWorkVM:
+    def __init__(self, work) -> None:
+        self.summary = work.summary
+        self.exception_type = work.exception_type
+        self.source = work.source
+
+
+class InvoicePrepSalesScopeVM:
+    def __init__(self, scope) -> None:
+        sc = scope.sales_contract
+        self.sales_contract_id = sc.id
+        self.sales_contract_no = sc.sales_contract_no
+        self.our_entity = sc.our_entity
+        self.customer = sc.customer or UNKNOWN_CUSTOMER_LABEL
+        self.customer_known = sc.customer is not None
+        self.currency = sc.currency or "—"
+        self.gross_amount = _fmt(sc.gross_amount)
+        self.contract_date = _fmt(sc.contract_date)
+        self.linked_procurement_contracts = [
+            InvoicePrepLinkedContractVM(entry) for entry in scope.linked_procurement_contracts
+        ]
+        self.invoice_allocations = [InvoicePrepSalesInvoiceVM(e) for e in scope.invoice_allocations]
+        self.payment_allocations = [InvoicePrepSalesReceiptVM(e) for e in scope.payment_allocations]
+        self.unresolved_work = [InvoicePrepUnresolvedWorkVM(w) for w in scope.unresolved_work]
+
+
+class InvoicePrepShipmentVM:
+    def __init__(self, shipment, item_by_id: dict) -> None:
+        self.external_reference = shipment.external_reference or "—"
+        self.execution_date = _fmt(shipment.execution_date)
+        self.quantity = _fmt(shipment.quantity)
+        self.item = ItemPresentationVM(item_by_id.get(shipment.contract_item_id))
+
+
+class InvoicePrepProcurementInvoiceVM:
+    def __init__(self, entry) -> None:
+        invoice = entry.invoice
+        self.invoice_no = (invoice.external_invoice_key or invoice.invoice_no or "—") if invoice else "—"
+        self.issue_date = _fmt(invoice.issue_date) if invoice else "—"
+        self.allocated_gross_amount = _fmt(entry.allocation.allocated_gross_amount)
+        self.confirmation_type_label = CONFIRMATION_TYPE_LABELS.get(
+            entry.allocation.confirmation_type, entry.allocation.confirmation_type
+        )
+
+
+class InvoicePrepItemAllocationVM:
+    """One current InvoiceItemAllocation + its InvoiceItem Fact — facts
+    only, no remaining quantity/amount concept."""
+
+    def __init__(self, entry) -> None:
+        invoice_item = entry.invoice_item
+        invoice = entry.invoice
+        self.invoice_no = (invoice.external_invoice_key or invoice.invoice_no or "—") if invoice else "—"
+        self.line_no = _fmt(invoice_item.line_no) if invoice_item is not None else "—"
+        self.allocated_quantity = _fmt(entry.allocation.allocated_quantity)
+        self.allocated_net_amount = _fmt(entry.allocation.allocated_net_amount)
+
+
+class InvoicePrepOutgoingPaymentVM:
+    def __init__(self, entry) -> None:
+        payment = entry.payment
+        self.bank_reference = (payment.bank_reference or str(payment.id)) if payment else "—"
+        self.transaction_date = _fmt(payment.transaction_date) if payment else "—"
+        self.allocated_amount = _fmt(entry.allocation.allocated_amount)
+        self.confirmation_type_label = CONFIRMATION_TYPE_LABELS.get(
+            entry.allocation.confirmation_type, entry.allocation.confirmation_type
+        )
+
+
+class InvoicePrepSupplierScopeVM:
+    def __init__(self, scope) -> None:
+        contract = scope.contract
+        self.contract_id = contract.id
+        self.contract_no = contract.contract_no
+        # Contract.buyer is OUR OWN entity — presented exactly as that,
+        # never as a customer (docs/DOMAIN.md).
+        self.our_entity = contract.buyer or "—"
+        self.supplier = contract.counterparty or "—"
+        self.gross_amount = _fmt(contract.gross_amount)
+        self.currency = contract.currency
+        self.contract_date = _fmt(contract.contract_date)
+
+        item_by_id = {item.id: item for item in scope.items}
+        self.items = [ItemPresentationVM(item) for item in scope.items]
+        self.shipments = [InvoicePrepShipmentVM(s, item_by_id) for s in scope.shipments]
+        self.invoice_allocations = [InvoicePrepProcurementInvoiceVM(e) for e in scope.invoice_allocations]
+        self.invoice_item_allocations = [InvoicePrepItemAllocationVM(e) for e in scope.invoice_item_allocations]
+        self.payment_allocations = [InvoicePrepOutgoingPaymentVM(e) for e in scope.payment_allocations]
+        self.unresolved_work = [InvoicePrepUnresolvedWorkVM(w) for w in scope.unresolved_work]
+
+
+class InvoicePreparationVM:
+    def __init__(self, dto: InvoicePreparationContext) -> None:
+        self.sales_scopes = [InvoicePrepSalesScopeVM(s) for s in dto.sales_scopes]
+        self.supplier_scopes = [InvoicePrepSupplierScopeVM(s) for s in dto.supplier_scopes]
+        self.sales_scope_count = len(self.sales_scopes)
+        self.supplier_scope_count = len(self.supplier_scopes)
+        self.page_note = INVOICE_PREPARATION_PAGE_NOTE

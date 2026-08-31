@@ -41,6 +41,7 @@ from sqlalchemy import create_engine, text
 
 from bel.application.contract_360 import get_contract_360
 from bel.application.contract_business_ledger import ContractLedgerFilters, get_contract_business_ledger
+from bel.application.invoice_preparation import get_invoice_preparation_context
 from bel.application.contract_ledger_export import (
     export_contract_business_ledger_csv,
     export_contract_business_ledger_xlsx,
@@ -305,6 +306,73 @@ def test_period_close_data_product_export_against_postgres(pg_runtime, tmp_path)
         workbench2 = get_period_close_workbench(session, "2031-03")
         product2 = build_period_close_data_product(workbench2)
         assert export_period_close_csv(product) == export_period_close_csv(product2)
+
+
+def test_invoice_preparation_context_against_postgres(pg_runtime, tmp_path):
+    """Phase 2D.3-F0: the rule-neutral invoice-preparation fact context
+    builds against real PostgreSQL from a mix of imported procurement
+    data and a human-confirmed SALES allocation, both axes populate, and
+    the read is strictly read-only (no row count changes)."""
+    with pg_runtime.session_factory() as session:
+        contracts_xlsx = tmp_path / "contracts.xlsx"
+        invoices_xlsx = tmp_path / "invoices.xlsx"
+        write_ledger_workbook(contracts_xlsx, PHASE2B_CONTRACT_HEADERS, PHASE2B_CONTRACT_ROWS)
+        write_invoice_workbook(invoices_xlsx, scenarios.BUYER, PHASE2B_INVOICE_ROWS)
+        import_contract_ledger(session, contracts_xlsx)
+        import_invoices(session, invoices_xlsx, InvoiceDirection.PURCHASE)
+        _confirm_contract_allocations(session)
+        session.commit()
+
+        # Sales side: a SALES invoice confirmed to a SalesContract via the
+        # ordinary propose/confirm flow (writes the SalesInvoiceAllocation).
+        frag = _make_fragment(session)
+        invoice = Invoice(
+            id=uuid.uuid4(), direction=InvoiceDirection.SALES, invoice_type=None, invoice_no=None,
+            digital_invoice_no=None, external_invoice_key=f"SINV-PG-{uuid.uuid4().hex[:8]}",
+            issue_date=date(2026, 1, 10), seller="Our Entity", buyer="Customer",
+            net_amount=Decimal("100.00"), tax_amount=Decimal("0"), gross_amount=Decimal("100.00"),
+            invoice_status=None, source_fragment_id=frag.id, created_at=NOW, updated_at=NOW,
+        )
+        InvoiceRepository(session).add(invoice)
+        session.flush()
+        sc = create_sales_contract_fact(
+            session, our_entity="Our Entity", sales_contract_no=f"SC-PG-{uuid.uuid4().hex[:8]}",
+            fields={"customer": "Customer"}, source_fragment_id=frag.id, created_at=NOW,
+        ).sales_contract
+        session.commit()
+        proposal = propose_sales_invoice_match(session, invoice_id=invoice.id, sales_contract_ids=[sc.id], created_at=NOW)
+        session.commit()
+        confirm_sales_invoice_match(
+            session, match_case_id=proposal.match_case.id, allocations=[(sc.id, Decimal("100.00"))], created_at=NOW,
+        )
+        session.commit()
+
+        def _counts():
+            from bel.infrastructure.persistence import models as m
+
+            counts = {}
+            for name in dir(m):
+                obj = getattr(m, name)
+                if isinstance(obj, type) and hasattr(obj, "__tablename__"):
+                    counts[obj.__tablename__] = session.query(obj).count()
+            return counts
+
+        before = _counts()
+        ctx = get_invoice_preparation_context(session)
+        after = _counts()
+        assert before == after, "invoice preparation context must be strictly read-only"
+
+        assert len(ctx.sales_scopes) == 1
+        sales_scope = ctx.sales_scopes[0]
+        assert sales_scope.sales_contract.customer == "Customer"
+        assert len(sales_scope.invoice_allocations) == 1
+        assert sales_scope.invoice_allocations[0].invoice.direction == InvoiceDirection.SALES
+
+        assert len(ctx.supplier_scopes) > 0
+        supplier_scope = next(
+            s for s in ctx.supplier_scopes if s.invoice_allocations
+        )
+        assert all(i.invoice.direction == InvoiceDirection.PURCHASE for i in supplier_scope.invoice_allocations)
 
 
 def test_cutover_reconciliation_snapshot_builds_against_postgres(pg_runtime, tmp_path):

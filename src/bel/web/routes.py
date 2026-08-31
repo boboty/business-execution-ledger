@@ -26,6 +26,7 @@ from bel.application.contract_ledger_export import (
     export_contract_business_ledger_csv,
     export_contract_business_ledger_xlsx,
 )
+from bel.application.invoice_preparation import get_invoice_preparation_context
 from bel.application.period_close_export import (
     build_period_close_data_product,
     export_period_close_csv,
@@ -162,6 +163,24 @@ def contract_360_page(
     vm = viewmodels.Contract360VM(dto, period)
     return _templates(request).TemplateResponse(
         request, "contract_360.html", {"page": "contract-360", "vm": vm}
+    )
+
+
+@router.get("/invoice-preparation", response_class=HTMLResponse)
+def invoice_preparation_page(
+    request: Request,
+    session: Session = Depends(_session),
+) -> HTMLResponse:
+    """Phase 2D.3-F0 read-only fact-context workbench. Presentation
+    only — the page composes the SAME Application context
+    (``get_invoice_preparation_context``) and decides nothing: no
+    eligibility, readiness or should-invoice judgment exists until the
+    Phase 2D.3 rule freeze."""
+    with session.no_autoflush:
+        dto = get_invoice_preparation_context(session)
+    vm = viewmodels.InvoicePreparationVM(dto)
+    return _templates(request).TemplateResponse(
+        request, "invoice_preparation.html", {"page": "invoice-preparation", "vm": vm}
     )
 
 
