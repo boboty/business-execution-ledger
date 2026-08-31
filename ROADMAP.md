@@ -211,6 +211,26 @@ schema change. The Phase 2D.3 business-rule discovery itself is
 external/private; eligibility/preparation rules remain unfrozen and
 unimplemented, and no final export Data Product is built in this round.
 
+**F1a (sales-direction rule foundation) implemented:** the
+`SALES_INVOICE_PREPARATION` rule layer
+(`bel.application.sales_invoice_preparation`) evaluates the THREE frozen
+required inputs per SalesContract scope — SalesContract, at least one
+CURRENT linked procurement Contract, and a Shipment/Export Fact on the
+linked contract — and emits an explicit blocker / insufficient-fact
+outcome when one is missing (`NO_CURRENT_PROCUREMENT_LINK`,
+`NO_SHIPMENT_FACT_ON_LINKED_CONTRACT`). Under MULTIPLE current links the
+any/all shipment judgment is deliberately NOT made
+(`SHIPMENT_JUDGMENT_DEFERRED_MULTIPLE_LINKS`) — that rule is not frozen
+and the system does not guess. `INPUTS_PRESENT` states required-input
+fact completeness only: it is not readiness, not an eligibility
+Decision, and no should-invoice amount/quantity, receipt-triggered
+invoicing, or supplier-direction calculation exists. `customer` comes
+only from `SalesContract.customer` (never judged by this rule); the
+Fact -> Decision layering is preserved (pure function over the F0 fact
+context, strictly read-only), and a deliberately-empty Application-layer
+seam is reserved for the future 一致性校验 whose compared field set is
+not frozen.
+
 ## Phase 2D.4 — Exception & Task Center
 
 异常与任务中心 plus the Exception/Task export.
