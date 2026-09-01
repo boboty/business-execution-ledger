@@ -20,12 +20,20 @@ Rule provenance lives in ``docs/PHASE2D3-RULE-FREEZE.md``. The frozen
 rules implemented here, by ID:
 
 - IP-P02 (``ACCOUNTANT_CONFIRMED``): the expected supplier PURCHASE
-  invoice gross amount is the procurement Contract gross amount. A
+  invoice gross amount is the procurement Contract gross amount, with
+  the Contract's own currency as the expected currency
+  (``expected_purchase_invoice_currency``, Phase 2D.3-F1e). A
   preparation amount — not an accounting value, not a tax calculation.
-  A single associated invoice whose gross amount differs from the
-  reference is a management-review DEVIATION advisory
-  (``PURCHASE_INVOICE_AMOUNT_DEVIATION``) — the invoice Fact stays
-  valid and nothing is a rule conflict.
+  The amount comparison is CURRENCY-SAFE (Phase 2D.3-F1e): it is
+  evaluated ONLY when the Contract amount AND currency AND the Invoice
+  amount AND currency are all explicit — no FX, no implicit
+  same-currency assumption, no CNY/USD default. A single associated
+  invoice whose gross amount differs from the reference (same explicit
+  currency) is a management-review DEVIATION advisory
+  (``PURCHASE_INVOICE_AMOUNT_DEVIATION``); both explicit currencies
+  present but different is a currency deviation
+  (``PURCHASE_INVOICE_CURRENCY_DEVIATION``); either way the invoice Fact
+  stays valid and nothing is a rule conflict.
 - IP-P03 (``ACCOUNTANT_CONFIRMED``): one procurement Contract is not
   expected to be split across multiple PURCHASE invoices. More than one
   confirmed PURCHASE invoice is a management review signal
@@ -91,18 +99,22 @@ context (still exposed on the decision) but is never promoted into
 confirmed Invoice/Payment Fact semantics.
 
 Check results (exact, never tolerant): ``MATCH`` / ``DEVIATION`` /
-``NOT_COMPARABLE_MISSING_FACT``. A DEVIATION means the confirmed Facts
-differ from the preferred reference (IP-P02 / IP-P05): it emits the
-corresponding ADVISORY and never changes status — never worded as
+``NOT_COMPARABLE_MISSING_FACT`` / (Phase 2D.3-F1e)
+``NOT_COMPARABLE_CURRENCY_MISMATCH``. A DEVIATION means the confirmed
+Facts differ from the preferred reference (IP-P02 / IP-P05): it emits
+the corresponding ADVISORY and never changes status — never worded as
 "unpaid", "outstanding", or "overdue". ``NOT_COMPARABLE_MISSING_FACT``
-is a check result only: a comparison that cannot be performed because a
-compared Fact/value is absent is an optional management comparison and
-does NOT make the decision ``INSUFFICIENT_FACTS`` (only
-``MISSING_CONTRACT_GROSS_AMOUNT`` — the primary preparation value —
-does). Amount comparisons reuse the existing canonical semantics (M001
-compares ``Invoice.gross_amount`` to ``Contract.gross_amount``; the
-confirmed allocation carries that same amount) with exact ``Decimal``
-equality — no tolerance is invented.
+and ``NOT_COMPARABLE_CURRENCY_MISMATCH`` are check results only: a
+comparison that cannot be performed because a compared Fact/value is
+absent — or because the two explicit currencies differ — is an optional
+management comparison and does NOT make the decision
+``INSUFFICIENT_FACTS`` (only ``MISSING_CONTRACT_GROSS_AMOUNT`` — the
+primary preparation value — does). Amount comparisons reuse the existing
+canonical semantics (M001 compares ``Invoice.gross_amount`` to
+``Contract.gross_amount``; the confirmed allocation carries that same
+amount) with exact ``Decimal`` equality — no tolerance is invented —
+and are made ONLY under an explicit comparable currency (no implicit
+same-currency assumption, no FX).
 
 Strictly read-only: evaluation is a pure function of the F0 context.
 The session entry point builds the context UNFILTERED — the IP-P04
@@ -183,9 +195,16 @@ class SupplierRequestAdvisoryCode:
     PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS = "PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS"
     # IP-P02 deviation: the single associated PURCHASE invoice's gross
     # amount differs from the Contract gross amount (exact Decimal
-    # comparison). The invoice Fact stays valid; this is a management
-    # review signal on the preparation amount reference.
+    # comparison, same explicit currency). The invoice Fact stays valid;
+    # this is a management review signal on the preparation amount
+    # reference.
     PURCHASE_INVOICE_AMOUNT_DEVIATION = "PURCHASE_INVOICE_AMOUNT_DEVIATION"
+    # IP-P02 currency deviation (Phase 2D.3-F1e): the single associated
+    # PURCHASE invoice's explicit currency differs from the Contract's
+    # explicit currency — the amount comparison is NOT performed (no FX,
+    # no amount deviation is implied). A management review signal, never
+    # a conflict; both explicit currencies are the Facts.
+    PURCHASE_INVOICE_CURRENCY_DEVIATION = "PURCHASE_INVOICE_CURRENCY_DEVIATION"
     # IP-P05 deviation: an explicitly associated InvoiceItem and
     # ContractItem both have confirmed product names and they are not
     # exactly equal. A management review signal, not a violation.
@@ -213,6 +232,7 @@ NON_BLOCKING_ADVISORY_CODES: frozenset[str] = frozenset(
         SupplierRequestAdvisoryCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT,
         SupplierRequestAdvisoryCode.PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS,
         SupplierRequestAdvisoryCode.PURCHASE_INVOICE_AMOUNT_DEVIATION,
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_CURRENCY_DEVIATION,
         SupplierRequestAdvisoryCode.PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION,
         SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED,
     }
@@ -234,11 +254,21 @@ MISSING_FACT_BLOCKER_CODES: frozenset[str] = frozenset(
 class SupplierRequestCheckOutcome:
     """Exact comparison outcomes — never tolerant, never a business
     judgment. DEVIATION is a factual outcome and is never worded as
-    unpaid / outstanding / overdue."""
+    unpaid / outstanding / overdue.
+
+    Phase 2D.3-F1e (docs/PHASE2D3-RULE-FREEZE.md IP-P02): the amount
+    comparison is currency-safe — it is performed ONLY when both
+    currencies are explicit and exactly comparable, so a hidden
+    same-currency assumption is never made. ``NOT_COMPARABLE_MISSING_FACT``
+    covers any required amount/currency Fact that is absent;
+    ``NOT_COMPARABLE_CURRENCY_MISMATCH`` is a NEW outcome: both explicit
+    currencies present but different (no amount comparison is even
+    attempted, and no amount deviation is implied). No FX conversion."""
 
     MATCH = "MATCH"
     DEVIATION = "DEVIATION"
     NOT_COMPARABLE_MISSING_FACT = "NOT_COMPARABLE_MISSING_FACT"
+    NOT_COMPARABLE_CURRENCY_MISMATCH = "NOT_COMPARABLE_CURRENCY_MISMATCH"
 
 
 # The two check names this foundation freezes. Adding a check is a new
@@ -302,15 +332,22 @@ class SupplierRequestAmountCheck:
     """IP-P02 amount-consistency check result — the single associated
     PURCHASE invoice's gross amount against the Contract gross amount,
     exact ``Decimal`` equality (existing canonical M001 semantics; no
-    tolerance invented). ``None`` compared amount(s) mean the Fact was
-    missing — always ``NOT_COMPARABLE_MISSING_FACT``, a check result
-    only (never a blocker, never a status change)."""
+    tolerance invented), evaluated ONLY when both currencies are
+    explicit and exactly comparable (Phase 2D.3-F1e). ``None`` compared
+    amount/currency value(s) mean the Fact was missing — always
+    ``NOT_COMPARABLE_CURRENCY_MISMATCH`` when both currencies are present
+    but different, otherwise ``NOT_COMPARABLE_MISSING_FACT``. Both are
+    check results only (never a blocker, never a status change)."""
 
     check_name: str
     contract_id: uuid.UUID
     invoice_id: uuid.UUID
     compared_invoice_gross_amount: Decimal | None
     contract_gross_amount: Decimal | None
+    # Phase 2D.3-F1e — the compared explicit currencies, so the monetary
+    # scope of the check is explicit (no hidden same-currency assumption).
+    compared_invoice_currency: str | None
+    contract_currency: str | None
     outcome: str
 
 
@@ -371,6 +408,12 @@ class SupplierInvoiceRequestDecision:
     # gross amount. ``None`` only when the Contract Fact's amount is
     # unknown (MISSING_CONTRACT_GROSS_AMOUNT blocker).
     expected_purchase_invoice_gross_amount: Decimal | None
+    # IP-P02 expected purchase invoice currency (Phase 2D.3-F1e) — the
+    # Contract's own currency, the explicit monetary scope of the expected
+    # amount. ``None`` exactly when the expected amount is itself unknown
+    # (the pair moves together: no reference currency is presented for an
+    # amount that cannot be prepared).
+    expected_purchase_invoice_currency: str | None
     invoice_allocations: tuple[SupplierScopeInvoiceAllocation, ...]
     invoice_item_allocations: tuple[SupplierScopeInvoiceItemAllocation, ...]
     payment_allocations: tuple[SupplierScopePaymentAllocation, ...]
@@ -468,8 +511,14 @@ def _evaluate_scope(
             )
         )
         expected_amount: Decimal | None = None
+        # Phase 2D.3-F1e: the reference currency is the Contract's own —
+        # exposed only when the expected amount itself is determinable
+        # (the pair moves together; no reference currency is presented
+        # for an amount that cannot be prepared).
+        expected_currency: str | None = None
     else:
         expected_amount = contract.gross_amount
+        expected_currency = contract.currency
 
     # B. IP-P03 — PURCHASE invoice cardinality on this Contract, from the
     # direction-isolated F0 associations. Zero is a factual state only:
@@ -533,14 +582,29 @@ def _evaluate_scope(
     # the confirmed allocation carries that same amount). Exact Decimal
     # equality; no tolerance.
     #
-    # A DEVIATION is a management-review ADVISORY — the invoice Fact
-    # stays valid, never a rule conflict, never worded as
-    # "unpaid"/"outstanding"/"overdue". Where the comparison cannot be
-    # performed because the compared Fact/value is absent, the check is
-    # NOT_COMPARABLE_MISSING_FACT — a check result ONLY, never a
-    # blocker, never a status change (the unknown Contract amount is
-    # already named by step A's MISSING_CONTRACT_GROSS_AMOUNT — never
-    # duplicated here).
+    # Phase 2D.3-F1e — the amount comparison is CURRENCY-SAFE: it is
+    # evaluated ONLY when the Contract amount AND currency AND the Invoice
+    # amount AND currency are all explicit. No FX conversion, no implicit
+    # same-currency assumption, no CNY/USD default, and no inference from
+    # buyer/seller/country or a contract currency. Outcomes:
+    #
+    #   - any required amount/currency Fact absent ->
+    #     NOT_COMPARABLE_MISSING_FACT (a check result ONLY — never a
+    #     blocker, never a status change; the unknown Contract amount is
+    #     already named by step A's MISSING_CONTRACT_GROSS_AMOUNT — never
+    #     duplicated here; a missing Invoice currency is an optional
+    #     management comparison that simply cannot be made and never
+    #     blocks the Decision);
+    #   - both explicit currencies present but different ->
+    #     NOT_COMPARABLE_CURRENCY_MISMATCH + PURCHASE_INVOICE_CURRENCY_DEVIATION
+    #     ADVISORY (no amount comparison is attempted, no amount deviation
+    #     is implied);
+    #   - same explicit currency: MATCH on exact amount equality, else
+    #     DEVIATION + PURCHASE_INVOICE_AMOUNT_DEVIATION ADVISORY.
+    #
+    # A DEVIATION (either channel) is a management-review ADVISORY — the
+    # invoice Fact stays valid, never a rule conflict, never worded as
+    # "unpaid"/"outstanding"/"overdue".
     amount_checks: list[SupplierRequestAmountCheck] = []
     if len(invoice_ids_in_scope) == 1:
         invoice_id = invoice_ids_in_scope[0]
@@ -556,21 +620,70 @@ def _evaluate_scope(
                     invoice_id=invoice_id,
                     compared_invoice_gross_amount=None,
                     contract_gross_amount=contract.gross_amount,
+                    compared_invoice_currency=None,
+                    contract_currency=contract.currency,
                     outcome=SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT,
                 )
             )
-        elif contract.gross_amount is None:
-            # Step A already emitted MISSING_CONTRACT_GROSS_AMOUNT for
-            # this same absent value — the check result is recorded
-            # without a duplicate blocker.
+        elif contract.gross_amount is None or contract.currency is None:
+            # Step A already emitted MISSING_CONTRACT_GROSS_AMOUNT for an
+            # absent amount — the check result is recorded without a
+            # duplicate blocker. An absent Contract currency is the same
+            # class of missing Fact: the amount comparison cannot be
+            # performed and nothing is inferred (F1e).
             amount_checks.append(
                 SupplierRequestAmountCheck(
                     check_name=AMOUNT_CONSISTENCY_CHECK_NAME,
                     contract_id=contract.id,
                     invoice_id=invoice_id,
                     compared_invoice_gross_amount=invoice_fact.gross_amount,
-                    contract_gross_amount=None,
+                    contract_gross_amount=contract.gross_amount,
+                    compared_invoice_currency=invoice_fact.currency,
+                    contract_currency=contract.currency,
                     outcome=SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT,
+                )
+            )
+        elif invoice_fact.currency is None:
+            # The Invoice Fact carries no explicit currency — the
+            # comparison is NOT_COMPARABLE_MISSING_FACT, never MATCH/
+            # DEVIATION under an implicit same-currency assumption, and
+            # never a blocker: the optional management comparison just
+            # cannot be made (the preparation reference remains
+            # determinable from Contract.gross_amount + Contract.currency).
+            amount_checks.append(
+                SupplierRequestAmountCheck(
+                    check_name=AMOUNT_CONSISTENCY_CHECK_NAME,
+                    contract_id=contract.id,
+                    invoice_id=invoice_id,
+                    compared_invoice_gross_amount=invoice_fact.gross_amount,
+                    contract_gross_amount=contract.gross_amount,
+                    compared_invoice_currency=None,
+                    contract_currency=contract.currency,
+                    outcome=SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT,
+                )
+            )
+        elif invoice_fact.currency != contract.currency:
+            # Both currencies explicit but different — a currency
+            # deviation (ADVISORY), never an amount comparison, never a
+            # conflict, no FX conversion.
+            amount_checks.append(
+                SupplierRequestAmountCheck(
+                    check_name=AMOUNT_CONSISTENCY_CHECK_NAME,
+                    contract_id=contract.id,
+                    invoice_id=invoice_id,
+                    compared_invoice_gross_amount=invoice_fact.gross_amount,
+                    contract_gross_amount=contract.gross_amount,
+                    compared_invoice_currency=invoice_fact.currency,
+                    contract_currency=contract.currency,
+                    outcome=SupplierRequestCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH,
+                )
+            )
+            advisories.append(
+                SupplierRequestAdvisory(
+                    code=SupplierRequestAdvisoryCode.PURCHASE_INVOICE_CURRENCY_DEVIATION,
+                    contract_id=contract.id,
+                    related_invoice_ids=(invoice_id,),
+                    note="PURCHASE invoice explicit currency differs from the Contract reference — amount not compared, management review (IP-P02)",
                 )
             )
         else:
@@ -586,6 +699,8 @@ def _evaluate_scope(
                     invoice_id=invoice_id,
                     compared_invoice_gross_amount=invoice_fact.gross_amount,
                     contract_gross_amount=contract.gross_amount,
+                    compared_invoice_currency=invoice_fact.currency,
+                    contract_currency=contract.currency,
                     outcome=outcome,
                 )
             )
@@ -711,6 +826,7 @@ def _evaluate_scope(
         supplier=contract.counterparty,
         status=status,
         expected_purchase_invoice_gross_amount=expected_amount,
+        expected_purchase_invoice_currency=expected_currency,
         invoice_allocations=tuple(scope.invoice_allocations),
         invoice_item_allocations=tuple(scope.invoice_item_allocations),
         payment_allocations=tuple(scope.payment_allocations),

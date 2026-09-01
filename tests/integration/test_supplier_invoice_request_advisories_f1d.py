@@ -156,7 +156,11 @@ def _make_purchase_invoice(
     gross_amount=Decimal("1000.00"),
     product_name="Widget Alpha",
     tax_rate=Decimal("0.13"),
+    currency="CNY",
 ):
+    """Phase 2D.3-F1e: ``currency`` defaults to the domestic CNY that
+    every contract fixture here uses; pass ``currency=None`` explicitly
+    for the no-explicit-currency Fact shape."""
     invoice = Invoice(
         id=uuid.uuid4(),
         direction=InvoiceDirection.PURCHASE,
@@ -174,6 +178,7 @@ def _make_purchase_invoice(
         source_fragment_id=fragment_id,
         created_at=NOW,
         updated_at=NOW,
+        currency=currency,
     )
     InvoiceRepository(session).add(invoice)
     session.flush()
@@ -880,7 +885,7 @@ def test_advisory_presence_never_derives_status():
         digital_invoice_no=None, external_invoice_key="PINV-F1D-10A", issue_date=date(2031, 1, 10),
         seller="Supplier", buyer="Our Own Entity", net_amount=Decimal("800.00"), tax_amount=Decimal("0"),
         gross_amount=Decimal("800.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
-        created_at=NOW, updated_at=NOW,
+        created_at=NOW, updated_at=NOW, currency="CNY",
     )
 
     def _scope(contract, with_invoice):

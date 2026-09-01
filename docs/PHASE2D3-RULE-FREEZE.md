@@ -103,15 +103,24 @@ never a `RULE_CONFLICT`, never a preparation blocker.
 
 **Remaining limitation (recorded structurally, not worked around):**
 IP-S02 is FROZEN AS A RULE but its full three-way consistency
-evaluation is still PENDING. The current Invoice Fact has no explicit
-currency field, so comparing declaration amount/currency against the
-final SALES Invoice gross amount must not introduce an implicit currency
-assumption merely to make the rule appear complete — any downstream
-three-way comparison must refuse cross-currency comparison, and none is
-implemented yet. No code path may substitute `SalesContract.gross_amount`
-or an invoice amount for the declaration amount, and no legacy sales
-amount is backfilled as a customs-declaration amount: real declaration
-Evidence or an explicit human-confirmed Fact is required.
+evaluation is still PENDING. The canonical currency Fact gap on the
+Invoice is now closed (Phase 2D.3-F1e: `Invoice.currency`, Evidence-
+derived, never defaulted/inferred/FX-converted, nullable), so canonical
+currency support now exists on all three legs — `SalesContract.currency`,
+Shipment `declared_currency` (F1c), and `Invoice.currency` (F1e). F1e
+closes the currency FACT gap only; the full three-way comparison is NOT
+implemented because its scope/cardinality semantics are not yet handled
+safely: multiple SALES invoices may exist, multiple linked procurement
+Contracts may exist, and multiple Shipment/Export Facts may exist. The
+rule must not sum, apportion, or pick an arbitrary one of any of these
+before the comparison semantics are frozen, so no downstream three-way
+comparison is emitted, and none may introduce an implicit currency
+assumption merely to make the rule appear complete — any future
+comparison must refuse cross-currency comparison. No code path may
+substitute `SalesContract.gross_amount` or an invoice amount for the
+declaration amount, and no legacy sales amount is backfilled as a
+customs-declaration amount: real declaration Evidence or an explicit
+human-confirmed Fact is required.
 
 ### IP-S03 — Receipt is not a hard prerequisite
 
@@ -167,19 +176,34 @@ it is a management reminder, never a payment-state signal.
 ### IP-P02 — Expected purchase invoice gross amount
 
 The expected supplier PURCHASE invoice gross amount is the procurement
-Contract gross amount. This is a preparation amount — not an accounting
-value and not a tax calculation.
+Contract gross amount, with the Contract's own currency as the expected
+currency. This is a preparation amount — not an accounting value and
+not a tax calculation.
 
 **Source: `ACCOUNTANT_CONFIRMED`.**
 
 **Finding level: `ADVISORY`** (reference + deviation). The Contract gross
 amount is the reference for a deterministic comparison (exact `Decimal`
-equality). A single associated PURCHASE invoice whose gross amount
-differs from the reference emits the
-`PURCHASE_INVOICE_AMOUNT_DEVIATION` advisory — the invoice Fact remains
-valid and nothing is a rule conflict. A missing Contract gross amount
-stays `INSUFFICIENT_FACTS` (genuine data incompleteness — the primary
-preparation value cannot be built).
+equality). The amount comparison is valid ONLY when both explicit
+currencies are present and exactly comparable — there is NO implicit
+same-currency assumption (Phase 2D.3-F1e). Semantics:
+
+- `MATCH` — same explicit currency, exact gross amount equality.
+- `DEVIATION` (amount) — same explicit currency, gross amount
+  inequality -> `PURCHASE_INVOICE_AMOUNT_DEVIATION` ADVISORY; the
+  invoice Fact remains valid and nothing is a rule conflict.
+- `NOT_COMPARABLE_CURRENCY_MISMATCH` — both currencies explicit but
+  different -> `PURCHASE_INVOICE_CURRENCY_DEVIATION` ADVISORY; no
+  amount comparison is attempted (no FX, no amount deviation implied).
+- `NOT_COMPARABLE_MISSING_FACT` — any required amount/currency Fact
+  absent (including a missing `Invoice.currency`): a check result ONLY,
+  never a blocker — the optional management comparison simply cannot be
+  made, and it never makes the Decision `INSUFFICIENT_FACTS`. The
+  preparation reference stays determinable from
+  `Contract.gross_amount` + `Contract.currency`.
+
+A missing Contract gross amount stays `INSUFFICIENT_FACTS` (genuine
+data incompleteness — the primary preparation value cannot be built).
 
 ### IP-P03 — One procurement Contract → one PURCHASE invoice
 
@@ -328,6 +352,14 @@ provenance and enforcement as INDEPENDENT dimensions:
   this rule today.
 - `NO-FINDING` — the rule emits nothing yet (guard-only or pending).
 
+Check-result vocabulary (Phase 2D.3-F1e adds one member):
+`MATCH` / `DEVIATION` / `NOT_COMPARABLE_MISSING_FACT` /
+`NOT_COMPARABLE_CURRENCY_MISMATCH`. The last is emitted when both
+compared currencies are explicit but different: no amount comparison is
+attempted and no amount deviation is implied — the IP-P02 comparison is
+currency-safe by construction (explicit comparable currency required;
+no FX, no default, no inference).
+
 The F1b conflict semantics they supersede: the old amount / product-name
 `MISMATCH` blockers (`PURCHASE_INVOICE_AMOUNT_MISMATCH`,
 `PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH`), the IP-P03 / IP-P04
@@ -342,11 +374,11 @@ reclassified outcomes appear in the table below.
 | Rule | Provenance | Finding level | Implementation |
 | --- | --- | --- | --- |
 | IP-S01 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Re-leveled (F1a/F1d): three inputs report fact completeness / comparison availability only — link = management linkage, shipment = export-management anchor, no eligibility blocker; `INSUFFICIENT_FACTS` reserved for genuinely-required sales-scope data (unreachable by construction) |
-| IP-S02 | `OWNER_CONFIRMED_PROVISIONAL` | `CONTEXT` (future comparison → `MATCH`/`DEVIATION`/`NOT_COMPARABLE_MISSING_FACT`, ADVISORY, never conflict) | Frozen as a rule; canonical declaration amount/currency supported after F1c and exposed as Shipment Facts, but full three-way consistency evaluation still pending (IP-S02 limitation above) — no finding emitted |
+| IP-S02 | `OWNER_CONFIRMED_PROVISIONAL` | `CONTEXT` (future comparison → `MATCH`/`DEVIATION`/`NOT_COMPARABLE_MISSING_FACT`, ADVISORY, never conflict) | Frozen as a rule; canonical currency supported on all three legs — Shipment `declared_amount`/`declared_currency` (F1c) and `Invoice.currency` (F1e) — but full three-way consistency evaluation still pending (comparison scope/cardinality semantics — multiple sales invoices / linked contracts / Shipment Facts — not yet handled safely; never sum/apportion/choose one) — no finding emitted |
 | IP-S03 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Respected by F1a/F1d (receipts never consulted, no chronology finding); invoice-before-receipt is common |
 | IP-S04 | `UNRESOLVED` | `CONTEXT` (unresolved comparison, never a blocker) | Shipment input recorded `NOT_JUDGED_UNDER_MN_UNRESOLVED` (F1a boundary, re-leveled F1d); M:N facts stay visible; future comparison → `NOT_COMPARABLE` / `UNRESOLVED`; never blocks invoice preparation |
 | IP-P01 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Payment exposed as context only (F1b); no status/advisory from payment ordering (F1d removed the `OUT_PAYMENT_PRESENT_CONTEXT_ONLY` advisory) |
-| IP-P02 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` (reference + deviation) | Expected amount = `Contract.gross_amount` (F1b); DEVIATION → `PURCHASE_INVOICE_AMOUNT_DEVIATION` advisory (F1d); missing Contract amount → `INSUFFICIENT_FACTS` (genuine data incompleteness) |
+| IP-P02 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` (reference + deviation) | Expected amount = `Contract.gross_amount` + expected currency = `Contract.currency` (F1b/F1e); amount comparison valid only with explicit comparable currency (F1e) — same currency + amount mismatch → `PURCHASE_INVOICE_AMOUNT_DEVIATION`, different explicit currencies → `PURCHASE_INVOICE_CURRENCY_DEVIATION`, missing currency/amount → `NOT_COMPARABLE_MISSING_FACT` (check result only, never blocks); all advisories (F1d); missing Contract amount → `INSUFFICIENT_FACTS` (genuine data incompleteness) |
 | IP-P03 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` | `MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT` advisory (F1d, re-leveled from a conflict) — split is legitimate business state; all Facts preserved |
 | IP-P04 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` | `PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS` advisory (F1d, re-leveled from a conflict) — never apportioned, M:N is not an error |
 | IP-P05 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` | DEVIATION → `PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION` advisory (F1d, re-leveled from a conflict); missing name → `NOT_COMPARABLE_MISSING_FACT` check result only (never blocks preparation) |

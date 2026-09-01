@@ -312,6 +312,7 @@ def _invoice_to_domain(m: InvoiceModel) -> Invoice:
         source_fragment_id=m.source_fragment_id,
         created_at=m.created_at,
         updated_at=m.updated_at,
+        currency=m.currency,
     )
 
 
@@ -1739,6 +1740,7 @@ class InvoiceRepository:
                 source_fragment_id=invoice.source_fragment_id,
                 created_at=invoice.created_at,
                 updated_at=invoice.updated_at,
+                currency=invoice.currency,
             )
         )
 

@@ -127,6 +127,11 @@ def import_invoices(session: Session, file_path: Path, direction: str) -> Invoic
             source_fragment_id=row_fragment_ids[header.row_number],
             created_at=now,
             updated_at=now,
+            # Phase 2D.3-F1e: the current purchase invoice Excel source
+            # provides NO canonical currency field, so the Invoice's
+            # Evidence-derived ``currency`` stays None (the dataclass
+            # default) — no CNY/USD default and no domestic inference is
+            # ever manufactured here (docs/PHASE2D3-RULE-FREEZE.md IP-P02).
         )
         invoice_repo.add(invoice)
         invoices_by_group.append((group, invoice))

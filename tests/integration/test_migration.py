@@ -114,6 +114,62 @@ def test_alembic_head_to_base_to_head_round_trips_cleanly(postgres_url):
 
 
 @pytest.mark.postgres
+def test_upgrade_from_f1c_preserves_existing_invoice_rows_with_null_currency(postgres_url):
+    """Phase 2D.3-F1e: the additive migration must not disturb existing
+    Invoice rows. A row written while the chain sat at the pre-F1e head
+    (93e9d48c5cc8) survives ``alembic upgrade head`` with
+    ``currency IS NULL`` — the new column is nullable and nothing is
+    backfilled (no guessed/domestic currency is manufactured)."""
+    engine = create_engine(postgres_url, future=True)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP SCHEMA public CASCADE")
+        connection.exec_driver_sql("CREATE SCHEMA public")
+
+    # Upgrade only to the pre-F1e head, where invoices has NO currency
+    # column yet — the schema an existing deployment would actually have.
+    assert _alembic(postgres_url, "upgrade", "93e9d48c5cc8").returncode == 0
+
+    doc_id = uuid.uuid4()
+    frag_id = uuid.uuid4()
+    invoice_id = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO evidence_documents (id, file_name, sha256, source_type, imported_at) "
+            "VALUES (%s, 'pre-f1e.xlsx', %s, 'invoice_ledger_xlsx', now())",
+            (doc_id, uuid.uuid4().hex * 2),
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO evidence_fragments (id, evidence_document_id, fragment_kind, raw_data, created_at) "
+            "VALUES (%s, %s, 'EXCEL_ROW', %s::jsonb, now())",
+            (frag_id, doc_id, "{}"),
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO invoices "
+            "(id, direction, external_invoice_key, net_amount, tax_amount, gross_amount, "
+            " source_fragment_id, created_at, updated_at) "
+            "VALUES (%s, 'PURCHASE', %s, 100.00, 0.00, 100.00, %s, now(), now())",
+            (invoice_id, "PINV-PRE-F1E", frag_id),
+        )
+    engine.dispose()
+
+    # Upgrade to head (applies the F1e migration).
+    assert _alembic(postgres_url, "upgrade", "head").returncode == 0
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT id, external_invoice_key, currency FROM invoices WHERE id = :id"),
+            {"id": invoice_id},
+        ).mappings().first()
+        assert row is not None
+        assert row["external_invoice_key"] == "PINV-PRE-F1E"
+        assert row["currency"] is None
+
+    check = _alembic(postgres_url, "check")
+    assert check.returncode == 0, check.stdout + check.stderr
+    engine.dispose()
+
+
+@pytest.mark.postgres
 def test_percent_encoded_credentials_survive_alembic_and_the_cli_web_path(postgres_url):
     """BLOCKER 1: a URL-encoded password (%40 for '@', %25 for '%', %2F
     for '/' — all valid, all likely for a generated production

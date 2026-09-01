@@ -459,6 +459,44 @@ def test_shipment_declared_amount_currency_round_trip_against_postgres(pg_runtim
         assert history[2].declared_amount == Decimal("54321.00")  # current
 
 
+def test_invoice_currency_round_trip_against_postgres(pg_runtime):
+    """Phase 2D.3-F1e: the canonical Invoice currency survives a full
+    write/read cycle against real PostgreSQL — an explicit currency
+    persists and reads back, and a NULL-currency Invoice (the pre-F1e
+    row shape, and the shape the current purchase Excel source imports)
+    round-trips as NULL with no default manufactured. Identity fields are
+    untouched by the new column."""
+    with pg_runtime.session_factory() as session:
+        frag = _make_fragment(session)
+        explicit = Invoice(
+            id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+            digital_invoice_no=None, external_invoice_key=f"PINV-PG-F1E-CUR-{uuid.uuid4().hex[:8]}",
+            issue_date=date(2031, 1, 10), seller="Supplier", buyer="Our Entity",
+            net_amount=Decimal("100.00"), tax_amount=Decimal("0"), gross_amount=Decimal("100.00"),
+            invoice_status=None, source_fragment_id=frag.id, created_at=NOW, updated_at=NOW, currency="EUR",
+        )
+        null_currency = Invoice(
+            id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+            digital_invoice_no=None, external_invoice_key=f"PINV-PG-F1E-NULL-{uuid.uuid4().hex[:8]}",
+            issue_date=date(2031, 1, 11), seller="Supplier", buyer="Our Entity",
+            net_amount=Decimal("200.00"), tax_amount=Decimal("0"), gross_amount=Decimal("200.00"),
+            invoice_status=None, source_fragment_id=frag.id, created_at=NOW, updated_at=NOW, currency=None,
+        )
+        InvoiceRepository(session).add(explicit)
+        InvoiceRepository(session).add(null_currency)
+        session.commit()
+
+        with pg_runtime.session_factory() as fresh_session:
+            reloaded_explicit = InvoiceRepository(fresh_session).get(explicit.id)
+            assert reloaded_explicit is not None
+            assert reloaded_explicit.currency == "EUR"
+            assert reloaded_explicit.external_invoice_key == explicit.external_invoice_key
+            reloaded_null = InvoiceRepository(fresh_session).get(null_currency.id)
+            assert reloaded_null is not None
+            assert reloaded_null.currency is None
+            assert reloaded_null.gross_amount == Decimal("200.00")
+
+
 def test_cutover_reconciliation_snapshot_builds_against_postgres(pg_runtime, tmp_path):
     with pg_runtime.session_factory() as session:
         contracts_xlsx = tmp_path / "contracts.xlsx"
@@ -489,6 +527,7 @@ def test_supplier_invoice_request_against_postgres(pg_runtime):
             issue_date=date(2026, 1, 10), seller=counterparty, buyer="Our Entity",
             net_amount=gross_amount, tax_amount=Decimal("0"), gross_amount=gross_amount,
             invoice_status=None, source_fragment_id=frag.id, created_at=NOW, updated_at=NOW,
+            currency="CNY",  # Phase 2D.3-F1e: explicit currency required for MATCH
         )
         InvoiceRepository(session).add(invoice)
         session.flush()
@@ -887,11 +926,11 @@ def _stamp_alembic_head(engine) -> None:
     rest of the module — not a stamp-as-repair (M5): the schema really is
     the head schema, this only makes the tracking row agree with a fact
     that's already true. The stamped hash must match the current chain
-    head (93e9d48c5cc8 after the Phase 2D.3-F1c migration)."""
+    head (6aa25aa4e81f after the Phase 2D.3-F1e migration)."""
     with engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)")
         connection.exec_driver_sql("DELETE FROM alembic_version")
-        connection.exec_driver_sql("INSERT INTO alembic_version (version_num) VALUES ('93e9d48c5cc8')")
+        connection.exec_driver_sql("INSERT INTO alembic_version (version_num) VALUES ('6aa25aa4e81f')")
 
 
 def _run_bel_cli(database_url: str, *args: str) -> subprocess.CompletedProcess:

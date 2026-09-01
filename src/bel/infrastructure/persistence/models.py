@@ -694,6 +694,12 @@ class InvoiceModel(Base):
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # Phase 2D.3-F1e — canonical Invoice currency (docs/PHASE2D3-RULE-FREEZE.md
+    # IP-P02). Evidence-derived only, never defaulted/inferred/FX-converted,
+    # and NOT part of invoice identity (external_invoice_key unchanged).
+    # Nullable: a pre-F1e Invoice row has no explicit currency and stays
+    # NULL (no backfill); a source with no stated currency imports NULL.
+    currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
 
 
 class InvoiceItemModel(Base):
