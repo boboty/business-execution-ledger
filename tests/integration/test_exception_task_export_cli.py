@@ -66,6 +66,18 @@ def _seed_db(tmp_path: Path) -> Path:
             )
         )
         session.flush()
+        resolved_id = uuid.uuid4()
+        ExceptionRepository(session).add(
+            TaskException(
+                id=resolved_id,
+                exception_type=ExceptionType.BACKFILL_CONFLICT,
+                status=ExceptionStatus.RESOLVED,
+                summary="CLI-RESOLVED-TASK",
+                detail={"fact_type": "x", "identity_key": "k"},
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.flush()
         case = MatchCase(
             id=uuid.uuid4(),
             subject_type=SubjectType.INVOICE,
@@ -154,6 +166,52 @@ def test_web_and_cli_export_are_byte_identical(tmp_path):
         center = get_unresolved_work_center(session, filters=UnresolvedWorkFilters(period=PERIOD))
     direct = export_exception_task_csv(build_exception_task_data_product(center))
     assert cli_out.read_bytes() == direct
+
+
+def test_cli_export_open_only_false_matches_web_and_projection(tmp_path):
+    """The CLI must be able to express F1's open_only=False (include
+    RESOLVED tasks) so its filtered identity set matches Web and the F1
+    projection — the pre-gate blocker was the missing entry point."""
+    from bel.application.exception_task_data_product import (
+        build_exception_task_data_product,
+        export_exception_task_csv,
+    )
+    from bel.application.unresolved_work_center import UnresolvedWorkFilters, get_unresolved_work_center
+    from bel.web.app import create_app
+
+    db_path = _seed_db(tmp_path)  # includes a RESOLVED task + an OPEN task + a MatchCase
+
+    # Default view (open_only unset) excludes the RESOLVED task.
+    default_out = tmp_path / "exceptions-default.csv"
+    result = _run_bel(
+        db_path, "exceptions", "export", "--format", "csv", "--output", str(default_out)
+    )
+    assert result.returncode == 0, result.stderr
+    default_text = default_out.read_text(encoding="utf-8-sig")
+    assert "CLI-RESOLVED-TASK" not in default_text
+    assert "CLI-EXPORT-TASK" in default_text
+
+    # open_only=False (via --no-open-only) includes the RESOLVED task.
+    cli_out = tmp_path / "exceptions-open.csv"
+    result = _run_bel(
+        db_path, "exceptions", "export", "--format", "csv", "--output", str(cli_out), "--no-open-only"
+    )
+    assert result.returncode == 0, result.stderr
+    cli_bytes = cli_out.read_bytes()
+    assert "CLI-RESOLVED-TASK".encode() in cli_bytes
+
+    # Web with the same filter is byte-identical.
+    app = create_app(f"sqlite:///{db_path}")
+    client = TestClient(app)
+    web_response = client.get("/exceptions/export.csv?open_only=false")
+    assert web_response.status_code == 200
+    assert cli_bytes == web_response.content
+
+    # And both equal the direct application-layer serializer output.
+    with app.state.session_factory() as session:
+        center = get_unresolved_work_center(session, filters=UnresolvedWorkFilters(open_only=False))
+    direct = export_exception_task_csv(build_exception_task_data_product(center))
+    assert cli_bytes == direct
 
 
 def test_cli_export_is_read_only(tmp_path):

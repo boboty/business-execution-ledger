@@ -1886,6 +1886,14 @@ def exceptions_group() -> None:
 )
 @click.option("--status", type=str, default=None, help="Exact status on the projection (e.g. OPEN / RESOLVED).")
 @click.option(
+    "--open-only/--no-open-only",
+    "open_only",
+    default=None,
+    help="TaskException-only filter: the default unresolved view shows OPEN "
+    "tasks; --no-open-only also includes RESOLVED tasks. Ignored when --status "
+    "is given (the explicit status wins).",
+)
+@click.option(
     "--source-type",
     "source_type",
     type=click.Choice(["TASK_EXCEPTION", "MATCH_CASE", "COMPUTED_BLOCKER"]),
@@ -1902,6 +1910,7 @@ def exceptions_export(
     fmt: str,
     output_path: Path,
     status: str | None,
+    open_only: bool | None,
     source_type: str | None,
     code: str | None,
     procurement_contract_id,
@@ -1914,6 +1923,7 @@ def exceptions_export(
     same filters, and writes nothing to the database."""
     filters = UnresolvedWorkFilters(
         status=status,
+        open_only=open_only,
         source_type=source_type,
         code=code,
         procurement_contract_id=procurement_contract_id,

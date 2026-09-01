@@ -305,3 +305,29 @@ def test_malformed_scope_id_is_400(web_app):
     client = TestClient(app)
     response = client.get("/exceptions?procurement_contract_id=not-a-uuid")
     assert response.status_code == 400
+
+
+def test_open_only_checkbox_round_trip(web_app):
+    """F1's open-only filter is a first-class page control: the default view
+    hides RESOLVED tasks; checking 包含已解决任务 (open_only=false) shows them
+    and the checkbox round-trips."""
+    app = _seed_base_center(web_app)
+    with app.state.session_factory() as session:
+        _add_task(
+            session,
+            ExceptionType.BACKFILL_CONFLICT,
+            {"fact_type": "x", "identity_key": "k"},
+            summary="WEB-OPEN-ONLY-RESOLVED",
+            status=ExceptionStatus.RESOLVED,
+        )
+        session.commit()
+    client = TestClient(app)
+
+    default = client.get("/exceptions")
+    assert "WEB-OPEN-ONLY-RESOLVED" not in default.text
+    assert 'name="open_only" value="false"' in default.text  # control present
+    assert 'name="open_only" value="false" checked' not in default.text  # unchecked
+
+    with_open = client.get("/exceptions?open_only=false")
+    assert "WEB-OPEN-ONLY-RESOLVED" in with_open.text
+    assert 'name="open_only" value="false" checked' in with_open.text  # round-trips checked

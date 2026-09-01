@@ -108,11 +108,11 @@ def _make_contract(session, fragment_id, contract_no=None):
     return contract
 
 
-def _make_task(session, exception_type, detail, summary="task"):
+def _make_task(session, exception_type, detail, summary="task", status=ExceptionStatus.OPEN):
     task = TaskException(
         id=uuid.uuid4(),
         exception_type=exception_type,
-        status=ExceptionStatus.OPEN,
+        status=status,
         summary=summary,
         detail=detail,
         created_at=NOW,
@@ -382,3 +382,27 @@ def test_filter_parity_period(db_session):
     _seed_mixed_center(db_session)
     _assert_parity(db_session, UnresolvedWorkFilters(period="2026-03"))
     _assert_parity(db_session, UnresolvedWorkFilters(period=None))
+
+
+def test_filter_parity_open_only(db_session):
+    """open_only=False is an F1 filter the export must reflect exactly: a
+    RESOLVED task only appears when open_only=False, and the projection /
+    CSV / XLSX identity sets agree."""
+    _seed_mixed_center(db_session)
+    _make_task(
+        db_session,
+        ExceptionType.BACKFILL_CONFLICT,
+        {"fact_type": "x", "identity_key": "k"},
+        summary="RESOLVED-DP-TASK",
+        status=ExceptionStatus.RESOLVED,
+    )
+    db_session.commit()
+
+    center_default = get_unresolved_work_center(db_session)
+    assert ExceptionStatus.RESOLVED not in {i.status for i in center_default.items}
+
+    _assert_parity(db_session, UnresolvedWorkFilters(open_only=False))
+    center_all = get_unresolved_work_center(db_session, filters=UnresolvedWorkFilters(open_only=False))
+    resolved_rows = [i for i in center_all.items if i.code == ExceptionType.BACKFILL_CONFLICT]
+    assert len(resolved_rows) == 1
+    assert resolved_rows[0].status == ExceptionStatus.RESOLVED

@@ -28,6 +28,12 @@
         <option value="HUMAN_CONFIRMATION_REQUIRED" {% if vm.filters.status == 'HUMAN_CONFIRMATION_REQUIRED' %}selected{% endif %}>待人工确认</option>
       </select>
     </div>
+    <div class="filter-field filter-field-checkbox">
+      <label for="f-open-only">
+        <input id="f-open-only" type="checkbox" name="open_only" value="false" {% if vm.filters.open_only is false %}checked{% endif %}>
+        包含已解决任务
+      </label>
+    </div>
     <div class="filter-field">
       <label for="f-code">类型代码</label>
       <input id="f-code" type="text" name="code" value="{{ vm.filters.code }}" placeholder="如 BusinessKeyConflict">
