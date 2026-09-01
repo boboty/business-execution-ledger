@@ -34,13 +34,13 @@ As new business facts continuously enter BEL, BEL must be able to:
 
 **On capability 2 specifically:** the technical ability to answer "given
 the facts confirmed so far, what would this period accrue, reverse,
-differ by, and fail to judge" is implemented and shipped. That is a
+differ by, and fail to judge" is implemented and shipped, as are its
+supporting object pipelines (`ContractItem`, `Shipment / Export`, and
+the sales-side association — sections 2.2, 2.3, 3.1). That is a
 statement about the capability, **not** a claim that the first-stage
 Definition of Done is met: the *business coverage* of that answer is
-still bounded by `ContractItem` completeness (section 2.2),
-`Shipment / Export` (section 2.3), sales-side association (section 3.1),
-and legacy backfill (section 7). Capability implemented; first-stage
-coverage not yet cutover-complete.
+still bounded by first-stage cutover and legacy backfill (section 7).
+Capability implemented; first-stage coverage not yet cutover-complete.
 
 Excel remains legitimate as an **import format**, an **export format**,
 a **cutover/backfill source**, a **downstream handoff format**, and a
@@ -186,31 +186,33 @@ deterministic recompute
 
 combined with the correction/supersession mechanism in section 2.4.
 
-### 2.3 `Shipment / Export` is a first-stage implementation gap
+### 2.3 `Shipment / Export` — canonical Fact capability implemented
 
-[DOMAIN.md](DOMAIN.md) freezes `Shipment / Export`'s meaning and section
-3 lists `Contract ↔ Export` as a V1 match type, but **no implementation
-exists**: there is no `Shipment`/`Export` domain object, no persistence
-model, no adapter, and no matching pipeline. This must not be described
-as "largely present, only needs a page".
+[DOMAIN.md](DOMAIN.md) freezes `Shipment / Export`'s meaning. The
+**canonical Fact capability is implemented** (Phase 2D.1-R2, extended by
+Phase 2D.3-F1c):
 
-It must enter Phase 2D.1 because the legacy contract ledger is organized
-around export business. If BEL cannot canonically express *whether the
-goods a contract covers actually shipped/exported*, it cannot replace
-that ledger. A concrete anchor already exists in code: the contract
-ledger carries an export-contract-number column that the importer
-currently reads only to count completeness — it is never promoted to a
-Fact or to any association.
+- a canonical `Shipment` domain object exists with persistence
+  (`Shipment` anchor + `ShipmentRevision`);
+- current/versioned Fact semantics exist (INITIAL / SUPPLEMENT /
+  CORRECTION with a stable anchor, exactly like `ContractItem`);
+- every `Shipment` names exactly one procurement `Contract`;
+- `declared_amount` / `declared_currency` exist as nullable canonical
+  Facts (Phase 2D.3-F1c) — the export/customs declaration values,
+  asserted only with Evidence, never inferred, never FX-converted, never
+  defaulted;
+- the Contract Business Ledger can project Shipment/export context per
+  procurement Contract.
 
-Phase 2D.1 must deliver a minimal `Shipment / Export` implementation:
-domain object, Evidence trace, intake path, `Contract` association, and
-a Contract Business Ledger projection.
+This is a statement about **canonical Fact capability implemented**.
+Source-document/import coverage may still be incomplete — that is a
+separate question from whether the canonical object and its Facts exist.
 
-**Not frozen by this document:** `Export completed → automatically
-invoice eligible`. Export execution is one *candidate* fact for future
-invoicing-eligibility rules (in either direction); it does not by itself
-decide invoicing eligibility. That rule is frozen separately before
-Phase 2D.3 (section 5.1).
+**Customs/export is a management anchor / context Fact, NOT automatic
+invoice eligibility.** Export execution does not by itself decide
+invoicing eligibility; it is one management/context fact among the
+confirmed Facts (Phase 2D.3 comparison is a deterministic management
+control, section 5.1).
 
 ### 2.4 Fact correction / supersession semantics — frozen in Phase 2D.1-R0
 
@@ -240,13 +242,19 @@ Added by SCR-2D1R0-001, after business confirmation that today's
 
 **`SalesContract`** carries the sales-side business scope and is the
 only place an external customer is expressed. Its `customer` may be
-unknown at first — a sales scope is often first learned from a reference
-carried on procurement evidence, before the sales contract document
-itself has been ingested — and is supplied later from sales-side
-Evidence as a normal supplementing fact. A sales-scope reference number
-is **not** a customer identity, and neither is a customs-receiving party
-named on shipping material. Until a customer is known, that scope cannot
-support sales-invoice preparation; it produces a `Task`, never a guess.
+`NULL` — a sales scope is often first learned from a reference carried
+on procurement evidence, before the sales contract document itself has
+been ingested — and is supplied later from sales-side Evidence as a
+normal supplementing fact. A sales-scope reference number is **not** a
+customer identity, and neither is a customs-receiving party named on
+shipping material. An unknown customer stays an explicit
+missing/supplement-needed Fact state (surfaced as 客户待补充 on the
+Workbench) — never a guess, never a preparation blocker, and no
+persistent Task is invented merely from customer absence in Phase 2D.3
+(the only customer-related Task that exists is the implemented
+`sales_contract_facts` intake follow-up when a sales-contract anchor is
+created without a customer). Customer presence is deliberately NOT one
+of the three preparation inputs and adds no finding.
 
 **`ProcurementSalesLink`** is the bridge: which procurement contract(s)
 supply which sales scope(s). It is many-to-many, and it **expresses a
@@ -259,12 +267,15 @@ not in V1.
 
 `ContractItem` does not participate in the bridge, and V1 builds **no
 sales-side item object**. `Shipment / Export` is **not** the bridge and
-never creates one automatically; a shipment implying an unestablished
-link produces a `Task`. A shipment is, however, an important candidate
-fact source for the quantity a future invoice preparation (in either
-direction) would consider — what that rule actually is remains Phase
-2D.3's to freeze (section 5.1), and nothing here establishes shipped
-quantity as invoiceable quantity.
+never auto-creates a `ProcurementSalesLink`; a Shipment may corroborate
+an existing relationship, but an ambiguous/conflicting relationship
+remains explicit for human resolution — no Task is auto-created from a
+Shipment alone. A Shipment is a management/context anchor (its
+`declared_amount` / `declared_currency` feed the Phase 2D.3 customs
+comparison), NOT an invoiceable-quantity basis: the supplier quantity
+basis (IP-P07, contract / shipped / declared precedence) remains
+unresolved, and nothing here establishes shipped quantity as
+invoiceable quantity.
 
 ## 3. Matching
 
@@ -284,58 +295,40 @@ SCR-2D1R0-001 (Phase 2D.1-R0) once business confirmation established
 that the sales leg is a separate business object; the first four are
 unchanged.
 
-### 3.1 Implementation reality: the matching pipeline is purchase-side only
+### 3.1 Implementation reality: procurement and sales association both exist
 
-The frozen list above is a scope statement. What the pipeline actually
-processes today is narrower:
+The frozen list above is a scope statement. What is actually implemented
+(through Phase 2D.1-R2/R3 + Phase 2D.3):
 
 | Match type | Status |
 |---|---|
-| `Contract ↔ Invoice` | Implemented for **`PURCHASE` invoices only** |
-| `Contract ↔ Payment` | Implemented for **`OUT` payments only** |
+| `Contract ↔ Invoice` | Implemented for **`PURCHASE` invoices only** — procurement `InvoiceAllocation` (Phase 2D.1-R3b) |
+| `Contract ↔ Payment` | Implemented for **`OUT` payments only** — procurement `PaymentAllocation` (Phase 2D.1-R3b) |
 | `ContractItem ↔ InvoiceItem` | Implemented (manual confirmed allocation, Phase 2C) |
-| `Contract ↔ Export` | **Not implemented** (see section 2.3) |
+| `Contract ↔ Shipment/Export` | Implemented — a `Shipment` names exactly one procurement `Contract` (Phase 2D.1-R2); the Contract Business Ledger projects Shipment/export context per contract (section 2.3) |
+| `SalesContract ↔ Invoice` | Implemented — a SALES Invoice associates to a `SalesContract` via `SalesInvoiceAllocation` (Phase 2D.1-R3b) |
+| `SalesContract ↔ Payment` | Implemented — an IN receipt associates to a `SalesContract` via `SalesPaymentAllocation` (Phase 2D.1-R3b) |
+| `Contract ↔ SalesContract` | Implemented — the procurement/sales bridge `ProcurementSalesLink` (Phase 2D.1-R3a) |
 
-`InvoiceDirection.SALES` and `PaymentDirection.IN` exist in the Domain
-and sales invoices and incoming receipts can be imported — but the
-matching pipeline never associates them with a `Contract`. So the
-accurate statement of the gap is: **sales-side raw facts can exist and
-be imported; the sales-side Contract association / matching pipeline is
-not connected.**
+The sales-side association is a **separate object** from the procurement
+Contract association: a SALES Invoice and an IN receipt associate to a
+`SalesContract` — never to a procurement `Contract` — through the
+sales-side allocation objects. `SalesContract` exists (Phase 2D.1-R3a),
+and the sales-side matching foundation/candidates exist as implemented
+by Phase 2D.1-R3b (the sales leg's only method is the explicit
+human-proposal `MANUAL_SALES_SCOPE`); automatic sales matching remains
+`REQUIRES BUSINESS RULE FREEZE` and is not attempted.
 
-This directly limits:
+The identity boundary is unchanged and frozen:
 
-- the Contract Business Ledger's sales-invoice state
-- the Contract Business Ledger's incoming-receipt state
-- the Invoice Preparation Workbench's "does a corresponding Sales
-  Invoice Fact already exist" judgment
-- sales-side business execution state generally
+- the external customer comes **only** from `SalesContract.customer`;
+- `Contract.buyer` is **our own entity** and **must never be used as a
+  sales-side customer key**;
+- a procurement `Contract` and a sales customer are never directly
+  matched — the bridge is `ProcurementSalesLink`, a relationship only.
 
-**This is not merely a direction parameter.** Closing it required
-freezing the sales-side relationship semantics first, which Phase
-2D.1-R0 has now done (SCR-2D1R0-001).
-
-The purchase side associates a supplier/seller to a contract's
-`counterparty`, and that is unchanged. The sales side does **not**
-associate a customer to a contract's `buyer`: business confirmation
-established that the ledger's party columns describe the **procurement**
-leg, where the seller is the external supplier and the buyer is **our
-own trading/export entity**. `Contract.buyer` is therefore our own
-entity and **must never be used as a sales-side customer key** — doing
-so would attribute every sales invoice and customer receipt to our own
-company.
-
-An earlier version of this section stated the opposite. That statement
-was wrong and is corrected here; see
-[PHASE2D1-R0-DECISIONS.md](PHASE2D1-R0-DECISIONS.md).
-
-The sales-side customer instead comes from an independent fact source —
-`SalesContract`, built from sales-side Evidence (see section 2.5). A
-sales-scope reference number carried on procurement evidence identifies
-the scope but is **not** a customer identity. Reusing the purchase
-side's counterparty/amount assumptions remains explicitly forbidden; the
-sales-side matching *algorithm* is still tagged
-`REQUIRES BUSINESS RULE FREEZE` and is implemented in Phase 2D.1-R3b.
+A sales-scope reference number carried on procurement evidence identifies
+the scope but is **not** a customer identity.
 
 ## 4. Period-Close Business Engine
 
@@ -380,12 +373,13 @@ V1's Definition of Done requires five core work surfaces. 业务驾驶舱
    **procurement contract**, matching the legacy ledger it replaces;
    linked sales scopes are projected onto that row and are never summed
    across the bridge (see section 2.5). It does not replicate the
-   spreadsheet's dozens of raw columns. **Not implemented.** It is
-   sequenced *after* `ContractItem` intake (2.2), `Shipment / Export`
-   (2.3), and sales-side association (3.1), because those supply columns
-   it would otherwise have to fake. **No column may display fabricated
-   data for a fact BEL does not yet hold.** The Ledger drills down into
-   Contract 360, never the reverse.
+   spreadsheet's dozens of raw columns. **Implemented** (Phase 2D.1-R4)
+   as a read-only Contract Business Ledger + Excel/CSV export; the
+   first-stage cutover as a whole is still pending. It sequenced after
+   `ContractItem` intake (2.2), `Shipment / Export` (2.3), and sales-side
+   association (3.1), which now supply its columns. **No column displays
+   fabricated data for a fact BEL does not yet hold.** The Ledger drills
+   down into Contract 360, never the reverse.
 2. **合同360° Contract 360** — **implemented** (Phase 2C/2C.2). Single
    contract traceability, unchanged by Phase 2D.0.
 3. **月结工作台 Period-Close Workbench** — **implemented as a read-only

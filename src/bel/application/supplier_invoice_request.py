@@ -27,11 +27,14 @@ rules implemented here, by ID:
   The amount comparison is CURRENCY-SAFE (Phase 2D.3-F1e): it is
   evaluated ONLY when the Contract amount AND currency AND the Invoice
   amount AND currency are all explicit — no FX, no implicit
-  same-currency assumption, no CNY/USD default. A single associated
-  invoice whose gross amount differs from the reference (same explicit
-  currency) is a management-review DEVIATION advisory
-  (``PURCHASE_INVOICE_AMOUNT_DEVIATION``); both explicit currencies
-  present but different is a currency deviation
+  same-currency assumption, no CNY/USD default. The comparison scope is
+  the CONFIRMED PURCHASE Invoice Facts ONLY (Final Gate repair #2): a
+  dangling or wrong-direction association stays visible as context but
+  never suppresses a valid comparison and is never a confirmed candidate.
+  A single confirmed PURCHASE invoice whose gross amount differs from the
+  reference (same explicit currency) is a management-review DEVIATION
+  advisory (``PURCHASE_INVOICE_AMOUNT_DEVIATION``); both explicit
+  currencies present but different is a currency deviation
   (``PURCHASE_INVOICE_CURRENCY_DEVIATION``); either way the invoice Fact
   stays valid and nothing is a rule conflict.
 - IP-P03 (``ACCOUNTANT_CONFIRMED``): one procurement Contract is not
@@ -138,7 +141,7 @@ from bel.application.invoice_preparation import (
     SupplierScopePaymentAllocation,
     get_invoice_preparation_context,
 )
-from bel.domain.invoice import InvoiceDirection
+from bel.domain.invoice import Invoice, InvoiceDirection
 from bel.domain.payment import PaymentDirection
 
 # ---------------------------------------------------------------------------
@@ -193,13 +196,13 @@ class SupplierRequestAdvisoryCode:
     # association). Not a violation, and the invoice is never silently
     # apportioned.
     PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS = "PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS"
-    # IP-P02 deviation: the single associated PURCHASE invoice's gross
+    # IP-P02 deviation: the single confirmed PURCHASE invoice's gross
     # amount differs from the Contract gross amount (exact Decimal
     # comparison, same explicit currency). The invoice Fact stays valid;
     # this is a management review signal on the preparation amount
     # reference.
     PURCHASE_INVOICE_AMOUNT_DEVIATION = "PURCHASE_INVOICE_AMOUNT_DEVIATION"
-    # IP-P02 currency deviation (Phase 2D.3-F1e): the single associated
+    # IP-P02 currency deviation (Phase 2D.3-F1e): the single confirmed
     # PURCHASE invoice's explicit currency differs from the Contract's
     # explicit currency — the amount comparison is NOT performed (no FX,
     # no amount deviation is implied). A management review signal, never
@@ -329,15 +332,17 @@ class SupplierRequestAdvisory:
 
 @dataclass(frozen=True)
 class SupplierRequestAmountCheck:
-    """IP-P02 amount-consistency check result — the single associated
+    """IP-P02 amount-consistency check result — the single CONFIRMED
     PURCHASE invoice's gross amount against the Contract gross amount,
     exact ``Decimal`` equality (existing canonical M001 semantics; no
     tolerance invented), evaluated ONLY when both currencies are
-    explicit and exactly comparable (Phase 2D.3-F1e). ``None`` compared
-    amount/currency value(s) mean the Fact was missing — always
-    ``NOT_COMPARABLE_CURRENCY_MISMATCH`` when both currencies are present
-    but different, otherwise ``NOT_COMPARABLE_MISSING_FACT``. Both are
-    check results only (never a blocker, never a status change)."""
+    explicit and exactly comparable (Phase 2D.3-F1e). The comparison
+    scope is confirmed PURCHASE Invoice Facts only (Final Gate repair
+    #2). ``None`` compared amount/currency value(s) mean the Fact was
+    missing — always ``NOT_COMPARABLE_CURRENCY_MISMATCH`` when both
+    currencies are present but different, otherwise
+    ``NOT_COMPARABLE_MISSING_FACT``. Both are check results only (never a
+    blocker, never a status change)."""
 
     check_name: str
     contract_id: uuid.UUID
@@ -533,10 +538,15 @@ def _evaluate_scope(
     # invoice and never contributes (Codex Pre-Gate BLOCKER 1).
     #
     # ``invoice_ids_in_scope`` (raw allocation ids) is kept separately
-    # for the step-D amount check, which must stay NOT_COMPARABLE when a
-    # single association's Invoice Fact is absent.
+    # ONLY so the single-incomplete-association case can still project a
+    # NOT_COMPARABLE_MISSING_FACT check. CONFIRMED PURCHASE Invoice Facts
+    # determine the IP-P02 comparison scope: a dangling or wrong-direction
+    # association must remain visible as context but must NEVER alter
+    # confirmed PURCHASE Invoice cardinality (association existence !=
+    # confirmed Fact).
     invoice_ids_in_scope: list[uuid.UUID] = []
     confirmed_invoice_ids: list[uuid.UUID] = []
+    confirmed_invoice_facts: list[Invoice] = []
     for entry in scope.invoice_allocations:
         if entry.allocation.invoice_id not in invoice_ids_in_scope:
             invoice_ids_in_scope.append(entry.allocation.invoice_id)
@@ -546,6 +556,7 @@ def _evaluate_scope(
             and entry.invoice.id not in confirmed_invoice_ids
         ):
             confirmed_invoice_ids.append(entry.invoice.id)
+            confirmed_invoice_facts.append(entry.invoice)
     if len(confirmed_invoice_ids) > 1:
         advisories.append(
             SupplierRequestAdvisory(
@@ -608,34 +619,17 @@ def _evaluate_scope(
     # invoice Fact stays valid, never a rule conflict, never worded as
     # "unpaid"/"outstanding"/"overdue".
     amount_checks: list[SupplierRequestAmountCheck] = []
-    if len(invoice_ids_in_scope) == 1:
-        invoice_id = invoice_ids_in_scope[0]
-        invoice_fact = next(
-            (entry.invoice for entry in scope.invoice_allocations if entry.allocation.invoice_id == invoice_id),
-            None,
-        )
-        if invoice_fact is None or invoice_fact.direction != InvoiceDirection.PURCHASE:
-            # The single association's Invoice Fact is missing OR present
-            # with a direction that is not PURCHASE — neither is a
-            # CONFIRMED PURCHASE invoice for this surface, so the amount
-            # comparison stays NOT_COMPARABLE_MISSING_FACT (Final Gate: an
-            # association existing is NOT proof of a confirmed Fact; a
-            # wrong-direction Fact never participates as a confirmed
-            # comparison candidate). The association itself remains visible
-            # as context on the decision.
-            amount_checks.append(
-                SupplierRequestAmountCheck(
-                    check_name=AMOUNT_CONSISTENCY_CHECK_NAME,
-                    contract_id=contract.id,
-                    invoice_id=invoice_id,
-                    compared_invoice_gross_amount=invoice_fact.gross_amount if invoice_fact else None,
-                    contract_gross_amount=contract.gross_amount,
-                    compared_invoice_currency=invoice_fact.currency if invoice_fact else None,
-                    contract_currency=contract.currency,
-                    outcome=SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT,
-                )
-            )
-        elif contract.gross_amount is None or contract.currency is None:
+
+    # D. IP-P02 amount consistency — the comparison scope is the CONFIRMED
+    # PURCHASE Invoice Facts ONLY (Final Gate repair #2). A dangling or
+    # wrong-direction association stays visible as context but never alters
+    # confirmed PURCHASE Invoice cardinality, so it never suppresses a valid
+    # comparison against the one confirmed PURCHASE invoice, and it is never
+    # treated as a confirmed comparison candidate itself.
+    if len(confirmed_invoice_ids) == 1:
+        invoice_id = confirmed_invoice_ids[0]
+        invoice_fact = confirmed_invoice_facts[0]
+        if contract.gross_amount is None or contract.currency is None:
             # Step A already emitted MISSING_CONTRACT_GROSS_AMOUNT for an
             # absent amount — the check result is recorded without a
             # duplicate blocker. An absent Contract currency is the same
@@ -723,6 +717,31 @@ def _evaluate_scope(
                         note="PURCHASE invoice gross amount deviates from the Contract reference — management review (IP-P02)",
                     )
                 )
+    elif len(confirmed_invoice_ids) == 0 and len(invoice_ids_in_scope) == 1:
+        # A single incomplete raw association (dangling or wrong-direction)
+        # is NEVER a confirmed comparison candidate: the check stays
+        # NOT_COMPARABLE_MISSING_FACT for that association (context only),
+        # exactly as before, and it never participates in a comparison.
+        invoice_id = invoice_ids_in_scope[0]
+        invoice_fact = next(
+            (entry.invoice for entry in scope.invoice_allocations if entry.allocation.invoice_id == invoice_id),
+            None,
+        )
+        amount_checks.append(
+            SupplierRequestAmountCheck(
+                check_name=AMOUNT_CONSISTENCY_CHECK_NAME,
+                contract_id=contract.id,
+                invoice_id=invoice_id,
+                compared_invoice_gross_amount=invoice_fact.gross_amount if invoice_fact else None,
+                contract_gross_amount=contract.gross_amount,
+                compared_invoice_currency=invoice_fact.currency if invoice_fact else None,
+                contract_currency=contract.currency,
+                outcome=SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT,
+            )
+        )
+    # else: >1 confirmed PURCHASE invoices (the P03 advisory above already
+    # records the cardinality) or >1 incomplete raw associations -> no
+    # singular P02 amount comparison is performed.
 
     # E. IP-P05 item-name consistency — for every current item
     # association on this Contract's ContractItems. A confirmed comparison

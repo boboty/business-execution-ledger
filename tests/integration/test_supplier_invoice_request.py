@@ -462,10 +462,13 @@ def test_sales_direction_facts_never_count_as_purchase_cardinality(db_session):
         sales_invoice.id,
     }
     # The SALES invoice never counts as a confirmed PURCHASE invoice: P03
-    # cardinality stays 1 (no advisory) and the amount comparison is not
-    # run against the wrong-direction Fact.
+    # cardinality stays 1 (no advisory), and the P02 amount comparison runs
+    # against the ONE confirmed PURCHASE invoice (the wrong-direction
+    # association does NOT suppress a valid confirmed comparison).
     assert decision.advisories == ()
-    assert decision.amount_checks == ()
+    assert len(decision.amount_checks) == 1
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.MATCH
+    assert decision.amount_checks[0].invoice_id == purchase_invoice.id
 
 
 # ---------------------------------------------------------------------------

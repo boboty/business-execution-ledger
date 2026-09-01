@@ -48,6 +48,7 @@ from bel.application.invoice_preparation_workbench import (
     get_invoice_preparation_workbench,
     get_invoice_preparation_workbench_from_context,
 )
+from bel.application.supplier_invoice_request import SupplierRequestCheckOutcome
 from bel.domain.accrual import InvoiceItemAllocation
 from bel.domain.contract import Contract, ContractItem
 from bel.domain.invoice import Invoice, InvoiceDirection, InvoiceItem
@@ -968,3 +969,49 @@ def test_wrong_direction_associations_preserved_not_confirmed_in_product():
     text = export_invoice_preparation_csv(product).decode("utf-8-sig")
     assert '"0"' in text  # the confirmed counts are literal zero, not blank-but-implied
     assert "采购发票明细关联 · 关联记录未形成可确认业务事实" in text
+
+
+def test_p02_confirmed_comparison_survives_incomplete_associations_in_product():
+    """Final Gate repair #2 (1C, verified through Workbench + Data Product):
+    with ONE confirmed PURCHASE invoice PLUS a dangling association, the
+    P02 comparison still runs against the confirmed invoice (not suppressed),
+    and the dangling association surfaces as an INCOMPLETE_ASSOCIATION
+    attention row."""
+    contract = _pure_contract("PO-P02-PROD", gross=Decimal("1000.00"))
+    confirmed = _pure_invoice(InvoiceDirection.PURCHASE, "PINV-P02-PROD", gross=Decimal("900.00"))
+
+    def alloc(invoice=None):
+        return SupplierScopeInvoiceAllocation(
+            allocation=InvoiceAllocation(
+                id=uuid.uuid4(), invoice_id=(invoice.id if invoice else uuid.uuid4()), contract_id=contract.id,
+                match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("900.00"),
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+            ),
+            invoice=invoice,
+        )
+
+    context = InvoicePreparationContext(
+        sales_scopes=(),
+        supplier_scopes=(
+            SupplierScopeContext(
+                contract=contract, items=(), shipments=(),
+                invoice_allocations=(alloc(confirmed), alloc(None)),
+                invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
+            ),
+        ),
+    )
+    workbench = get_invoice_preparation_workbench_from_context(context)
+    decision = workbench.supplier_report.decisions[0]
+    # The Workbench's F1 decision carries the confirmed comparison.
+    assert len(decision.amount_checks) == 1
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.DEVIATION
+    assert decision.amount_checks[0].invoice_id == confirmed.id
+
+    product = build_invoice_preparation_data_product(workbench)
+    row = product.supplier_request[0]
+    assert row.supplier_amount_check_outcome == "DEVIATION"
+    assert row.confirmed_purchase_invoice_count == 1
+    # The dangling association is attention, never a confirmed Fact.
+    incomplete = _attention_for(product, category=ATTENTION_CATEGORY_INCOMPLETE_ASSOCIATION)
+    assert any("采购发票关联" in r.attention_message for r in incomplete)

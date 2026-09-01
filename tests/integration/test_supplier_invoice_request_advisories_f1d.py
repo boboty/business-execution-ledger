@@ -931,8 +931,8 @@ def test_wrong_direction_invoice_and_payment_never_confirmed_no_false_positive()
     confirmed_invoice = Invoice(
         id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
         digital_invoice_no=None, external_invoice_key="PINV-CONFIRMED", issue_date=date(2031, 1, 10),
-        seller="Supplier", buyer="Our Own Entity", net_amount=Decimal("100.00"), tax_amount=Decimal("0"),
-        gross_amount=Decimal("100.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        seller="Supplier", buyer="Our Own Entity", net_amount=Decimal("1000.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("1000.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
         created_at=NOW, updated_at=NOW, currency="CNY",
     )
     wrong_invoice = Invoice(
@@ -1008,11 +1008,16 @@ def test_wrong_direction_invoice_and_payment_never_confirmed_no_false_positive()
         wrong_payment.id,
     }
     # No false positives: one confirmed PURCHASE invoice (no P03), no span
-    # (no P04), and a confirmed invoice present (no P09).
+    # (no P04), a confirmed invoice present (no P09), and the confirmed
+    # invoice MATCHes the contract (no P02 deviation). The wrong-direction
+    # associations cause NONE of these.
     assert decision.advisories == ()
-    # The amount comparison never uses the wrong-direction invoice as a
-    # confirmed candidate (the raw scope is 2 -> no single-candidate check).
-    assert decision.amount_checks == ()
+    # The P02 comparison runs against the ONE confirmed PURCHASE invoice —
+    # the wrong-direction associations do NOT suppress a valid confirmed
+    # comparison, and are never the comparison candidate themselves.
+    assert len(decision.amount_checks) == 1
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.MATCH
+    assert decision.amount_checks[0].invoice_id == confirmed_invoice.id
 
 
 def test_wrong_direction_item_allocation_never_confirmed_comparison():
@@ -1067,3 +1072,147 @@ def test_wrong_direction_item_allocation_never_confirmed_comparison():
     assert len(decision.item_name_checks) == 1
     assert decision.item_name_checks[0].outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
     assert decision.advisories == ()
+
+
+# ---------------------------------------------------------------------------
+# Final Gate repair #2 — IP-P02 comparison scope is CONFIRMED PURCHASE
+# Invoice Facts only; dangling/wrong-direction associations never suppress a
+# valid confirmed comparison and are never a confirmed candidate.
+# ---------------------------------------------------------------------------
+
+
+def _confirmed_invoice(key, *, gross=Decimal("1000.00"), currency="CNY"):
+    return Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key=key, issue_date=date(2031, 1, 10),
+        seller="Supplier", buyer="Our Own Entity", net_amount=gross, tax_amount=Decimal("0"),
+        gross_amount=gross, invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW, currency=currency,
+    )
+
+
+def _invoice_alloc(contract, invoice=None, invoice_id=None):
+    return SupplierScopeInvoiceAllocation(
+        allocation=InvoiceAllocation(
+            id=uuid.uuid4(), invoice_id=(invoice.id if invoice else invoice_id or uuid.uuid4()),
+            contract_id=contract.id, match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("1000.00"),
+            match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+            confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+        ),
+        invoice=invoice,
+    )
+
+
+def _supplier_decision(contract, invoice_allocations):
+    scope = SupplierScopeContext(
+        contract=contract, items=(), shipments=(),
+        invoice_allocations=tuple(invoice_allocations),
+        invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
+    )
+    return evaluate_supplier_invoice_request_from_context(_context_with_scopes((scope,))).decisions[0]
+
+
+def test_p02_case1_single_confirmed_invoice_runs():
+    contract = _pure_contract("PO-P02-1")
+    invoice = _confirmed_invoice("PINV-P02-1")
+    decision = _supplier_decision(contract, (_invoice_alloc(contract, invoice=invoice),))
+    assert len(decision.amount_checks) == 1
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.MATCH
+    assert decision.amount_checks[0].invoice_id == invoice.id
+    assert decision.advisories == ()
+
+
+def test_p02_case2_confirmed_plus_dangling_same_result():
+    contract = _pure_contract("PO-P02-2")
+    invoice = _confirmed_invoice("PINV-P02-2")
+    decision = _supplier_decision(contract, (_invoice_alloc(contract, invoice=invoice), _invoice_alloc(contract)))
+    # Same P02 result as case 1 — the dangling association does NOT suppress
+    # the valid confirmed comparison.
+    assert len(decision.amount_checks) == 1
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.MATCH
+    assert decision.amount_checks[0].invoice_id == invoice.id
+    # The dangling association remains visible as context.
+    assert len(decision.invoice_allocations) == 2
+    assert decision.advisories == ()
+
+
+def test_p02_case3_confirmed_plus_wrong_direction_same_result():
+    contract = _pure_contract("PO-P02-3")
+    invoice = _confirmed_invoice("PINV-P02-3")
+    wrong = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.SALES, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="SINV-P02-3", issue_date=date(2031, 1, 10),
+        seller="Our Own Entity", buyer="Customer", net_amount=Decimal("100.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW, currency="CNY",
+    )
+    decision = _supplier_decision(contract, (_invoice_alloc(contract, invoice=invoice), _invoice_alloc(contract, invoice=wrong)))
+    # Same P02 result as case 1 — the wrong-direction association does NOT
+    # suppress the valid confirmed comparison, and is never the candidate.
+    assert len(decision.amount_checks) == 1
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.MATCH
+    assert decision.amount_checks[0].invoice_id == invoice.id
+    assert {e.allocation.invoice_id for e in decision.invoice_allocations} == {invoice.id, wrong.id}
+    assert decision.advisories == ()
+
+
+def test_p02_case4_confirmed_deviation_plus_dangling_advisory_emitted():
+    contract = _pure_contract("PO-P02-4")
+    invoice = _confirmed_invoice("PINV-P02-4", gross=Decimal("900.00"))
+    decision = _supplier_decision(contract, (_invoice_alloc(contract, invoice=invoice), _invoice_alloc(contract)))
+    assert len(decision.amount_checks) == 1
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.DEVIATION
+    assert decision.amount_checks[0].invoice_id == invoice.id
+    # The deviation advisory is still emitted despite the dangling association.
+    assert [a.code for a in decision.advisories] == [
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_AMOUNT_DEVIATION
+    ]
+
+
+def test_p02_case5_confirmed_currency_mismatch_plus_wrong_direction():
+    contract = _pure_contract("PO-P02-5")
+    invoice = _confirmed_invoice("PINV-P02-5", currency="USD")
+    wrong = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.SALES, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="SINV-P02-5", issue_date=date(2031, 1, 10),
+        seller="Our Own Entity", buyer="Customer", net_amount=Decimal("100.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW, currency="CNY",
+    )
+    decision = _supplier_decision(contract, (_invoice_alloc(contract, invoice=invoice), _invoice_alloc(contract, invoice=wrong)))
+    assert len(decision.amount_checks) == 1
+    check = decision.amount_checks[0]
+    assert check.outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH
+    assert check.invoice_id == invoice.id
+    # The currency deviation is emitted for the CONFIRMED invoice; no amount
+    # deviation is implied, and the wrong-direction association caused none.
+    assert [a.code for a in decision.advisories] == [
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_CURRENCY_DEVIATION
+    ]
+
+
+def test_p02_case6_two_confirmed_no_singular_comparison_p03_present():
+    contract = _pure_contract("PO-P02-6")
+    inv_a = _confirmed_invoice("PINV-P02-6A", gross=Decimal("600.00"))
+    inv_b = _confirmed_invoice("PINV-P02-6B", gross=Decimal("400.00"))
+    decision = _supplier_decision(
+        contract, (_invoice_alloc(contract, invoice=inv_a), _invoice_alloc(contract, invoice=inv_b), _invoice_alloc(contract))
+    )
+    # No singular P02 comparison (two confirmed invoices — never summed or
+    # arbitrarily selected), and the P03 cardinality advisory is present.
+    assert decision.amount_checks == ()
+    assert SupplierRequestAdvisoryCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT in [
+        a.code for a in decision.advisories
+    ]
+
+
+def test_p02_case7_zero_confirmed_dangling_only_not_comparable():
+    contract = _pure_contract("PO-P02-7")
+    decision = _supplier_decision(contract, (_invoice_alloc(contract),))
+    # No confirmed PURCHASE invoice count; the single incomplete association
+    # projects NOT_COMPARABLE_MISSING_FACT (never a confirmed candidate).
+    assert decision.amount_checks == () or (
+        len(decision.amount_checks) == 1
+        and decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
+        and decision.amount_checks[0].compared_invoice_gross_amount is None
+    )
