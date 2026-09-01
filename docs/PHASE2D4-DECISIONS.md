@@ -45,7 +45,7 @@ fresh task on every occurrence (§1A table notes).
 | `SalesContractIdentityIncomplete` | `bel.application.sales_contract_facts` (`sales_contract_facts.py:327`) | `source_fragment_id`, `missing_our_entity`, `missing_sales_contract_no` | **no anchor of any kind** | none |
 | `SalesContractCustomerUnresolved` | `bel.application.sales_contract_facts` (`sales_contract_facts.py:240`) | `sales_contract_id` | → `sales_contract_id` | **yes** — customer SUPPLEMENT closes it (§5.2) |
 | `ProcurementSalesLinkUnconfirmed` | `bel.application.procurement_sales_link` (`procurement_sales_link.py:342`) | `procurement_contract_id`, `sales_contract_id`, `source_fragment_id` | → both contract ids; **no link row** | none |
-| `ProcurementSalesLinkMultipleScopes` | `bel.application.procurement_sales_link` (`procurement_sales_link.py:198`) | `procurement_contract_id`, `sales_contract_ids` | → `procurement_contract_id` | none |
+| `ProcurementSalesLinkMultipleScopes` | `bel.application.procurement_sales_link` (`procurement_sales_link.py:198`) | `procurement_contract_id`, `sales_contract_ids` (list) | → procurement Contract **plus all structured SalesContract ids in `sales_contract_ids`** (repeatable scopes: one authoritative task, multiple trace/navigation scopes) | none |
 | `ProcurementSalesLinkCorrectionConflict` | `bel.application.procurement_sales_link` (`procurement_sales_link.py:221`) | `superseded_link_id`, `conflicting_source_fragment_id` | → link id | none |
 | `BackfillIdentityIncomplete` | `bel.application.cutover_backfill` `_find_or_create_backfill_task` (`cutover_backfill.py:177`) | `fact_type`, `identity_key`, `+ extra` (`missing_contract_no`, `missing_counterparty`, …) | **no anchor id ever stored**; contract linkage, where any, lives only inside `identity_key` text | none |
 | `BackfillIdentityAmbiguous` | same | `fact_type`, `identity_key`, `+ extra` (`matches`, `reason`, …) | no anchor id; `identity_key` names the ambiguous candidate set | none |
@@ -218,7 +218,7 @@ optional; a source that has no value for a field leaves it **explicitly
 | `scope_type` / `scope_id` | the structured business scope the item maps to (§4); **repeatable** — a `MATCH_CASE` with several candidates traces to each, exactly as `_collect_unresolved_work` does today | from `detail`/lookup | candidate scope(s) | contract / contract_item |
 | `procurement_contract_id`, `sales_contract_id`, `invoice_id`, `payment_id`, `shipment_id`, `match_case_id` | trace/navigation ids | per producer `detail` | subject + candidate scopes | per blocker |
 | `resolution_route` | guidance where the issue is corrected (§6) | §6 | `CONFIRM_MATCH` | `REVIEW_ONLY` |
-| `provenance` | producer where already available | module.function | module.function | `bel.application.period_close` |
+| `provenance` | producer identifier where truthfully available — trace metadata, never identity (§3.1) | producer **module** where deterministically available; may be `None` when the persisted source does not distinguish the producer | producer **module** (`bel.application.matching` / `bel.application.sales_matching`) | `bel.application.period_close` |
 
 Rules:
 - **Never infer a Contract/scope by parsing `summary` text.** The existing
@@ -232,6 +232,35 @@ Rules:
   `created_at = None`, a constant `status`, and a `source_id` that is a
   deterministic, collision-free key (§8) — it is never the id of a
   persisted row, because none exists.
+
+### 3.1 Provenance contract (frozen)
+
+`provenance` is auxiliary trace metadata: **where the unresolved-work
+item's producer is truthfully available**. It is never part of the item's
+identity (identity remains `(source_type, source_id)`, §4) and never
+changes what an item is.
+
+- **Module-level provenance is sufficient and is the normal F1/F2
+  contract** — e.g. `bel.application.matching`,
+  `bel.application.shipment_facts`,
+  `bel.application.sales_contract_facts`,
+  `bel.application.procurement_sales_link`,
+  `bel.application.cutover_backfill`,
+  `bel.application.period_close`.
+- **Function-level provenance MAY be used only where it is explicitly
+  available, unambiguous, and intentionally stable.** It is not
+  manufactured: a persisted `TaskException` row does not store which
+  producer function created it.
+- **`provenance` MAY be `None`** where the authoritative persisted source
+  does not distinguish the producer. Example: `BusinessKeyConflict` can be
+  produced by either `bel.application.import_contract_ledger` or
+  `bel.application.sales_contract_facts`, and the persisted row does not
+  record which — F1 truthfully leaves provenance `None` for such rows
+  rather than guessing.
+- **Never infer provenance from `summary` text, and never guess a
+  producer function.**
+- `COMPUTED_BLOCKER` provenance is always the constant
+  `bel.application.period_close` (§8).
 
 ## 4. Scope / identity rule (frozen)
 
