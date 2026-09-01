@@ -1,23 +1,33 @@
-"""Phase 2D.3-F1d — advisory/blocker separation in SUPPLIER_INVOICE_REQUEST.
+"""Phase 2D.3-F1d — advisory/blocker separation in SUPPLIER_INVOICE_REQUEST
+(F1d PRE-GATE REPAIR re-leveling).
 
-On top of the frozen supplier-direction rule layer (F1b, IP-P01..IP-P07),
+On top of the frozen supplier-direction rule layer (F1b, IP-P01..IP-P09),
 the F1d outcome model separates two finding channels on every Decision:
 
-- ``blockers`` — hard findings (rule conflicts / missing compared
-  Facts); the decision ``status`` is derived from these ALONE.
-- ``advisories`` — explicit NON-BLOCKING findings recording a frozen
-  accountant-confirmed rule consequence that is factual context and
-  never a gate:
-    * ``OUT_PAYMENT_PRESENT_CONTEXT_ONLY`` (IP-P01) — the scope carries
-      OUT payment Facts; payment is context, never a gate;
-    * ``EXISTING_INVOICE_ITEM_TAX_RATE_FACT`` (IP-P06) — an actual
-      PURCHASE InvoiceItem's ``tax_rate`` is reachable as an existing
-      Fact; displayed as it is, with no inference or recommendation.
+- ``blockers`` — hard findings (genuinely-required data absent); the
+  decision ``status`` is derived from these ALONE. Exactly one blocker
+  code exists: ``MISSING_CONTRACT_GROSS_AMOUNT``.
+- ``advisories`` — explicit NON-BLOCKING management reminders / review
+  signals. A legitimate real-world business state is NEVER a conflict
+  merely because it departs from the preferred management pattern:
+    * ``SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED`` (IP-P09) — paid, no
+      PURCHASE invoice yet (已付款，尚未收到对应进项发票，建议催供应商开票);
+    * ``PURCHASE_INVOICE_AMOUNT_DEVIATION`` (IP-P02) — invoice amount
+      deviates from the Contract reference;
+    * ``PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION`` (IP-P05) — product
+      name deviates from the contract product name;
+    * ``MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT`` (IP-P03) — the split is
+      legitimate business state;
+    * ``PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS`` (IP-P04) — M:N is
+      not a business error, never apportioned.
 
 Every test here proves that an advisory NEVER affects ``status``: a
 scope with advisories and no blockers is still
-``PREPARATION_AMOUNT_DETERMINABLE``, and an advisory coexisting with a
-blocker leaves the blocker's status (e.g. ``RULE_CONFLICT``) intact.
+``PREPARATION_AMOUNT_DETERMINABLE``, an advisory coexisting with a
+blocker leaves the blocker's status (``INSUFFICIENT_FACTS``) intact, and
+a comparison that cannot be performed (missing product name / invoice
+Fact) is a ``NOT_COMPARABLE_MISSING_FACT`` CHECK RESULT ONLY — it never
+blocks preparation.
 """
 
 from __future__ import annotations
@@ -37,9 +47,9 @@ from bel.application.invoice_preparation import (
 from bel.application.supplier_invoice_request import (
     MISSING_FACT_BLOCKER_CODES,
     NON_BLOCKING_ADVISORY_CODES,
-    RULE_VIOLATION_BLOCKER_CODES,
     SupplierRequestAdvisoryCode,
     SupplierRequestBlockerCode,
+    SupplierRequestCheckOutcome,
     SupplierRequestDecisionStatus,
     evaluate_supplier_invoice_request,
     evaluate_supplier_invoice_request_from_context,
@@ -303,16 +313,17 @@ def _pure_contract(contract_no, gross_amount=Decimal("1000.00"), counterparty="S
 
 
 # ---------------------------------------------------------------------------
-# IP-P01 — OUT payment is a non-blocking advisory (advisory/blocker separation)
+# IP-P09 — paid but no PURCHASE invoice is a management follow-up advisory
 # ---------------------------------------------------------------------------
 
 
-def test_out_payment_present_emits_context_advisory_but_never_changes_status(db_session):
-    """A scope carrying OUT payment Facts gains an
-    OUT_PAYMENT_PRESENT_CONTEXT_ONLY advisory (IP-P01) — while the
-    payment-less scope gains nothing. Both scopes keep the identical
-    PREPARATION_AMOUNT_DETERMINABLE status and zero blockers: the
-    advisory is a finding channel fully separated from blockers."""
+def test_paid_no_invoice_emits_follow_up_advisory_never_changes_status(db_session):
+    """A scope carrying a confirmed OUT payment and NO associated PURCHASE
+    invoice gains the SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED advisory
+    (IP-P09), while the payment-less scope gains nothing. Both scopes
+    keep the identical PREPARATION_AMOUNT_DETERMINABLE status and zero
+    blockers: the advisory is a management reminder fully separated from
+    blockers."""
     frag = _make_fragment(db_session)
     paid_contract = _make_contract(db_session, frag.id, "PO-F1D-01A", counterparty="Supplier One")
     bare_contract = _make_contract(db_session, frag.id, "PO-F1D-01B", counterparty="Supplier Two")
@@ -328,55 +339,173 @@ def test_out_payment_present_emits_context_advisory_but_never_changes_status(db_
     assert paid.status == bare.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
     assert paid.blockers == () and bare.blockers == ()
 
-    # The separation: the paid scope carries the advisory, the bare one
-    # does not; the payment Fact itself stays exposed as context too.
+    # The separation: the paid scope carries the follow-up advisory, the
+    # bare one does not; the payment Fact itself stays exposed as context.
     assert [a.code for a in paid.advisories] == [
-        SupplierRequestAdvisoryCode.OUT_PAYMENT_PRESENT_CONTEXT_ONLY
+        SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED
     ]
+    assert "已付款" in paid.advisories[0].note and "催供应商开票" in paid.advisories[0].note
     assert len(paid.payment_allocations) == 1
     assert paid.payment_allocations[0].payment.direction == PaymentDirection.OUT
     assert bare.advisories == ()
     assert bare.payment_allocations == ()
 
 
-def test_advisory_never_masks_a_rule_conflict(db_session):
-    """An advisory coexisting with a blocker leaves the blocker's status
-    intact: IP-P02 amount MISMATCH + an OUT payment on the same scope
-    yields BOTH the PURCHASE_INVOICE_AMOUNT_MISMATCH blocker AND the
-    OUT_PAYMENT_PRESENT_CONTEXT_ONLY advisory, with status
-    RULE_CONFLICT — the advisory never softens or masks the conflict."""
+def test_follow_up_disappears_when_invoice_associated(db_session):
+    """The IP-P09 follow-up is recomputed from current Facts: once a
+    PURCHASE invoice is associated, the advisory disappears on the same
+    evaluation run — no Task is persisted, nothing lingers."""
     frag = _make_fragment(db_session)
-    contract = _make_contract(db_session, frag.id, "PO-F1D-02", gross_amount=Decimal("1000.00"))
-    invoice, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("800.00"))
+    contract = _make_contract(db_session, frag.id, "PO-F1D-01C")
+    invoice, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("1000.00"))
     _make_invoice_allocation(db_session, invoice.id, contract)
     payment = _make_out_payment(db_session, frag.id)
     _make_payment_allocation(db_session, payment, contract)
     db_session.commit()
 
     decision = _decision_for(db_session, contract.id)
-    assert decision.status == SupplierRequestDecisionStatus.RULE_CONFLICT
-    assert [b.code for b in decision.blockers] == [
-        SupplierRequestBlockerCode.PURCHASE_INVOICE_AMOUNT_MISMATCH
-    ]
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+    assert decision.blockers == ()
+    assert decision.advisories == ()
+
+
+# ---------------------------------------------------------------------------
+# IP-P02 / IP-P05 — deviation advisories (management review, not conflict)
+# ---------------------------------------------------------------------------
+
+
+def test_amount_deviation_emits_advisory_and_preserves_invoice_fact(db_session):
+    """IP-P02 deviation: the invoice amount differing from the Contract
+    reference emits PURCHASE_INVOICE_AMOUNT_DEVIATION — a management
+    review signal. The invoice Fact stays valid and exposed, the status
+    stays PREPARATION_AMOUNT_DETERMINABLE, and no blocker is emitted."""
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id, "PO-F1D-02", gross_amount=Decimal("1000.00"))
+    invoice, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("800.00"))
+    _make_invoice_allocation(db_session, invoice.id, contract)
+    db_session.commit()
+
+    decision = _decision_for(db_session, contract.id)
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+    assert decision.blockers == ()
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.DEVIATION
     assert [a.code for a in decision.advisories] == [
-        SupplierRequestAdvisoryCode.OUT_PAYMENT_PRESENT_CONTEXT_ONLY
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_AMOUNT_DEVIATION
     ]
+    assert decision.advisories[0].related_invoice_ids == (invoice.id,)
+    # The invoice Fact is preserved verbatim (never a conflict, never
+    # apportioned, never deleted).
+    assert decision.invoice_allocations[0].invoice.gross_amount == Decimal("800.00")
 
 
-# ---------------------------------------------------------------------------
-# IP-P06 — existing InvoiceItem tax_rate is a non-blocking advisory
-# ---------------------------------------------------------------------------
-
-
-def test_existing_tax_rate_fact_emits_factual_advisory(db_session):
-    """An actual PURCHASE InvoiceItem's tax_rate is displayed as the
-    existing Fact it is (IP-P06): the decision gains an
-    EXISTING_INVOICE_ITEM_TAX_RATE_FACT advisory naming that InvoiceItem,
-    the status stays PREPARATION_AMOUNT_DETERMINABLE, and no blocker is
-    emitted — a Fact display is never a rule conflict and never an
-    inference."""
+def test_product_name_deviation_emits_advisory(db_session):
+    """IP-P05 deviation: an unequal confirmed product-name pair emits
+    PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION naming the conflicting
+    invoice and invoice item — a management review signal, never a
+    conflict."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-F1D-03")
+    item = _make_contract_item(db_session, contract, frag.id, product_name="Widget Alpha")
+    invoice, invoice_item = _make_purchase_invoice(db_session, frag.id, product_name="Widget Beta")
+    _make_invoice_item_allocation(db_session, invoice_item, item)
+    db_session.commit()
+
+    decision = _decision_for(db_session, contract.id)
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+    assert decision.blockers == ()
+    assert decision.item_name_checks[0].outcome == SupplierRequestCheckOutcome.DEVIATION
+    assert [a.code for a in decision.advisories] == [
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION
+    ]
+    assert decision.advisories[0].related_invoice_ids == (invoice.id,)
+    assert decision.advisories[0].related_invoice_item_ids == (invoice_item.id,)
+
+
+def test_missing_product_name_is_not_comparable_never_blocks(db_session):
+    """A comparison impossible for an absent product name is a CHECK
+    RESULT ONLY — NOT_COMPARABLE_MISSING_FACT with no blocker and no
+    advisory: the optional management comparison is unavailable and does
+    NOT make the Decision INSUFFICIENT_FACTS (Phase 2D.3-F1d)."""
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id, "PO-F1D-04")
+    item = _make_contract_item(db_session, contract, frag.id, product_name="Widget Alpha")
+    invoice, invoice_item = _make_purchase_invoice(db_session, frag.id, product_name=None)
+    _make_invoice_item_allocation(db_session, invoice_item, item)
+    db_session.commit()
+
+    decision = _decision_for(db_session, contract.id)
+    assert decision.item_name_checks[0].outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
+    assert decision.blockers == ()
+    assert decision.advisories == ()
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+
+
+# ---------------------------------------------------------------------------
+# IP-P03 / IP-P04 — cardinality advisories (legitimate business state)
+# ---------------------------------------------------------------------------
+
+
+def test_multiple_invoices_advisory_only(db_session):
+    """IP-P03: a Contract split across multiple PURCHASE invoices emits
+    MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT — an advisory, never a
+    violation, never a status change."""
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id, "PO-F1D-05")
+    invoice1, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("600.00"))
+    invoice2, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("400.00"))
+    _make_invoice_allocation(db_session, invoice1.id, contract)
+    _make_invoice_allocation(db_session, invoice2.id, contract)
+    db_session.commit()
+
+    decision = _decision_for(db_session, contract.id)
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+    assert decision.blockers == ()
+    assert [a.code for a in decision.advisories] == [
+        SupplierRequestAdvisoryCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT
+    ]
+    assert set(decision.advisories[0].related_invoice_ids) == {invoice1.id, invoice2.id}
+
+
+def test_invoice_spans_contracts_advisory_no_apportionment(db_session):
+    """IP-P04: one PURCHASE invoice on multiple Contracts emits
+    PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS on every involved scope —
+    the M:N relationship is not a business error, the invoice is never
+    silently apportioned, and the status never changes."""
+    frag = _make_fragment(db_session)
+    contract_a = _make_contract(db_session, frag.id, "PO-F1D-06A")
+    contract_b = _make_contract(db_session, frag.id, "PO-F1D-06B")
+    invoice, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("1000.00"))
+    _make_invoice_allocation(db_session, invoice.id, contract_a)
+    _make_invoice_allocation(db_session, invoice.id, contract_b)
+    db_session.commit()
+
+    report = evaluate_supplier_invoice_request(db_session)
+    decisions = {d.contract_id: d for d in report.decisions}
+    for contract in (contract_a, contract_b):
+        decision = decisions[contract.id]
+        assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+        assert decision.blockers == ()
+        ip_p04 = [a for a in decision.advisories if a.code == SupplierRequestAdvisoryCode.PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS]
+        assert len(ip_p04) == 1
+        assert ip_p04[0].related_invoice_ids == (invoice.id,)
+        assert set(ip_p04[0].related_contract_ids) == {contract_a.id, contract_b.id}
+        # Never silently apportioned: the full invoice Fact is exposed.
+        assert decision.invoice_allocations[0].invoice.gross_amount == Decimal("1000.00")
+
+
+# ---------------------------------------------------------------------------
+# IP-P06 — existing tax_rate is CONTEXT, never an advisory
+# ---------------------------------------------------------------------------
+
+
+def test_existing_tax_rate_is_context_only_no_advisory(db_session):
+    """An actual PURCHASE InvoiceItem's tax_rate is displayed as the
+    existing Fact it is (IP-P06): it is reachable through
+    invoice_item_allocations, the status stays PREPARATION_AMOUNT_DETERMINABLE,
+    no blocker is emitted, and NO advisory is emitted for its presence
+    (Phase 2D.3-F1d removed the old tax-rate advisory)."""
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id, "PO-F1D-07")
     item = _make_contract_item(db_session, contract, frag.id)
     invoice, invoice_item = _make_purchase_invoice(db_session, frag.id, tax_rate=Decimal("0.13"))
     _make_invoice_allocation(db_session, invoice.id, contract)
@@ -386,26 +515,15 @@ def test_existing_tax_rate_fact_emits_factual_advisory(db_session):
     decision = _decision_for(db_session, contract.id)
     assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
     assert decision.blockers == ()
-    codes = [a.code for a in decision.advisories]
-    assert SupplierRequestAdvisoryCode.EXISTING_INVOICE_ITEM_TAX_RATE_FACT in codes
-    tax_advisory = next(
-        a for a in decision.advisories if a.code == SupplierRequestAdvisoryCode.EXISTING_INVOICE_ITEM_TAX_RATE_FACT
-    )
-    assert tax_advisory.related_invoice_item_ids == (invoice_item.id,)
-    # The advisory explicitly negates inference and recommendation — it
-    # states the Fact display, never what rate to use. It also carries no
-    # Decimal field at all, so no tax-rate VALUE can leak into it.
-    note_lower = tax_advisory.note.lower()
-    assert "no inference" in note_lower and "no recommendation" in note_lower
-    assert "should" not in note_lower
-    assert not any(isinstance(getattr(tax_advisory, f.name), Decimal) for f in dataclasses.fields(tax_advisory))
+    assert decision.advisories == ()
+    assert decision.invoice_item_allocations[0].invoice_item.tax_rate == Decimal("0.13")
 
 
 def test_no_tax_rate_fact_means_no_advisory(db_session):
-    """An InvoiceItem with NO tax_rate Fact produces no tax advisory at
-    all — nothing is inferred and nothing is invented."""
+    """An InvoiceItem with NO tax_rate Fact produces no finding at all —
+    nothing is inferred and nothing is invented."""
     frag = _make_fragment(db_session)
-    contract = _make_contract(db_session, frag.id, "PO-F1D-04")
+    contract = _make_contract(db_session, frag.id, "PO-F1D-08")
     item = _make_contract_item(db_session, contract, frag.id)
     invoice, invoice_item = _make_purchase_invoice(db_session, frag.id, tax_rate=None)
     _make_invoice_allocation(db_session, invoice.id, contract)
@@ -413,16 +531,17 @@ def test_no_tax_rate_fact_means_no_advisory(db_session):
     db_session.commit()
 
     decision = _decision_for(db_session, contract.id)
-    assert [a.code for a in decision.advisories] == []
+    assert decision.advisories == ()
     assert decision.blockers == ()
     assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
 
 
-def test_tax_rate_advisory_deduplicates_per_invoice_item():
-    """Two item allocations naming the SAME InvoiceItem emit the tax-rate
-    advisory exactly once — the advisory is per Fact, not per
-    association. (Pure function over the F0 context, no session.)"""
-    contract = _pure_contract("PO-F1D-05")
+def test_product_name_deviation_advisory_deduplicates_per_invoice():
+    """Two item allocations naming the SAME InvoiceItem's invoice emit the
+    product-name deviation advisory exactly once — the advisory is per
+    invoice, not per association. (Pure function over the F0 context, no
+    session.)"""
+    contract = _pure_contract("PO-F1D-09")
     contract_item = ContractItem(
         id=uuid.uuid4(), contract_id=contract.id, source_item_key="ITEM-1", sku=None,
         product_name="Widget Alpha", specification=None, quantity=Decimal("10"), unit=None,
@@ -431,19 +550,25 @@ def test_tax_rate_advisory_deduplicates_per_invoice_item():
     )
     invoice = Invoice(
         id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
-        digital_invoice_no=None, external_invoice_key="PINV-F1D-05", issue_date=date(2031, 1, 10),
+        digital_invoice_no=None, external_invoice_key="PINV-F1D-09", issue_date=date(2031, 1, 10),
         seller="Supplier", buyer="Our Own Entity", net_amount=Decimal("1000.00"), tax_amount=Decimal("0"),
         gross_amount=Decimal("1000.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
         created_at=NOW, updated_at=NOW,
     )
-    invoice_item = InvoiceItem(
-        id=uuid.uuid4(), invoice_id=invoice.id, line_no=1, product_name="Widget Alpha", specification=None,
+    invoice_item_a = InvoiceItem(
+        id=uuid.uuid4(), invoice_id=invoice.id, line_no=1, product_name="Widget Beta", specification=None,
         unit=None, quantity=Decimal("10"), unit_price=None, net_amount=Decimal("1000.00"),
         tax_rate=Decimal("0.13"), tax_amount=Decimal("0"), gross_amount=Decimal("1000.00"),
         source_fragment_id=uuid.uuid4(),
     )
+    invoice_item_b = InvoiceItem(
+        id=uuid.uuid4(), invoice_id=invoice.id, line_no=2, product_name="Widget Beta", specification=None,
+        unit=None, quantity=Decimal("5"), unit_price=None, net_amount=Decimal("500.00"),
+        tax_rate=Decimal("0.13"), tax_amount=Decimal("0"), gross_amount=Decimal("500.00"),
+        source_fragment_id=uuid.uuid4(),
+    )
 
-    def _item_alloc():
+    def _item_alloc(invoice_item):
         return SupplierScopeInvoiceItemAllocation(
             allocation=InvoiceItemAllocation(
                 id=uuid.uuid4(), invoice_item_id=invoice_item.id, contract_item_id=contract_item.id,
@@ -467,17 +592,18 @@ def test_tax_rate_advisory_deduplicates_per_invoice_item():
             ),
             invoice=invoice,
         ),),
-        invoice_item_allocations=(_item_alloc(), _item_alloc()),
+        invoice_item_allocations=(_item_alloc(invoice_item_a), _item_alloc(invoice_item_b)),
         payment_allocations=(),
         unresolved_work=(),
     ),))
 
     decision = evaluate_supplier_invoice_request_from_context(context).decisions[0]
-    tax_advisories = [
-        a for a in decision.advisories if a.code == SupplierRequestAdvisoryCode.EXISTING_INVOICE_ITEM_TAX_RATE_FACT
+    deviation_advisories = [
+        a for a in decision.advisories if a.code == SupplierRequestAdvisoryCode.PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION
     ]
-    assert len(tax_advisories) == 1
-    assert tax_advisories[0].related_invoice_item_ids == (invoice_item.id,)
+    assert len(deviation_advisories) == 1
+    assert deviation_advisories[0].related_invoice_ids == (invoice.id,)
+    assert set(deviation_advisories[0].related_invoice_item_ids) == {invoice_item_a.id, invoice_item_b.id}
     assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
 
 
@@ -489,59 +615,65 @@ def test_tax_rate_advisory_deduplicates_per_invoice_item():
 def test_advisory_vocabulary_is_disjoint_from_blockers_and_non_judgmental():
     """The advisory channel is fully separated from the blocker channel:
     the advisory-code set is exhaustive over its own vocabulary and
-    disjoint from BOTH blocker classes, so an advisory can never leak
-    into the status precedence. Advisory codes carry no business
-    judgment — none of the rejected judgment concepts appear."""
+    disjoint from the blocker class, so an advisory can never leak into
+    the status derivation. Advisory codes carry no business judgment —
+    none of the rejected judgment concepts appear. The single sanctioned
+    management recommendation is SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED
+    (IP-P09); no other code may carry "recommend"."""
     all_advisory_codes = {
         v for k, v in vars(SupplierRequestAdvisoryCode).items() if not k.startswith("_") and isinstance(v, str)
     }
     assert NON_BLOCKING_ADVISORY_CODES == all_advisory_codes
-    assert NON_BLOCKING_ADVISORY_CODES.isdisjoint(RULE_VIOLATION_BLOCKER_CODES)
     assert NON_BLOCKING_ADVISORY_CODES.isdisjoint(MISSING_FACT_BLOCKER_CODES)
 
     for code in NON_BLOCKING_ADVISORY_CODES:
         lowered = code.lower()
-        for token in ("overdue", "should", "recommend", "eligib", "ready", "remaining", "owed", "outstanding", "unpaid"):
+        for token in ("overdue", "should", "eligib", "ready", "remaining", "owed", "outstanding", "unpaid", "must"):
             assert token not in lowered, f"advisory code {code} carries judgment token {token!r}"
+    # The follow-up advisory is the ONE sanctioned recommendation code;
+    # no other advisory code carries a recommend/inference concept.
+    assert SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED in NON_BLOCKING_ADVISORY_CODES
+    for code in NON_BLOCKING_ADVISORY_CODES - {SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED}:
+        assert "recommend" not in code.lower(), f"advisory code {code} carries a recommendation outside IP-P09"
 
 
 def test_advisory_presence_never_derives_status():
     """Status is a function of blockers alone: two clean scopes that
-    differ only in advisory-bearing context (one has an OUT payment) are
-    the same status, and the advisory-bearing scope carries no blocker
-    whatsoever. (Pure function over the F0 context.)"""
-    paid_contract = _pure_contract("PO-F1D-06A", counterparty="Supplier One")
-    bare_contract = _pure_contract("PO-F1D-06B", counterparty="Supplier Two")
-    payment = Payment(
-        id=uuid.uuid4(), transaction_date=date(2031, 1, 15), direction=PaymentDirection.OUT,
-        amount=Decimal("500.00"), counterparty="Supplier One", business_type=None,
-        bank_reference="REF-F1D-06", description=None, running_balance=None,
-        source_fragment_id=uuid.uuid4(), created_at=NOW,
+    differ only in advisory-bearing context (one has an amount deviation)
+    are the same status, and the advisory-bearing scope carries no
+    blocker whatsoever. (Pure function over the F0 context.)"""
+    deviated_contract = _pure_contract("PO-F1D-10A", gross_amount=Decimal("1000.00"))
+    clean_contract = _pure_contract("PO-F1D-10B", gross_amount=Decimal("1000.00"))
+    invoice_id = uuid.uuid4()
+    invoice = Invoice(
+        id=invoice_id, direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="PINV-F1D-10A", issue_date=date(2031, 1, 10),
+        seller="Supplier", buyer="Our Own Entity", net_amount=Decimal("800.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("800.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW,
     )
-    context = _context_with_scopes((
-        SupplierScopeContext(
-            contract=paid_contract, items=(), shipments=(),
-            invoice_allocations=(), invoice_item_allocations=(),
-            payment_allocations=(SupplierScopePaymentAllocation(
-                allocation=PaymentAllocation(
-                    id=uuid.uuid4(), payment_id=payment.id, contract_id=paid_contract.id,
-                    match_case_id=uuid.uuid4(), allocated_amount=Decimal("500.00"),
+
+    def _scope(contract, with_invoice):
+        return SupplierScopeContext(
+            contract=contract, items=(), shipments=(),
+            invoice_allocations=(SupplierScopeInvoiceAllocation(
+                allocation=InvoiceAllocation(
+                    id=uuid.uuid4(), invoice_id=invoice_id, contract_id=contract.id, match_case_id=uuid.uuid4(),
+                    allocated_gross_amount=Decimal("800.00"),
                     match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
                     confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
                 ),
-                payment=payment,
-            ),),
-            unresolved_work=(),
-        ),
-        SupplierScopeContext(
-            contract=bare_contract, items=(), shipments=(),
-            invoice_allocations=(), invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
-        ),
-    ))
+                invoice=invoice if with_invoice else None,
+            ),) if with_invoice else (),
+            invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
+        )
 
+    context = _context_with_scopes((_scope(deviated_contract, with_invoice=True), _scope(clean_contract, with_invoice=False)))
     decisions = {d.contract_id: d for d in evaluate_supplier_invoice_request_from_context(context).decisions}
-    paid, bare = decisions[paid_contract.id], decisions[bare_contract.id]
-    assert paid.status == bare.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
-    assert paid.blockers == () and bare.blockers == ()
-    assert [a.code for a in paid.advisories] == [SupplierRequestAdvisoryCode.OUT_PAYMENT_PRESENT_CONTEXT_ONLY]
-    assert bare.advisories == ()
+    deviated, clean = decisions[deviated_contract.id], decisions[clean_contract.id]
+    assert deviated.status == clean.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+    assert deviated.blockers == () and clean.blockers == ()
+    assert [a.code for a in deviated.advisories] == [
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_AMOUNT_DEVIATION
+    ]
+    assert clean.advisories == ()

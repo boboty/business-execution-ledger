@@ -1,4 +1,5 @@
-"""SALES_INVOICE_PREPARATION rule foundation (Phase 2D.3-F1a).
+"""SALES_INVOICE_PREPARATION rule foundation (Phase 2D.3-F1a, re-leveled
+in Phase 2D.3-F1d).
 
 Formally establishes the sales-direction preparation rule layer on top
 of the F0 fact context. The rule layer consumes ONLY already-confirmed /
@@ -7,31 +8,45 @@ Decision per SalesContract scope — the Fact -> Decision layering is
 preserved: this module never writes, never mutates Facts, and never
 re-derives "current" semantics.
 
-Frozen by the Phase 2D.3-F1a business clarification — the THREE required
-inputs of SALES_INVOICE_PREPARATION, in this order:
+The Invoice Preparation Workbench is FACT CONTROL + MANAGEMENT
+REMINDERS, NOT a workflow approval engine. SALES_INVOICE_PREPARATION is
+NOT a process gate: it reports fact completeness and comparison
+availability per scope; it never decides whether an invoice may be
+issued.
 
-1. ``SALES_CONTRACT``                — the scope's own SalesContract Fact.
-2. ``LINKED_PROCUREMENT_CONTRACT``   — at least one CURRENT
-   ProcurementSalesLink resolving to a procurement Contract.
-3. ``SHIPMENT_EXPORT_FACT``          — a Shipment/Export Fact on the
-   linked procurement Contract (single-link case only; see below).
+The three inputs of SALES_INVOICE_PREPARATION, in this order, are a
+FACT-COMPLETENESS / COMPARISON-AVAILABILITY report — not eligibility
+inputs:
 
-When a required input is missing, the decision carries an explicit
-blocker / insufficient-fact outcome. When all three are present, the
-status is ``INPUTS_PRESENT`` — a statement about required-input fact
-completeness ONLY. It is NOT "ready to invoice", NOT an eligibility
-Decision, and does not mean any amount or quantity should be invoiced.
+1. ``SALES_CONTRACT``              — the scope's own SalesContract Fact.
+   This is the genuinely-required sales-scope data. A sales scope exists
+   only for an existing SalesContract anchor, so this input is present
+   by construction; missing genuinely-required sales-scope data would be
+   ``INSUFFICIENT_FACTS`` (where preparation data cannot be built),
+   which the F0 construction makes unreachable today.
+2. ``LINKED_PROCUREMENT_CONTRACT`` — the current linked procurement
+   Contract(s) (via CURRENT ``ProcurementSalesLink``). This is a
+   management/context linkage: the bridge is exposed as a fact, and a
+   missing link only makes procurement-side comparison unavailable. It
+   is NOT an eligibility blocker and never gates invoice preparation.
+3. ``SHIPMENT_EXPORT_FACT``        — a Shipment/Export Fact on the
+   linked procurement Contract (single-link case only). This is an
+   export-management anchor: a missing Shipment makes the export/customs
+   comparison unavailable (NOT "may not issue invoice"), and it is never
+   an eligibility blocker.
 
 Deliberately NOT implemented (each requires its own rule freeze):
 
 - M:N shipment judgment — when a scope has MULTIPLE current links, no
   "any shipment" / "all linked contracts have shipments" decision is
-  made; a dedicated ``SHIPMENT_JUDGMENT_DEFERRED_MULTIPLE_LINKS``
-  blocker is emitted instead. The system does not guess.
+  made: the shipment input is recorded ``NOT_JUDGED_UNDER_MN_UNRESOLVED``
+  (an unresolved comparison, never a blocker). The system does not
+  guess, and the M:N linked-contract facts stay visible.
 - 应开金额 / 应开数量 — no should-invoice amount or quantity exists
   anywhere in this module.
 - Receipt/payment triggering — no "receipt triggers invoice" or
-  "已收多少开多少" logic. SalesPaymentAllocations are not consulted.
+  "已收多少开多少" logic. Invoice may precede or follow receipt/payment:
+  both orderings are fine, and no chronology finding is emitted.
 - The exact field set of the future 一致性校验 (consistency validation,
   "完全一致") — reserved, not defined (see below).
 - Supplier-side preparation calculation — this module is
@@ -40,8 +55,8 @@ Deliberately NOT implemented (each requires its own rule freeze):
 ``customer`` on every decision comes only from
 ``SalesContract.customer`` (the Domain's only expression of an external
 customer). Whether a customer is known is surfaced as a fact, never
-judged: customer presence is deliberately NOT one of the three required
-inputs and adds no blocker here.
+judged: customer presence is deliberately NOT one of the three inputs
+and adds no finding here.
 
 Consistency-validation reservation: ``SalesPreparationConsistencyCheckResult``
 and ``SALES_INVOICE_CONSISTENCY_CHECK_NAMES`` reserve a pure
@@ -72,10 +87,13 @@ from bel.application.invoice_preparation import (
 
 
 class SalesPreparationRequiredInput:
-    """The THREE required inputs of SALES_INVOICE_PREPARATION, frozen by
-    the Phase 2D.3-F1a clarification. Exactly these three — adding a
-    fourth (e.g. customer presence, receipt state) would be a new rule
-    and requires its own freeze."""
+    """The THREE inputs of SALES_INVOICE_PREPARATION, frozen by the
+    Phase 2D.3-F1a clarification and re-leveled in F1d. Exactly these
+    three — adding a fourth (e.g. customer presence, receipt state)
+    would be a new rule and requires its own freeze. Only the first is
+    genuinely required (present by construction); the other two are
+    management/context linkages whose absence makes a comparison
+    unavailable, never an eligibility blocker."""
 
     SALES_CONTRACT = "SALES_CONTRACT"
     LINKED_PROCUREMENT_CONTRACT = "LINKED_PROCUREMENT_CONTRACT"
@@ -92,27 +110,26 @@ REQUIRED_INPUT_ORDER: tuple[str, ...] = (
 class SalesPreparationDecisionStatus:
     """Fact-completeness vocabulary, deliberately NOT an eligibility
     vocabulary: there is no READY / NOT_READY / BLOCKED member. A status
-    here says which required-input Facts are present, nothing more."""
+    here says whether the genuinely-required sales-scope data (the
+    SalesContract) is present, nothing more. Under the F0 construction
+    that data is present by construction, so the status is
+    ``INPUTS_PRESENT`` in every reachable state; ``INSUFFICIENT_FACTS``
+    is reserved for a genuinely-required sales-scope Fact being missing —
+    where preparation data cannot be built — and is unreachable today
+    exactly as the schema-backstopped supplier amount path is."""
 
     INPUTS_PRESENT = "INPUTS_PRESENT"
     INSUFFICIENT_FACTS = "INSUFFICIENT_FACTS"
 
 
 class SalesPreparationBlockerCode:
-    """Explicit blocker / insufficient-fact codes. Codes state which
-    required input could not be confirmed — never what should be done
-    about it (that is the unfrozen eligibility question)."""
-
-    # Required input 2 missing: no CURRENT ProcurementSalesLink resolves
-    # to a procurement Contract (none exist, or none resolve).
-    NO_CURRENT_PROCUREMENT_LINK = "NO_CURRENT_PROCUREMENT_LINK"
-    # Required input 3 missing: the single linked procurement Contract
-    # has no Shipment/Export Fact.
-    NO_SHIPMENT_FACT_ON_LINKED_CONTRACT = "NO_SHIPMENT_FACT_ON_LINKED_CONTRACT"
-    # Required input 3 NOT JUDGED: the scope has MULTIPLE current links
-    # (the bridge is many-to-many) and the any/all shipment rule is not
-    # frozen. The system does not guess.
-    SHIPMENT_JUDGMENT_DEFERRED_MULTIPLE_LINKS = "SHIPMENT_JUDGMENT_DEFERRED_MULTIPLE_LINKS"
+    """Reserved blocker vocabulary. The current sales rule set emits NO
+    blocker: the only genuinely-required input (the SalesContract) is
+    present by construction, and the link / shipment inputs are
+    management/context linkages whose absence only makes a comparison
+    unavailable. A genuinely-required sales-scope blocker — or one from
+    the future consistency-validation seam — would extend this class
+    under a rule freeze."""
 
 
 # RESERVED for the future 一致性校验 (consistency validation) — pure
@@ -140,24 +157,32 @@ class SalesPreparationConsistencyCheckResult:
 
 @dataclass(frozen=True)
 class SalesPreparationRequiredInputState:
-    """One required input's evaluation outcome, with the Fact ids that
-    satisfy it — the Fact -> Decision trace."""
+    """One input's evaluation outcome, with the Fact ids that satisfy
+    it — the Fact -> Decision trace. ``present`` states fact
+    completeness / comparison availability for that input; it is NOT an
+    eligibility statement."""
 
     name: str
     present: bool
     source_fact_ids: tuple[uuid.UUID, ...] = ()
-    # Why an input could not be judged (e.g. NOT_JUDGED_UNDER_MN). Never
-    # a business judgment — a statement about what this rule did not
-    # evaluate.
+    # Why an input's comparison is unavailable (e.g.
+    # PROCUREMENT_COMPARISON_UNAVAILABLE / EXPORT_COMPARISON_UNAVAILABLE /
+    # NOT_JUDGED_UNDER_MN_UNRESOLVED). Never a business judgment — a
+    # statement about what this rule did not evaluate.
     note: str | None = None
 
 
 @dataclass(frozen=True)
 class SalesPreparationBlocker:
+    """Reserved blocker shape for the genuinely-required sales-scope
+    data (the SalesContract) and the future consistency-validation seam.
+    No current code path emits one — the genuinely-required input is
+    present by construction."""
+
     code: str
     related_sales_contract_id: uuid.UUID
-    # Procurement Contract ids the blocker is about (empty when no link
-    # exists at all). Enumeration only — never an amount/quantity.
+    # Procurement Contract ids the blocker is about. Enumeration only —
+    # never an amount/quantity.
     related_contract_ids: tuple[uuid.UUID, ...] = ()
     note: str | None = None
 
@@ -166,7 +191,8 @@ class SalesPreparationBlocker:
 class SalesInvoicePreparationDecision:
     """One SalesContract scope's preparation-rule Decision. Carries facts
     and required-input outcomes only — no amount, no quantity, no
-    readiness/eligibility field."""
+    readiness/eligibility field, and no blocker in any reachable state
+    (the three inputs report comparison availability, not gates)."""
 
     sales_contract_id: uuid.UUID
     sales_contract_no: str
@@ -219,52 +245,57 @@ def _evaluate_scope(
     sales_contract = scope.sales_contract
     blockers: list[SalesPreparationBlocker] = []
 
-    # Required input 1 — the scope's own SalesContract Fact. Present by
-    # construction (a sales scope exists only for an existing
-    # SalesContract anchor); asserted, not assumed silently.
+    # Input 1 — the scope's own SalesContract Fact, the genuinely-
+    # required sales-scope data. Present by construction (a sales scope
+    # exists only for an existing SalesContract anchor); asserted, not
+    # assumed silently. Missing genuinely-required sales-scope data
+    # would be INSUFFICIENT_FACTS — unreachable under the F0
+    # construction.
     sales_contract_input = SalesPreparationRequiredInputState(
         name=SalesPreparationRequiredInput.SALES_CONTRACT,
         present=True,
         source_fact_ids=(sales_contract.id,),
     )
 
-    # Required input 2 — at least one CURRENT ProcurementSalesLink
-    # resolving to a procurement Contract. Enumeration is reused as-is
-    # from the F0 context; no amount/quantity crosses the bridge.
+    # Input 2 — the current linked procurement Contract(s). This is a
+    # management/context linkage: the bridge is exposed as a fact
+    # (every current link's procurement Contract id stays visible, so
+    # M:N facts are never hidden), and a missing link only makes
+    # procurement-side comparison unavailable. It is NOT an eligibility
+    # blocker, so no blocker is emitted.
+    all_link_contract_ids = tuple(
+        entry.link.procurement_contract_id for entry in scope.linked_procurement_contracts
+    )
     resolved = [entry.contract for entry in scope.linked_procurement_contracts if entry.contract is not None]
-    all_link_contract_ids = tuple(entry.link.procurement_contract_id for entry in scope.linked_procurement_contracts)
     link_input = SalesPreparationRequiredInputState(
         name=SalesPreparationRequiredInput.LINKED_PROCUREMENT_CONTRACT,
         present=bool(resolved),
-        source_fact_ids=tuple(contract.id for contract in resolved),
-    )
-    if not resolved:
-        blockers.append(
-            SalesPreparationBlocker(
-                code=SalesPreparationBlockerCode.NO_CURRENT_PROCUREMENT_LINK,
-                related_sales_contract_id=sales_contract.id,
-                related_contract_ids=all_link_contract_ids,
-                note=None if not all_link_contract_ids else "current link(s) exist but resolve to no Contract anchor",
+        source_fact_ids=all_link_contract_ids,
+        note=(
+            None
+            if resolved
+            else (
+                "PROCUREMENT_COMPARISON_UNAVAILABLE"
+                if all_link_contract_ids
+                else "PROCUREMENT_COMPARISON_UNAVAILABLE_NO_LINK"
             )
-        )
+        ),
+    )
 
-    # Required input 3 — Shipment/Export Fact. Judged ONLY in the
-    # single-link case: under M:N the any/all shipment rule is NOT
-    # frozen, and this module does not guess (deliberate F1a boundary).
+    # Input 3 — Shipment/Export Fact, the export-management anchor.
+    # Judged ONLY in the single-link case: under M:N the any/all
+    # shipment rule is NOT frozen, and this module does not guess — the
+    # input is recorded as an unresolved comparison
+    # (NOT_JUDGED_UNDER_MN_UNRESOLVED), never a blocker (deliberate F1a
+    # boundary, re-leveled in F1d). A missing shipment only makes the
+    # export/customs comparison unavailable; it is never "may not issue
+    # invoice".
     if len(scope.linked_procurement_contracts) > 1:
         shipment_input = SalesPreparationRequiredInputState(
             name=SalesPreparationRequiredInput.SHIPMENT_EXPORT_FACT,
             present=False,
             source_fact_ids=(),
-            note="NOT_JUDGED_UNDER_MN",
-        )
-        blockers.append(
-            SalesPreparationBlocker(
-                code=SalesPreparationBlockerCode.SHIPMENT_JUDGMENT_DEFERRED_MULTIPLE_LINKS,
-                related_sales_contract_id=sales_contract.id,
-                related_contract_ids=all_link_contract_ids,
-                note="any/all shipment judgment under multiple current links requires a rule freeze",
-            )
+            note="NOT_JUDGED_UNDER_MN_UNRESOLVED",
         )
     elif resolved:
         linked_contract = resolved[0]
@@ -276,19 +307,12 @@ def _evaluate_scope(
             name=SalesPreparationRequiredInput.SHIPMENT_EXPORT_FACT,
             present=bool(shipment_ids),
             source_fact_ids=shipment_ids,
+            note=None if shipment_ids else "EXPORT_COMPARISON_UNAVAILABLE",
         )
-        if not shipment_ids:
-            blockers.append(
-                SalesPreparationBlocker(
-                    code=SalesPreparationBlockerCode.NO_SHIPMENT_FACT_ON_LINKED_CONTRACT,
-                    related_sales_contract_id=sales_contract.id,
-                    related_contract_ids=(linked_contract.id,),
-                )
-            )
     else:
-        # No linked contract to check shipments on — the link blocker
-        # above already states the missing input; no separate shipment
-        # blocker is emitted (nothing was checked, so nothing is claimed).
+        # No linked contract to check shipments on — the link input above
+        # already states the missing linkage; no separate shipment claim
+        # is made (nothing was checked, so nothing is claimed).
         shipment_input = SalesPreparationRequiredInputState(
             name=SalesPreparationRequiredInput.SHIPMENT_EXPORT_FACT,
             present=False,
@@ -303,6 +327,11 @@ def _evaluate_scope(
     )
     assert [ri.name for ri in required_inputs] == list(REQUIRED_INPUT_ORDER)
 
+    # Status: derived from blockers alone. No blocker is emitted by the
+    # current rule set (the genuinely-required SalesContract is present
+    # by construction), so the status is INPUTS_PRESENT in every
+    # reachable state — a statement about fact completeness ONLY, never
+    # an eligibility or readiness Decision.
     return SalesInvoicePreparationDecision(
         sales_contract_id=sales_contract.id,
         sales_contract_no=sales_contract.sales_contract_no,

@@ -1,4 +1,5 @@
-"""SUPPLIER_INVOICE_REQUEST rule foundation (Phase 2D.3-F1b).
+"""SUPPLIER_INVOICE_REQUEST rule foundation (Phase 2D.3-F1b, re-leveled
+in Phase 2D.3-F1d).
 
 Formally establishes the supplier-direction preparation rule layer on
 top of the F0 fact context. Primary axis: procurement ``Contract``.
@@ -8,87 +9,91 @@ procurement Contract scope — the Fact -> Decision layering is
 preserved: this module never writes, never mutates Facts, and never
 re-derives "current" semantics.
 
+The Invoice Preparation Workbench is FACT CONTROL + MANAGEMENT
+REMINDERS, NOT a workflow approval engine. Its job: Facts ->
+deterministic comparison -> management reminder / review signal. A
+legitimate real-world business state is NEVER turned into a conflict
+merely because it departs from the company's preferred management
+pattern.
+
 Rule provenance lives in ``docs/PHASE2D3-RULE-FREEZE.md``. The frozen
 rules implemented here, by ID:
 
 - IP-P02 (``ACCOUNTANT_CONFIRMED``): the expected supplier PURCHASE
   invoice gross amount is the procurement Contract gross amount. A
   preparation amount — not an accounting value, not a tax calculation.
+  A single associated invoice whose gross amount differs from the
+  reference is a management-review DEVIATION advisory
+  (``PURCHASE_INVOICE_AMOUNT_DEVIATION``) — the invoice Fact stays
+  valid and nothing is a rule conflict.
 - IP-P03 (``ACCOUNTANT_CONFIRMED``): one procurement Contract is not
   expected to be split across multiple PURCHASE invoices. More than one
-  currently-allocated PURCHASE invoice emits a deterministic violation
-  blocker. Historical Facts are never deleted or mutated by this.
+  currently-allocated PURCHASE invoice is a management review signal
+  (``MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT`` ADVISORY) — the split is
+  legitimate business state, and every Fact stays preserved.
 - IP-P04 (``ACCOUNTANT_CONFIRMED``): one supplier PURCHASE invoice must
-  not cover multiple procurement Contracts. The complete F0 context's
-  factual invoice -> contracts map is built and any invoice currently
-  allocated to more than one procurement Contract emits a deterministic
-  violation blocker. The invoice is never silently apportioned.
+  not cover multiple procurement Contracts. An M:N association is a
+  management review signal (``PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS``
+  ADVISORY); the invoice is never silently apportioned, and the M:N
+  relationship is not a business error.
 - IP-P05 (``ACCOUNTANT_CONFIRMED``): where item facts exist, supplier
-  invoice product naming must match the confirmed procurement product
+  invoice product naming should match the confirmed procurement product
   naming — compared here as EXACT equality of the two confirmed product
-  names. No fuzzy matching; no normalization beyond what the Domain
-  already freezes (``bel.domain.normalize`` freezes COUNTERPARTY
-  normalization only — no product-name normalization exists, so raw
-  exact equality is used); no inference from HS / tax classification
-  codes.
+  names. An unequal pair is a management-review DEVIATION advisory
+  (``PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION``), never a conflict.
+- IP-P09 (``ACCOUNTANT_CONFIRMED``): paid but no PURCHASE invoice yet is
+  a management follow-up (``SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED``
+  ADVISORY; 已付款，尚未收到对应进项发票，建议催供应商开票) — emitted when
+  at least one confirmed OUT payment is allocated and no PURCHASE
+  invoice is associated, and gone on recomputation once one is.
 - IP-P01 (``ACCOUNTANT_CONFIRMED``): OUT payment facts are exposed as
-  context only. Payment is NOT a gate: nothing here requires payment
-  before a request, and no readiness is derived from payment.
+  context only. Payment is CONTEXT — NOT a gate, and no status/advisory
+  derives from payment ordering.
 - IP-P06 (``ACCOUNTANT_CONFIRMED``): no tax-rate inference. An actual
-  PURCHASE InvoiceItem's ``tax_rate`` is reachable only as an existing
-  Fact (through the exposed item associations); no requested,
-  recommended, or inferred tax rate exists anywhere in this module.
-- IP-P07 (``UNRESOLVED_SAFE_BLOCKER``): the quantity basis (contract /
-  shipped / declared precedence) is NOT frozen — no requested quantity
-  is calculated anywhere, and no such field exists in any DTO.
+  PURCHASE InvoiceItem's ``tax_rate`` is CONTEXT — reachable only as the
+  existing Fact it is; no advisory is emitted for its presence.
+- IP-P07 (``UNRESOLVED``): the quantity basis (contract / shipped /
+  declared precedence) is NOT frozen — no requested quantity is
+  calculated anywhere, and no such field exists in any DTO.
 
 Decision status vocabulary (fact/preparation vocabulary, deliberately
 NOT an eligibility vocabulary — no READY / ELIGIBLE / OVERDUE /
 SHOULD_HAVE_INVOICED / PAYMENT_REQUIRED / TAX_RATE_RECOMMENDED member):
 
 - ``PREPARATION_AMOUNT_DETERMINABLE`` — the IP-P02 expected amount could
-  be determined from the Contract Fact (and no frozen check is in
-  conflict or blocked on a missing Fact). This does NOT by itself mean
-  "the supplier should invoice now"; it is a statement about fact
-  completeness, nothing more.
-- ``INSUFFICIENT_FACTS`` — the expected amount could NOT be determined,
-  OR a comparison required by an existing association could not be
-  performed because the compared Fact/value is absent (an explicit
-  missing-fact blocker is emitted for each such gap).
-- ``RULE_CONFLICT`` — a frozen rule is violated by the current Facts:
-  IP-P03 / IP-P04 cardinality, an IP-P02 amount MISMATCH
-  (``PURCHASE_INVOICE_AMOUNT_MISMATCH``), or an IP-P05 product-name
-  MISMATCH (``PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH``).
+  be determined from the Contract Fact (and no genuinely-required data
+  is missing). This does NOT by itself mean "the supplier should invoice
+  now"; it is a statement about fact completeness, nothing more.
+- ``INSUFFICIENT_FACTS`` — the genuinely-required preparation data (the
+  Contract gross amount) is absent. Only genuine data incompleteness
+  blocks; a comparison that cannot be performed because an optional
+  compared Fact is absent is a ``NOT_COMPARABLE_MISSING_FACT`` check
+  result and never changes status.
 
-Status precedence when several apply: ``RULE_CONFLICT`` >
-``INSUFFICIENT_FACTS`` > ``PREPARATION_AMOUNT_DETERMINABLE``. A frozen
-rule conflict is never masked by fact incompleteness; the violated
-facts remain exposed on the decision either way.
+Blockers / advisories (Phase 2D.3-F1d re-leveling): a Decision carries
+exactly two finding channels. ``blockers`` are the hard findings — the
+genuinely-required data absent — and the decision ``status`` is derived
+from them alone (currently exactly one blocker code exists:
+``MISSING_CONTRACT_GROSS_AMOUNT``). ``advisories`` are explicit
+NON-BLOCKING management reminders / review signals (IP-P09 follow-up;
+IP-P02 / IP-P05 deviation; IP-P03 / IP-P04 cardinality); they NEVER
+affect ``status``, so a scope with advisories and no blockers is still
+``PREPARATION_AMOUNT_DETERMINABLE``, and an advisory coexisting with a
+blocker leaves the blocker's status intact.
 
-Advisory / blocker separation (Phase 2D.3-F1d): a Decision carries
-exactly two finding channels. ``blockers`` are hard findings — the
-frozen-rule conflicts and missing compared Facts the status precedence
-is derived from. ``advisories`` are explicit NON-BLOCKING findings:
-they record a frozen accountant-confirmed rule consequence that is
-factual context and never a gate (IP-P01: OUT payment Facts present;
-IP-P06: an actual InvoiceItem tax_rate reachable as an existing Fact).
-An advisory NEVER affects ``status`` — status is a function of blockers
-alone, so a scope with advisories and no blockers is still
-``PREPARATION_AMOUNT_DETERMINABLE``. Advisories follow the same
-discipline as blockers: they state what the Facts are, never what
-should be done about them (no "should"/"recommend"/"must pay").
-
-Check results (exact, never tolerant): ``MATCH`` / ``MISMATCH`` /
-``NOT_COMPARABLE_MISSING_FACT``. A MISMATCH means the confirmed Facts
-conflict with a frozen accountant-confirmed rule (IP-P02 / IP-P05): it
-emits the corresponding mismatch blocker and makes the scope decision
-``RULE_CONFLICT``. It is never worded as "unpaid", "outstanding", or
-"overdue". ``NOT_COMPARABLE_MISSING_FACT`` is NOT a rule conflict: it
-emits an explicit missing-fact blocker and makes the scope decision at
-least ``INSUFFICIENT_FACTS``. Amount comparisons reuse the existing
-canonical semantics (M001 compares ``Invoice.gross_amount`` to
-``Contract.gross_amount``; the confirmed allocation carries that same
-amount) with exact ``Decimal`` equality — no tolerance is invented.
+Check results (exact, never tolerant): ``MATCH`` / ``DEVIATION`` /
+``NOT_COMPARABLE_MISSING_FACT``. A DEVIATION means the confirmed Facts
+differ from the preferred reference (IP-P02 / IP-P05): it emits the
+corresponding ADVISORY and never changes status — never worded as
+"unpaid", "outstanding", or "overdue". ``NOT_COMPARABLE_MISSING_FACT``
+is a check result only: a comparison that cannot be performed because a
+compared Fact/value is absent is an optional management comparison and
+does NOT make the decision ``INSUFFICIENT_FACTS`` (only
+``MISSING_CONTRACT_GROSS_AMOUNT`` — the primary preparation value —
+does). Amount comparisons reuse the existing canonical semantics (M001
+compares ``Invoice.gross_amount`` to ``Contract.gross_amount``; the
+confirmed allocation carries that same amount) with exact ``Decimal``
+equality — no tolerance is invented.
 
 Strictly read-only: evaluation is a pure function of the F0 context.
 The session entry point builds the context UNFILTERED — the IP-P04
@@ -123,24 +128,18 @@ class SupplierRequestDecisionStatus:
     vocabulary: there is no READY / ELIGIBLE / BLOCKED member, and none
     of the rejected business-judgment members (OVERDUE,
     SHOULD_HAVE_INVOICED, PAYMENT_REQUIRED, TAX_RATE_RECOMMENDED) exist.
-    A status here states whether the frozen checks could be satisfied
-    determinatively — expected amount determinable, facts insufficient,
-    or a frozen rule in conflict — nothing more."""
+    A status here states whether the genuinely-required preparation data
+    could be determined — nothing more."""
 
     PREPARATION_AMOUNT_DETERMINABLE = "PREPARATION_AMOUNT_DETERMINABLE"
     INSUFFICIENT_FACTS = "INSUFFICIENT_FACTS"
-    RULE_CONFLICT = "RULE_CONFLICT"
 
 
 class SupplierRequestBlockerCode:
-    """Explicit blocker codes. Violation codes state which frozen
-    accountant-confirmed rule the current Facts conflict with
-    (RULE_CONFLICT); missing-fact codes state which compared Fact/value
-    could not be found (INSUFFICIENT_FACTS). Codes never state what
-    should be done about it (that is the unfrozen business decision)."""
-
-    # -- Missing-fact codes (never a rule conflict; status at least
-    #    INSUFFICIENT_FACTS) --
+    """Explicit blocker codes — the genuinely-required data that could
+    not be found (INSUFFICIENT_FACTS). There is exactly one today. Codes
+    never state what should be done about it (that is the unfrozen
+    business decision)."""
 
     # IP-P02 missing fact: the Contract's gross amount is unknown, so no
     # expected purchase invoice gross amount can be prepared. (Today's
@@ -149,104 +148,79 @@ class SupplierRequestBlockerCode:
     # unknown current amount unreachable in storage; the rule stays
     # deterministic should the Domain ever carry an unknown amount.)
     MISSING_CONTRACT_GROSS_AMOUNT = "MISSING_CONTRACT_GROSS_AMOUNT"
-    # IP-P02 comparison required by the confirmed association but the
-    # PURCHASE Invoice Fact behind it is absent — the compared Fact does
-    # not exist. (Unreachable in storage via the
-    # invoice_allocations.invoice_id FK; deterministic over the F0
-    # context's ``invoice is None`` shape.)
-    MISSING_PURCHASE_INVOICE_FACT = "MISSING_PURCHASE_INVOICE_FACT"
-    # IP-P05 comparison required by the item association but the
-    # ContractItem's confirmed product name is absent.
-    MISSING_CONTRACT_ITEM_PRODUCT_NAME = "MISSING_CONTRACT_ITEM_PRODUCT_NAME"
-    # IP-P05 comparison required by the item association but the
-    # InvoiceItem's confirmed product name is absent.
-    MISSING_INVOICE_ITEM_PRODUCT_NAME = "MISSING_INVOICE_ITEM_PRODUCT_NAME"
-
-    # -- Rule-violation codes (frozen accountant-confirmed rule
-    #    conflicted by current Facts; status RULE_CONFLICT) --
-
-    # IP-P03 violation: more than one PURCHASE invoice is currently
-    # allocated to this procurement Contract ("must not be split"). No
-    # historical Fact is deleted or mutated, and nothing is claimed to
-    # be "overdue".
-    MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT = "MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT"
-    # IP-P04 violation: one PURCHASE invoice is currently allocated to
-    # more than one procurement Contract. The invoice is never silently
-    # apportioned.
-    PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS = "PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS"
-    # IP-P02 violation: the single associated PURCHASE invoice's gross
-    # amount is not equal to the Contract gross amount (exact Decimal
-    # comparison). A frozen-rule conflict — never worded as
-    # "unpaid"/"outstanding"/"overdue".
-    PURCHASE_INVOICE_AMOUNT_MISMATCH = "PURCHASE_INVOICE_AMOUNT_MISMATCH"
-    # IP-P05 violation: an explicitly associated InvoiceItem and
-    # ContractItem both have confirmed product names and they are not
-    # exactly equal. A frozen-rule conflict — never worded as
-    # "unpaid"/"outstanding"/"overdue".
-    PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH = "PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH"
 
 
 class SupplierRequestAdvisoryCode:
-    """Explicit NON-BLOCKING finding codes (Phase 2D.3-F1d). An advisory
-    records a frozen accountant-confirmed rule consequence that is
-    factual context — it is emitted alongside the exposed Facts, never
-    drives the decision status, and never states what should be done
-    about it. ``status`` is derived from blockers only; an advisory code
-    belongs to no blocker class (disjoint from
-    ``RULE_VIOLATION_BLOCKER_CODES`` and ``MISSING_FACT_BLOCKER_CODES``,
-    enforced by test)."""
+    """Explicit NON-BLOCKING management finding codes (Phase 2D.3-F1d
+    re-leveling). An advisory records a frozen accountant-confirmed rule
+    consequence that is a management reminder / review signal — a
+    legitimate business state management should review or follow up. It
+    never drives ``status``, never blocks invoice preparation, and is
+    recomputed from current Facts on every evaluation (a finding
+    disappears as soon as the Facts change)."""
 
-    # IP-P01 advisory: the scope carries OUT payment Facts. Payment is
-    # context, never a gate — the request is neither enabled nor blocked
-    # by it, and no readiness is derived from it.
-    OUT_PAYMENT_PRESENT_CONTEXT_ONLY = "OUT_PAYMENT_PRESENT_CONTEXT_ONLY"
-    # IP-P06 advisory: an actual PURCHASE InvoiceItem's tax_rate is
-    # reachable as an existing Fact. The Fact is displayed as it is; no
-    # tax-rate recommendation or inference exists anywhere.
-    EXISTING_INVOICE_ITEM_TAX_RATE_FACT = "EXISTING_INVOICE_ITEM_TAX_RATE_FACT"
+    # IP-P03 advisory: more than one PURCHASE invoice is currently
+    # allocated to this procurement Contract. A management review signal,
+    # NOT a violation — the split is legitimate business state and every
+    # Fact stays preserved.
+    MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT = "MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT"
+    # IP-P04 advisory: one PURCHASE invoice is currently allocated to more
+    # than one procurement Contract (an M:N association). Not a violation,
+    # and the invoice is never silently apportioned.
+    PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS = "PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS"
+    # IP-P02 deviation: the single associated PURCHASE invoice's gross
+    # amount differs from the Contract gross amount (exact Decimal
+    # comparison). The invoice Fact stays valid; this is a management
+    # review signal on the preparation amount reference.
+    PURCHASE_INVOICE_AMOUNT_DEVIATION = "PURCHASE_INVOICE_AMOUNT_DEVIATION"
+    # IP-P05 deviation: an explicitly associated InvoiceItem and
+    # ContractItem both have confirmed product names and they are not
+    # exactly equal. A management review signal, not a violation.
+    PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION = "PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION"
+    # IP-P09 follow-up: at least one confirmed OUT payment is currently
+    # allocated but NO PURCHASE Invoice Fact is associated yet — paid, no
+    # invoice, recommend supplier invoice follow-up (已付款，尚未收到对应
+    # 进项发票，建议催供应商开票). Not overdue, not a rule conflict, not a
+    # payment-required gate, not a chronology finding. Disappears on
+    # recomputation once a PURCHASE invoice is associated. No Task is
+    # persisted (a later stage may promote this to a Task workflow).
+    SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED = "SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED"
 
 
 # The advisory codes, defined once — exhaustive over
 # SupplierRequestAdvisoryCode's members (enforced by test) and disjoint
-# from both blocker classes, because an advisory never participates in
-# the status precedence.
+# from the blocker class, because an advisory never participates in the
+# status derivation.
 NON_BLOCKING_ADVISORY_CODES: frozenset[str] = frozenset(
     {
-        SupplierRequestAdvisoryCode.OUT_PAYMENT_PRESENT_CONTEXT_ONLY,
-        SupplierRequestAdvisoryCode.EXISTING_INVOICE_ITEM_TAX_RATE_FACT,
+        SupplierRequestAdvisoryCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT,
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS,
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_AMOUNT_DEVIATION,
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION,
+        SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED,
     }
 )
 
 
-# The two blocker classes, defined once — the decision status is derived
-# from exactly this classification (RULE_CONFLICT > INSUFFICIENT_FACTS >
-# PREPARATION_AMOUNT_DETERMINABLE). Exhaustive over
-# SupplierRequestBlockerCode's members (enforced by test).
-RULE_VIOLATION_BLOCKER_CODES: frozenset[str] = frozenset(
-    {
-        SupplierRequestBlockerCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT,
-        SupplierRequestBlockerCode.PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS,
-        SupplierRequestBlockerCode.PURCHASE_INVOICE_AMOUNT_MISMATCH,
-        SupplierRequestBlockerCode.PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH,
-    }
-)
+# The blocker class, defined once — the decision status is derived from
+# exactly this classification (INSUFFICIENT_FACTS when a member is
+# present, otherwise PREPARATION_AMOUNT_DETERMINABLE). Exhaustive over
+# SupplierRequestBlockerCode's members (enforced by test). A code never
+# overlaps the advisory codes (enforced by test).
 MISSING_FACT_BLOCKER_CODES: frozenset[str] = frozenset(
     {
         SupplierRequestBlockerCode.MISSING_CONTRACT_GROSS_AMOUNT,
-        SupplierRequestBlockerCode.MISSING_PURCHASE_INVOICE_FACT,
-        SupplierRequestBlockerCode.MISSING_CONTRACT_ITEM_PRODUCT_NAME,
-        SupplierRequestBlockerCode.MISSING_INVOICE_ITEM_PRODUCT_NAME,
     }
 )
 
 
 class SupplierRequestCheckOutcome:
     """Exact comparison outcomes — never tolerant, never a business
-    judgment. MISMATCH is a factual outcome and is never worded as
+    judgment. DEVIATION is a factual outcome and is never worded as
     unpaid / outstanding / overdue."""
 
     MATCH = "MATCH"
-    MISMATCH = "MISMATCH"
+    DEVIATION = "DEVIATION"
     NOT_COMPARABLE_MISSING_FACT = "NOT_COMPARABLE_MISSING_FACT"
 
 
@@ -263,10 +237,9 @@ ITEM_NAME_CONSISTENCY_CHECK_NAME = "INVOICE_ITEM_PRODUCT_NAME_VS_CONTRACT_ITEM_P
 
 @dataclass(frozen=True)
 class SupplierRequestBlocker:
-    """One explicit blocker on a procurement Contract scope — a frozen
-    rule the current Facts conflict with (IP-P02 / IP-P03 / IP-P04 /
-    IP-P05 mismatches and cardinality), or a compared Fact/value a
-    required comparison needs but that is absent."""
+    """One explicit blocker on a procurement Contract scope — the
+    genuinely-required preparation data that is absent
+    (``MISSING_CONTRACT_GROSS_AMOUNT``)."""
 
     code: str
     # The procurement Contract scope the blocker is emitted on.
@@ -274,33 +247,35 @@ class SupplierRequestBlocker:
     # PURCHASE invoice ids the blocker is about (empty when no invoice
     # is involved, e.g. the missing-contract-amount case).
     related_invoice_ids: tuple[uuid.UUID, ...] = ()
-    # Procurement Contract ids involved (IP-P04: every contract the
-    # offending invoice is currently allocated to, this scope's included).
+    # Procurement Contract ids involved.
     related_contract_ids: tuple[uuid.UUID, ...] = ()
-    # ContractItem ids the blocker is about (missing/mismatched product
-    # name on the contract side).
+    # ContractItem ids the blocker is about.
     related_contract_item_ids: tuple[uuid.UUID, ...] = ()
-    # InvoiceItem ids the blocker is about (missing/mismatched product
-    # name on the invoice side).
+    # InvoiceItem ids the blocker is about.
     related_invoice_item_ids: tuple[uuid.UUID, ...] = ()
     note: str | None = None
 
 
 @dataclass(frozen=True)
 class SupplierRequestAdvisory:
-    """One explicit NON-BLOCKING finding on a procurement Contract scope
-    (Phase 2D.3-F1d). An advisory records a frozen accountant-confirmed
-    rule consequence that is factual context only (IP-P01 OUT payment
-    Facts present; IP-P06 existing InvoiceItem tax_rate Fact displayed).
-    Advisories NEVER affect the decision ``status`` — status is a
-    function of blockers alone. Like blockers, an advisory states what
-    the Facts are, never what should be done about it."""
+    """One explicit NON-BLOCKING management finding on a procurement
+    Contract scope (Phase 2D.3-F1d re-leveling). An advisory records a
+    frozen accountant-confirmed rule consequence that is a management
+    reminder / review signal — legitimate business state worth a review
+    or follow-up. Advisories NEVER affect the decision ``status`` —
+    status is a function of blockers alone — and are recomputed from
+    current Facts on every evaluation."""
 
     code: str
     # The procurement Contract scope the advisory is emitted on.
     contract_id: uuid.UUID
-    # InvoiceItem ids the advisory is about (IP-P06: the items whose
-    # existing tax_rate Fact is displayed).
+    # PURCHASE invoice ids the advisory is about (IP-P03 cardinality,
+    # IP-P04 spanning, IP-P02 / IP-P05 deviation).
+    related_invoice_ids: tuple[uuid.UUID, ...] = ()
+    # Procurement Contract ids involved (IP-P04: every contract the
+    # offending invoice is currently allocated to, this scope's included).
+    related_contract_ids: tuple[uuid.UUID, ...] = ()
+    # InvoiceItem ids the advisory is about (IP-P05 deviation).
     related_invoice_item_ids: tuple[uuid.UUID, ...] = ()
     note: str | None = None
 
@@ -311,7 +286,8 @@ class SupplierRequestAmountCheck:
     PURCHASE invoice's gross amount against the Contract gross amount,
     exact ``Decimal`` equality (existing canonical M001 semantics; no
     tolerance invented). ``None`` compared amount(s) mean the Fact was
-    missing — always ``NOT_COMPARABLE_MISSING_FACT``."""
+    missing — always ``NOT_COMPARABLE_MISSING_FACT``, a check result
+    only (never a blocker, never a status change)."""
 
     check_name: str
     contract_id: uuid.UUID
@@ -345,7 +321,7 @@ class PurchaseInvoiceContractAssociation:
     the invoice id and EVERY procurement Contract id it is currently
     allocated to across the complete F0 context. This is the Fact-level
     mapping IP-P04 is evaluated over (and the audit trail for each
-    emitted IP-P04 blocker)."""
+    emitted IP-P04 advisory)."""
 
     invoice_id: uuid.UUID
     contract_ids: tuple[uuid.UUID, ...]
@@ -355,14 +331,15 @@ class PurchaseInvoiceContractAssociation:
 class SupplierInvoiceRequestDecision:
     """One procurement Contract scope's request-preparation Decision.
     Carries facts, the IP-P02 expected amount, check results, blockers
-    and non-blocking advisories only — no readiness/eligibility field,
-    no requested quantity, no tax-rate recommendation.
+    and non-blocking management advisories only — no readiness/
+    eligibility field, no requested quantity, no tax-rate
+    recommendation.
 
     The existing PURCHASE invoice / item / OUT payment associations are
     the F0 context's own frozen DTO entries, exposed verbatim (one
     source of truth): through them an actual InvoiceItem's ``tax_rate``
-    is reachable as an existing Fact (IP-P06), and OUT payments are
-    visible as context without gating anything (IP-P01)."""
+    is reachable as an existing Fact (IP-P06, CONTEXT), and OUT payments
+    are visible as context without gating anything (IP-P01)."""
 
     contract_id: uuid.UUID
     contract_no: str
@@ -380,7 +357,8 @@ class SupplierInvoiceRequestDecision:
     amount_checks: tuple[SupplierRequestAmountCheck, ...] = ()
     item_name_checks: tuple[SupplierRequestItemNameCheck, ...] = ()
     blockers: tuple[SupplierRequestBlocker, ...] = ()
-    # Explicit NON-BLOCKING findings (IP-P01 / IP-P06). Never affect
+    # Explicit NON-BLOCKING management findings (IP-P09 / IP-P02 /
+    # IP-P05 deviation, IP-P03 / IP-P04 cardinality). Never affect
     # ``status`` — status is derived from blockers alone.
     advisories: tuple[SupplierRequestAdvisory, ...] = ()
 
@@ -451,10 +429,13 @@ def _evaluate_scope(
 ) -> SupplierInvoiceRequestDecision:
     contract = scope.contract
     blockers: list[SupplierRequestBlocker] = []
+    advisories: list[SupplierRequestAdvisory] = []
 
     # A. IP-P02 — the expected purchase invoice gross amount is the
     # Contract's own gross amount. Unknown amount => explicit
-    # missing-fact blocker; nothing is estimated or substituted.
+    # missing-fact blocker (the ONLY blocker this rule layer emits:
+    # genuinely-required preparation data absent); nothing is estimated
+    # or substituted.
     if contract.gross_amount is None:
         blockers.append(
             SupplierRequestBlocker(
@@ -469,33 +450,38 @@ def _evaluate_scope(
     # B. IP-P03 — PURCHASE invoice cardinality on this Contract, from the
     # direction-isolated F0 associations. Zero is a factual state only:
     # nothing is claimed to be missing, late, or overdue. More than one
-    # distinct PURCHASE invoice is a deterministic rule violation.
+    # distinct PURCHASE invoice is a management review signal — a split
+    # is legitimate business state, so this is an ADVISORY, never a
+    # conflict, and every Fact stays preserved.
     invoice_ids_in_scope: list[uuid.UUID] = []
     for entry in scope.invoice_allocations:
         if entry.allocation.invoice_id not in invoice_ids_in_scope:
             invoice_ids_in_scope.append(entry.allocation.invoice_id)
     if len(invoice_ids_in_scope) > 1:
-        blockers.append(
-            SupplierRequestBlocker(
-                code=SupplierRequestBlockerCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT,
+        advisories.append(
+            SupplierRequestAdvisory(
+                code=SupplierRequestAdvisoryCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT,
                 contract_id=contract.id,
                 related_invoice_ids=tuple(invoice_ids_in_scope),
+                note="multiple PURCHASE invoices on one Contract — management review, not a violation (IP-P03)",
             )
         )
 
     # C. IP-P04 — one PURCHASE invoice must not cover multiple
     # procurement Contracts. Judged over the complete-context mapping,
-    # surfaced on every involved scope. The invoice is never silently
-    # apportioned and no historical Fact is touched.
+    # surfaced on every involved scope. An M:N relationship is not a
+    # business error: this is an ADVISORY, and the invoice is never
+    # silently apportioned and no historical Fact is touched.
     for invoice_id in invoice_ids_in_scope:
         involved = invoice_contract_map.get(invoice_id, ())
         if len(involved) > 1:
-            blockers.append(
-                SupplierRequestBlocker(
-                    code=SupplierRequestBlockerCode.PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS,
+            advisories.append(
+                SupplierRequestAdvisory(
+                    code=SupplierRequestAdvisoryCode.PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS,
                     contract_id=contract.id,
                     related_invoice_ids=(invoice_id,),
                     related_contract_ids=tuple(sorted(involved, key=str)),
+                    note="one PURCHASE invoice spans multiple Contracts — M:N association, never apportioned (IP-P04)",
                 )
             )
 
@@ -506,15 +492,14 @@ def _evaluate_scope(
     # the confirmed allocation carries that same amount). Exact Decimal
     # equality; no tolerance.
     #
-    # MISMATCH conflicts with the frozen accountant-confirmed rule: the
-    # PURCHASE_INVOICE_AMOUNT_MISMATCH blocker is emitted and the scope
-    # becomes RULE_CONFLICT (never worded as "unpaid"/"outstanding"/
-    # "overdue"). Where the comparison cannot be performed because the
-    # compared Fact/value is absent, the check is
-    # NOT_COMPARABLE_MISSING_FACT and an explicit missing-fact blocker
-    # is emitted (the unknown Contract amount is already named by step
-    # A's MISSING_CONTRACT_GROSS_AMOUNT — never duplicated here) — that
-    # is fact incompleteness, NOT a rule conflict.
+    # A DEVIATION is a management-review ADVISORY — the invoice Fact
+    # stays valid, never a rule conflict, never worded as
+    # "unpaid"/"outstanding"/"overdue". Where the comparison cannot be
+    # performed because the compared Fact/value is absent, the check is
+    # NOT_COMPARABLE_MISSING_FACT — a check result ONLY, never a
+    # blocker, never a status change (the unknown Contract amount is
+    # already named by step A's MISSING_CONTRACT_GROSS_AMOUNT — never
+    # duplicated here).
     amount_checks: list[SupplierRequestAmountCheck] = []
     if len(invoice_ids_in_scope) == 1:
         invoice_id = invoice_ids_in_scope[0]
@@ -523,13 +508,6 @@ def _evaluate_scope(
             None,
         )
         if invoice_fact is None:
-            blockers.append(
-                SupplierRequestBlocker(
-                    code=SupplierRequestBlockerCode.MISSING_PURCHASE_INVOICE_FACT,
-                    contract_id=contract.id,
-                    related_invoice_ids=(invoice_id,),
-                )
-            )
             amount_checks.append(
                 SupplierRequestAmountCheck(
                     check_name=AMOUNT_CONSISTENCY_CHECK_NAME,
@@ -558,7 +536,7 @@ def _evaluate_scope(
             outcome = (
                 SupplierRequestCheckOutcome.MATCH
                 if invoice_fact.gross_amount == contract.gross_amount
-                else SupplierRequestCheckOutcome.MISMATCH
+                else SupplierRequestCheckOutcome.DEVIATION
             )
             amount_checks.append(
                 SupplierRequestAmountCheck(
@@ -570,12 +548,13 @@ def _evaluate_scope(
                     outcome=outcome,
                 )
             )
-            if outcome == SupplierRequestCheckOutcome.MISMATCH:
-                blockers.append(
-                    SupplierRequestBlocker(
-                        code=SupplierRequestBlockerCode.PURCHASE_INVOICE_AMOUNT_MISMATCH,
+            if outcome == SupplierRequestCheckOutcome.DEVIATION:
+                advisories.append(
+                    SupplierRequestAdvisory(
+                        code=SupplierRequestAdvisoryCode.PURCHASE_INVOICE_AMOUNT_DEVIATION,
                         contract_id=contract.id,
                         related_invoice_ids=(invoice_id,),
+                        note="PURCHASE invoice gross amount deviates from the Contract reference — management review (IP-P02)",
                     )
                 )
 
@@ -586,18 +565,15 @@ def _evaluate_scope(
     # beyond the Domain's frozen one (counterparty only), no
     # HS/tax-classification inference.
     #
-    # MISMATCH conflicts with the frozen accountant-confirmed rule: the
-    # PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH blocker is emitted per
-    # conflicting association and the scope becomes RULE_CONFLICT
-    # (never worded as "unpaid"/"outstanding"/"overdue"). A missing
-    # name (or missing InvoiceItem Fact) is NOT_COMPARABLE_MISSING_FACT
-    # — NOT a rule conflict; it collects an explicit missing-fact
-    # blocker (deduplicated per absent side) and makes the scope at
-    # least INSUFFICIENT_FACTS.
+    # A DEVIATION is a management-review ADVISORY per conflicting
+    # invoice (the invoice Fact stays valid — never a rule conflict). A
+    # missing name (or missing InvoiceItem Fact) is
+    # NOT_COMPARABLE_MISSING_FACT — a check result ONLY: the optional
+    # management comparison is unavailable and does NOT block
+    # preparation.
     item_by_id = {item.id: item for item in scope.items}
     item_name_checks: list[SupplierRequestItemNameCheck] = []
-    missing_contract_item_name_ids: list[uuid.UUID] = []
-    missing_invoice_item_name_ids: list[uuid.UUID] = []
+    deviation_items_by_invoice: dict[uuid.UUID, list[uuid.UUID]] = {}
     for entry in scope.invoice_item_allocations:
         contract_item = item_by_id.get(entry.allocation.contract_item_id)
         contract_name = contract_item.product_name if contract_item is not None else None
@@ -608,7 +584,7 @@ def _evaluate_scope(
             outcome = (
                 SupplierRequestCheckOutcome.MATCH
                 if contract_name == invoice_name
-                else SupplierRequestCheckOutcome.MISMATCH
+                else SupplierRequestCheckOutcome.DEVIATION
             )
         item_name_checks.append(
             SupplierRequestItemNameCheck(
@@ -622,85 +598,55 @@ def _evaluate_scope(
                 outcome=outcome,
             )
         )
-        if outcome == SupplierRequestCheckOutcome.MISMATCH:
-            blockers.append(
-                SupplierRequestBlocker(
-                    code=SupplierRequestBlockerCode.PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH,
-                    contract_id=contract.id,
-                    related_invoice_ids=(entry.invoice.id,) if entry.invoice is not None else (),
-                    related_contract_item_ids=(entry.allocation.contract_item_id,),
-                    related_invoice_item_ids=(entry.allocation.invoice_item_id,),
-                )
-            )
-        elif outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT:
-            if contract_name is None:
-                missing_contract_item_name_ids.append(entry.allocation.contract_item_id)
-            if invoice_name is None:
-                missing_invoice_item_name_ids.append(entry.allocation.invoice_item_id)
-    if missing_contract_item_name_ids:
-        blockers.append(
-            SupplierRequestBlocker(
-                code=SupplierRequestBlockerCode.MISSING_CONTRACT_ITEM_PRODUCT_NAME,
-                contract_id=contract.id,
-                related_contract_item_ids=tuple(sorted(set(missing_contract_item_name_ids), key=str)),
-            )
-        )
-    if missing_invoice_item_name_ids:
-        blockers.append(
-            SupplierRequestBlocker(
-                code=SupplierRequestBlockerCode.MISSING_INVOICE_ITEM_PRODUCT_NAME,
-                contract_id=contract.id,
-                related_invoice_item_ids=tuple(sorted(set(missing_invoice_item_name_ids), key=str)),
-            )
-        )
-
-    # F. IP-P01 — OUT payment associations are exposed as context only
-    # and never gate the request. The advisory channel records the rule
-    # consequence explicitly: a scope carrying OUT payment Facts gets an
-    # OUT_PAYMENT_PRESENT_CONTEXT_ONLY advisory, and the status is
-    # untouched — no readiness is derived from payment anywhere.
-    # G. IP-P06 — no tax rate is produced or inferred anywhere in this
-    # decision. An actual InvoiceItem's tax_rate is displayed only as
-    # the existing Fact it is: reachable through
-    # invoice_item_allocations AND named by an
-    # EXISTING_INVOICE_ITEM_TAX_RATE_FACT advisory (no recommendation).
-    # H. IP-P07 — no quantity is calculated anywhere; the quantity basis
-    # is an unresolved safe blocker (docs/PHASE2D3-RULE-FREEZE.md).
-
-    advisories: list[SupplierRequestAdvisory] = []
-    if scope.payment_allocations:
+        if outcome == SupplierRequestCheckOutcome.DEVIATION:
+            invoice_id = entry.invoice_item.invoice_id
+            deviation_items_by_invoice.setdefault(invoice_id, []).append(entry.allocation.invoice_item_id)
+    for invoice_id, invoice_item_ids in deviation_items_by_invoice.items():
         advisories.append(
             SupplierRequestAdvisory(
-                code=SupplierRequestAdvisoryCode.OUT_PAYMENT_PRESENT_CONTEXT_ONLY,
+                code=SupplierRequestAdvisoryCode.PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION,
                 contract_id=contract.id,
-                note="out payment Fact(s) exposed as context only; payment never gates a request (IP-P01)",
-            )
-        )
-    tax_rate_invoice_item_ids: list[uuid.UUID] = []
-    for entry in scope.invoice_item_allocations:
-        if (
-            entry.invoice_item is not None
-            and entry.invoice_item.tax_rate is not None
-            and entry.invoice_item.id not in tax_rate_invoice_item_ids
-        ):
-            tax_rate_invoice_item_ids.append(entry.invoice_item.id)
-    if tax_rate_invoice_item_ids:
-        advisories.append(
-            SupplierRequestAdvisory(
-                code=SupplierRequestAdvisoryCode.EXISTING_INVOICE_ITEM_TAX_RATE_FACT,
-                contract_id=contract.id,
-                related_invoice_item_ids=tuple(tax_rate_invoice_item_ids),
-                note="existing InvoiceItem tax_rate displayed as the Fact it is; no inference, no recommendation (IP-P06)",
+                related_invoice_ids=(invoice_id,),
+                related_invoice_item_ids=tuple(sorted(set(invoice_item_ids), key=str)),
+                note="invoice product name deviates from the contract product name — management review (IP-P05)",
             )
         )
 
-    # Status precedence: a frozen-rule conflict outranks fact
-    # incompleteness, which outranks the clean determinable state. Every
-    # blocker code belongs to exactly one of the two classes (enforced
+    # F. IP-P09 — paid but no PURCHASE invoice yet is a management
+    # follow-up. At least one confirmed OUT payment currently allocated
+    # AND no PURCHASE invoice associated yet =>
+    # SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED. Not overdue, not a rule
+    # conflict, not payment-required, not an eligibility gate, not a
+    # chronology finding. The advisory disappears on recomputation as
+    # soon as a PURCHASE invoice is associated, and no Task is persisted
+    # (a later stage may promote this to a Task workflow).
+    # G. IP-P01 — OUT payment associations are exposed as context only
+    # and never gate the request. Payment is CONTEXT: no status/advisory
+    # derives from payment ordering, and there is no payment-presence
+    # advisory — the only payment-derived finding is the IP-P09 follow-up
+    # above (paid + no invoice), never a payment-state signal.
+    # H. IP-P06 — no tax rate is produced or inferred anywhere in this
+    # decision. An actual InvoiceItem's tax_rate is CONTEXT, displayed
+    # only as the existing Fact it is, reachable through
+    # invoice_item_allocations — no advisory is emitted for its presence.
+    # I. IP-P07 — no quantity is calculated anywhere; the quantity basis
+    # is unresolved (docs/PHASE2D3-RULE-FREEZE.md).
+    if scope.payment_allocations and not invoice_ids_in_scope:
+        advisories.append(
+            SupplierRequestAdvisory(
+                code=SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED,
+                contract_id=contract.id,
+                note="paid, but no PURCHASE invoice associated yet — recommend supplier invoice follow-up "
+                "(已付款，尚未收到对应进项发票，建议催供应商开票) (IP-P09)",
+            )
+        )
+
+    # Status: derived from the blocker class alone (INSUFFICIENT_FACTS
+    # when genuinely-required data is absent, otherwise
+    # PREPARATION_AMOUNT_DETERMINABLE). Advisories never participate.
+    # Every blocker code belongs to MISSING_FACT_BLOCKER_CODES (enforced
     # by test), so the classification is total.
-    if any(b.code in RULE_VIOLATION_BLOCKER_CODES for b in blockers):
-        status = SupplierRequestDecisionStatus.RULE_CONFLICT
-    elif any(b.code in MISSING_FACT_BLOCKER_CODES for b in blockers):
+    if any(b.code in MISSING_FACT_BLOCKER_CODES for b in blockers):
         status = SupplierRequestDecisionStatus.INSUFFICIENT_FACTS
     else:
         status = SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE

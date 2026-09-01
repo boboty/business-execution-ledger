@@ -1,11 +1,23 @@
-"""Phase 2D.3-F1a — SALES_INVOICE_PREPARATION rule foundation.
+"""Phase 2D.3-F1a — SALES_INVOICE_PREPARATION rule foundation (re-leveled
+in Phase 2D.3-F1d).
 
-Covers the frozen three-required-input rule layer over the F0 fact
-context: explicit blockers when a required input is missing, the M:N
-shipment-judgment deferral (never any/all under multiple links),
-customer only from SalesContract.customer (and never a fourth blocker),
-the Fact -> Decision layering (read-only, pure), and the reserved
-(empty) 一致性校验 seam. Independently synthetic data throughout.
+Covers the frozen three-input rule layer over the F0 fact context, on
+independently synthetic data. SALES_INVOICE_PREPARATION is NOT a process
+gate: the three inputs report FACT COMPLETENESS / COMPARISON AVAILABILITY,
+never invoice eligibility:
+
+- the genuinely-required input is the SalesContract (present by
+  construction); a missing link (management/context linkage) and a
+  missing Shipment (export-management anchor) NEVER emit a blocker and
+  NEVER change the status — the comparison they would feed is simply
+  recorded unavailable;
+- under M:N the any/all shipment judgment is not frozen — the shipment
+  input is recorded NOT_JUDGED_UNDER_MN_UNRESOLVED, never a blocker, and
+  the M:N linked-contract facts stay visible;
+- customer only from SalesContract.customer (never a fourth input, never
+  a finding);
+- the Fact -> Decision layering (read-only, pure), and the reserved
+  (empty) 一致性校验 seam.
 """
 
 from __future__ import annotations
@@ -27,6 +39,7 @@ from bel.application.sales_invoice_preparation import (
     REQUIRED_INPUT_ORDER,
     SALES_INVOICE_CONSISTENCY_CHECK_NAMES,
     SalesInvoicePreparationDecision,
+    SalesPreparationBlocker,
     SalesPreparationBlockerCode,
     SalesPreparationDecisionStatus,
     SalesPreparationRequiredInput,
@@ -154,7 +167,7 @@ def _invalidate_link(session, link_id, fragment):
 
 
 # ---------------------------------------------------------------------------
-# The three required inputs
+# The three inputs — fact completeness / comparison availability
 # ---------------------------------------------------------------------------
 
 
@@ -184,24 +197,33 @@ def test_three_required_inputs_present_single_link_with_shipment(db_session):
     assert decision.customer == "Customer A"
 
 
-def test_missing_link_emits_explicit_blocker_and_shipment_not_judged(db_session):
+def test_missing_link_is_no_eligibility_blocker_comparison_unavailable(db_session):
+    """The link is a management/context linkage, not an eligibility input:
+    a scope with NO current link stays INPUTS_PRESENT with zero blockers;
+    the link input is recorded as comparison-unavailable, and the
+    shipment input is not judged (nothing to judge it on)."""
     frag = _make_fragment(db_session)
     _make_sales_contract(db_session, frag.id, "SC-F1A-2")
     db_session.commit()
 
     decision = evaluate_sales_invoice_preparation(db_session).decisions[0]
-    assert decision.status == SalesPreparationDecisionStatus.INSUFFICIENT_FACTS
-    codes = [b.code for b in decision.blockers]
-    # Exactly the missing required input is named — no invented extra
-    # blockers, and no shipment claim (nothing was checked).
-    assert codes == [SalesPreparationBlockerCode.NO_CURRENT_PROCUREMENT_LINK]
+    assert decision.status == SalesPreparationDecisionStatus.INPUTS_PRESENT
+    assert decision.blockers == ()
+    link_input = decision.required_inputs[1]
+    assert link_input.present is False
+    assert link_input.source_fact_ids == ()
+    assert link_input.note == "PROCUREMENT_COMPARISON_UNAVAILABLE_NO_LINK"
     shipment_input = decision.required_inputs[2]
     assert shipment_input.present is False
     assert shipment_input.note == "NOT_JUDGED_NO_LINKED_CONTRACT"
     assert shipment_input.source_fact_ids == ()
 
 
-def test_superseded_link_counts_as_missing(db_session):
+def test_superseded_link_is_no_eligibility_blocker_comparison_unavailable(db_session):
+    """Current links only — a superseded episode is not a current linked
+    procurement Contract (repository predicate reused, never re-derived).
+    The missing linkage still never blocks: INPUTS_PRESENT, zero
+    blockers."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-F1A-2")
     sales_contract = _make_sales_contract(db_session, frag.id, "SC-F1A-3")
@@ -210,13 +232,16 @@ def test_superseded_link_counts_as_missing(db_session):
     db_session.commit()
 
     decision = evaluate_sales_invoice_preparation(db_session).decisions[0]
-    # Current links only — a superseded episode is not a current linked
-    # procurement Contract (repository predicate reused, never re-derived).
-    assert decision.status == SalesPreparationDecisionStatus.INSUFFICIENT_FACTS
-    assert [b.code for b in decision.blockers] == [SalesPreparationBlockerCode.NO_CURRENT_PROCUREMENT_LINK]
+    assert decision.status == SalesPreparationDecisionStatus.INPUTS_PRESENT
+    assert decision.blockers == ()
+    assert decision.required_inputs[1].present is False
 
 
-def test_missing_shipment_on_single_link_emits_blocker(db_session):
+def test_missing_shipment_is_no_eligibility_blocker_comparison_unavailable(db_session):
+    """The Shipment is an export-management anchor, not an eligibility
+    input: a scope with a current link but NO Shipment stays INPUTS_PRESENT
+    with zero blockers — the export comparison is recorded unavailable,
+    never "may not issue invoice"."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-F1A-3")
     sales_contract = _make_sales_contract(db_session, frag.id, "SC-F1A-4")
@@ -224,12 +249,15 @@ def test_missing_shipment_on_single_link_emits_blocker(db_session):
     db_session.commit()
 
     decision = evaluate_sales_invoice_preparation(db_session).decisions[0]
-    assert decision.status == SalesPreparationDecisionStatus.INSUFFICIENT_FACTS
-    assert [b.code for b in decision.blockers] == [
-        SalesPreparationBlockerCode.NO_SHIPMENT_FACT_ON_LINKED_CONTRACT
-    ]
-    assert decision.blockers[0].related_contract_ids == (contract.id,)
-    assert decision.required_inputs[2].present is False
+    assert decision.status == SalesPreparationDecisionStatus.INPUTS_PRESENT
+    assert decision.blockers == ()
+    # The linked contract stays visible as the comparison scope.
+    assert decision.required_inputs[1].present is True
+    assert decision.required_inputs[1].source_fact_ids == (contract.id,)
+    shipment_input = decision.required_inputs[2]
+    assert shipment_input.present is False
+    assert shipment_input.note == "EXPORT_COMPARISON_UNAVAILABLE"
+    assert shipment_input.source_fact_ids == ()
 
 
 def test_shipments_on_unlinked_contract_do_not_satisfy_input(db_session):
@@ -242,25 +270,30 @@ def test_shipments_on_unlinked_contract_do_not_satisfy_input(db_session):
     db_session.commit()
 
     decision = evaluate_sales_invoice_preparation(db_session).decisions[0]
-    # The shipment input is scoped to the LINKED contract only.
-    assert [b.code for b in decision.blockers] == [
-        SalesPreparationBlockerCode.NO_SHIPMENT_FACT_ON_LINKED_CONTRACT
-    ]
-    assert decision.required_inputs[2].source_fact_ids == ()
+    # The shipment input is scoped to the LINKED contract only — a
+    # shipment on an unlinked contract is never attributed to it. Still
+    # never an eligibility blocker.
+    assert decision.status == SalesPreparationDecisionStatus.INPUTS_PRESENT
+    assert decision.blockers == ()
+    shipment_input = decision.required_inputs[2]
+    assert shipment_input.present is False
+    assert shipment_input.note == "EXPORT_COMPARISON_UNAVAILABLE"
+    assert shipment_input.source_fact_ids == ()
 
 
 # ---------------------------------------------------------------------------
-# M:N — never any/all shipment judgment
+# M:N — never any/all shipment judgment, never a blocker
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("with_shipments", ["none", "one", "both"])
-def test_mn_shipment_judgment_always_deferred(db_session, with_shipments):
+def test_mn_shipment_judgment_always_unresolved_never_blocker(db_session, with_shipments):
     """Under multiple current links the any/all shipment rule is NOT
-    frozen: even when every linked contract has shipments, the rule must
-    not claim the input present, and even when none does, it must not
-    claim a specific contract lacks it — one explicit deferral blocker
-    instead, always."""
+    frozen: even when every linked contract has shipments, the shipment
+    input is NOT judged; even when none does, no specific contract is
+    claimed to lack one — one explicit unresolved-comparison note instead,
+    always, and NEVER a blocker (Phase 2D.3-F1d re-leveling). The M:N
+    linked-contract facts stay visible."""
     frag = _make_fragment(db_session)
     contract_a = _make_contract(db_session, frag.id, "PO-F1A-6A")
     contract_b = _make_contract(db_session, frag.id, "PO-F1A-6B")
@@ -274,19 +307,19 @@ def test_mn_shipment_judgment_always_deferred(db_session, with_shipments):
     db_session.commit()
 
     decision = evaluate_sales_invoice_preparation(db_session).decisions[0]
-    assert [b.code for b in decision.blockers] == [
-        SalesPreparationBlockerCode.SHIPMENT_JUDGMENT_DEFERRED_MULTIPLE_LINKS
-    ]
-    assert decision.status == SalesPreparationDecisionStatus.INSUFFICIENT_FACTS
+    assert decision.status == SalesPreparationDecisionStatus.INPUTS_PRESENT
+    assert decision.blockers == ()
+    # M:N facts stay visible: every currently-linked contract id is on
+    # the link input, resolved or not.
+    assert set(decision.required_inputs[1].source_fact_ids) == {contract_a.id, contract_b.id}
     shipment_input = decision.required_inputs[2]
     assert shipment_input.present is False
-    assert shipment_input.note == "NOT_JUDGED_UNDER_MN"
+    assert shipment_input.note == "NOT_JUDGED_UNDER_MN_UNRESOLVED"
     assert shipment_input.source_fact_ids == ()
-    assert set(decision.blockers[0].related_contract_ids) == {contract_a.id, contract_b.id}
 
 
 # ---------------------------------------------------------------------------
-# customer semantics — fact only, never a fourth blocker
+# customer semantics — fact only, never a fourth input
 # ---------------------------------------------------------------------------
 
 
@@ -300,8 +333,8 @@ def test_unknown_customer_stays_unknown_and_adds_no_blocker(db_session):
 
     decision = evaluate_sales_invoice_preparation(db_session).decisions[0]
     # Unknown customer is preserved as unknown — surfaced as a fact, NOT
-    # judged: the three required inputs are present, so the status is
-    # INPUTS_PRESENT even with customer None.
+    # judged: customer presence is deliberately NOT one of the three
+    # inputs and adds no finding here.
     assert decision.customer is None
     assert decision.status == SalesPreparationDecisionStatus.INPUTS_PRESENT
     assert decision.blockers == ()
@@ -366,6 +399,26 @@ def test_status_and_dto_vocabulary_carry_no_eligibility_concept():
         for f in dataclasses.fields(dto_type):
             for token in banned_tokens:
                 assert token not in f.name.lower(), f"{dto_type.__name__}.{f.name} carries banned concept {token!r}"
+
+
+def test_only_genuinely_required_sales_scope_data_would_be_insufficient():
+    """INSUFFICIENT_FACTS is reserved for genuinely-required sales-scope
+    data (the SalesContract) being missing — where preparation data
+    cannot be built. The F0 construction provides a SalesContract for
+    every sales scope, so — exactly like the schema-backstopped supplier
+    amount path — the status member is deterministic but unreachable
+    today. The re-leveled model proves the reachable inverse: the
+    blocker vocabulary is empty, so NO code path can derive
+    INSUFFICIENT_FACTS from a missing link, a missing Shipment, or the
+    M:N deferral."""
+    statuses = {
+        v for k, v in vars(SalesPreparationDecisionStatus).items() if not k.startswith("_") and isinstance(v, str)
+    }
+    assert statuses == {"INPUTS_PRESENT", "INSUFFICIENT_FACTS"}
+    blocker_codes = {
+        v for k, v in vars(SalesPreparationBlockerCode).items() if not k.startswith("_") and isinstance(v, str)
+    }
+    assert blocker_codes == set()
 
 
 def test_evaluation_is_strictly_read_only(db_session):
@@ -477,4 +530,11 @@ def test_report_covers_every_sales_scope(db_session):
     assert {d.sales_contract_id for d in report.decisions} == {sc1.id, sc2.id}
     by_no = {d.sales_contract_no: d for d in report.decisions}
     assert by_no["SC-F1A-11A"].status == SalesPreparationDecisionStatus.INPUTS_PRESENT
-    assert by_no["SC-F1A-11B"].status == SalesPreparationDecisionStatus.INSUFFICIENT_FACTS
+    assert by_no["SC-F1A-11A"].required_inputs[1].present is True
+    # SC-F1A-11B has no current link — the linkage is management context
+    # only, so it stays INPUTS_PRESENT with zero blockers and the link
+    # input recorded comparison-unavailable.
+    sc2_decision = by_no["SC-F1A-11B"]
+    assert sc2_decision.status == SalesPreparationDecisionStatus.INPUTS_PRESENT
+    assert sc2_decision.blockers == ()
+    assert sc2_decision.required_inputs[1].present is False
