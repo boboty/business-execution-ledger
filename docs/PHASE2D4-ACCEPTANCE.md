@@ -131,6 +131,25 @@ F1/F2. They are the product contract of the Center.
     `docs/V1-SCOPE.md`, `docs/ROADMAP.md`, `docs/DOMAIN.md` (Task /
     Exception) and with the source.
 
+## How to run — F1 (read-only Exception & Task Center)
+
+The read-only Center is implemented over the frozen F0 semantics:
+
+```bash
+.venv/bin/python -m pytest tests/integration/test_unresolved_work_center.py   # F1 application projection
+.venv/bin/python -m pytest tests/web/test_web_exceptions.py                    # F1 Web surface
+.venv/bin/python -m pytest tests/unit/test_period_close_rules.py tests/web/test_web_period_close.py \
+    tests/integration/test_contract_business_ledger.py tests/web/test_web_contract_ledger.py \
+    tests/web/test_web_invoice_preparation.py                                   # directly relevant neighbors
+python tools/privacy_scan.py --staged                    # must PASS
+python tools/check_migration_immutability.py --staged    # must PASS
+git diff --check                                         # must be clean
+```
+
+F1 adds no schema/migration (no `unresolved_work` table, no new columns),
+no generic RESOLVE endpoint, and no advisory→Task promotion. The F0
+frozen invariants above are unchanged.
+
 ## Explicitly out of scope (F0, and until explicitly re-opened)
 
 - The Center UI / Web surface (F1).

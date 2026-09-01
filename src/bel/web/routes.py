@@ -39,6 +39,11 @@ from bel.application.period_close_export import (
 )
 from bel.application.period_close_workbench import get_period_close_workbench, list_known_periods
 from bel.application.search_contracts import search_contracts_by_no
+from bel.application.unresolved_work_center import (
+    UnresolvedWorkFilters,
+    get_unresolved_work_center,
+    validate_period,
+)
 from bel.infrastructure.persistence.database import is_database_busy
 from bel.web import viewmodels
 
@@ -295,6 +300,62 @@ def contract_ledger_export_xlsx(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=contract-business-ledger.xlsx"},
+    )
+
+
+def _uuid_query_param(q, name: str) -> uuid.UUID | None:
+    raw = q.get(name)
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{name} must be a valid UUID") from exc
+
+
+def _unresolved_work_filters_from_query(request: Request) -> UnresolvedWorkFilters:
+    """Phase 2D.4-F1 — web only parses query args; the Application layer
+    (UnresolvedWorkFilters / get_unresolved_work_center) owns filter
+    semantics — no SQL/raw field expression is ever built here. An invalid
+    period or a malformed scope id is an explicit 400, never silently
+    ignored."""
+    q = request.query_params
+    period = q.get("period") or None
+    if period is not None:
+        try:
+            validate_period(period)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return UnresolvedWorkFilters(
+        status=q.get("status") or None,
+        open_only=_bool_filter(q.get("open_only")),
+        source_type=q.get("source_type") or None,
+        code=q.get("code") or None,
+        procurement_contract_id=_uuid_query_param(q, "procurement_contract_id"),
+        sales_contract_id=_uuid_query_param(q, "sales_contract_id"),
+        period=period,
+    )
+
+
+@router.get("/exceptions", response_class=HTMLResponse)
+def exceptions_page(
+    request: Request,
+    session: Session = Depends(_session),
+) -> HTMLResponse:
+    """Phase 2D.4-F1 — 异常与任务中心. Strictly read-only: the whole
+    handler runs under no_autoflush (so a pending object can never be
+    written by the projection) and there is no POST/action surface — the
+    page is a neutral read projection over persisted TaskExceptions,
+    HUMAN_CONFIRMATION_REQUIRED MatchCases, and (only when a period is
+    requested) the recomputed Period Close blockers."""
+    with session.no_autoflush:
+        filters = _unresolved_work_filters_from_query(request)
+        center = get_unresolved_work_center(session, filters=filters)
+        # The VM's scope-display lookups are reads too — kept under
+        # no_autoflush so nothing pending can ever be written by them.
+        vm = viewmodels.UnresolvedWorkCenterVM(center, session)
+    return _templates(request).TemplateResponse(
+        request, "exceptions.html", {"page": "exceptions", "vm": vm}
     )
 
 

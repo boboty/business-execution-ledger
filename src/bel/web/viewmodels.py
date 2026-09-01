@@ -54,9 +54,28 @@ from bel.application.supplier_invoice_request import (
     SupplierRequestBlockerCode,
     SupplierRequestCheckOutcome,
 )
+from bel.application.unresolved_work_center import (
+    ComputedBlockerStatus,
+    ResolutionRoute,
+    ScopeType,
+    SourceType,
+    UnresolvedWorkCenter,
+    UnresolvedWorkFilters,
+    UnresolvedWorkItem,
+    UnresolvedWorkScope,
+)
 from bel.domain.contract import ContractItem
+from bel.domain.exception import ExceptionStatus
 from bel.domain.invoice import InvoiceDirection
+from bel.domain.matching import MatchCaseStatus
 from bel.domain.payment import PaymentDirection
+from bel.infrastructure.persistence.repositories import (
+    ContractItemRepository,
+    ContractRepository,
+    SalesContractRepository,
+    ShipmentRepository,
+)
+from sqlalchemy.orm import Session
 
 # ---- Blocker business copy (Presentation only — existence/type of a
 # blocker is decided exclusively by period_close.py). ----
@@ -1210,3 +1229,154 @@ class InvoicePreparationVM:
         self.sales_scope_count = len(self.sales_scopes)
         self.supplier_scope_count = len(self.supplier_scopes)
         self.page_note = INVOICE_PREPARATION_PAGE_NOTE
+
+
+# ---------------------------------------------------------------------------
+# Phase 2D.4-F1 — /exceptions — the read-only Exception & Task Center.
+# Presentation only: source labels, scope display, resolution guidance.
+# No write control of any kind is built here (docs/PHASE2D4-DECISIONS.md §6,
+# §13, §15) and the page itself is GET-only with zero business-state writes.
+# ---------------------------------------------------------------------------
+
+EXCEPTION_CENTER_SOURCE_LABELS = {
+    SourceType.TASK_EXCEPTION: "系统任务",
+    SourceType.MATCH_CASE: "待确认匹配",
+    SourceType.COMPUTED_BLOCKER: "月结阻断项",
+}
+
+EXCEPTION_CENTER_ROUTE_LABELS = {
+    ResolutionRoute.CONFIRM_MATCH: "去确认匹配",
+    ResolutionRoute.CONFIRM_RELATIONSHIP: "补充销售合同客户信息",
+    ResolutionRoute.SUPPLY_FACT: "补充/确认业务事实",
+    ResolutionRoute.REVIEW_ONLY: "查看并人工处理",
+}
+
+CENTER_SCOPE_TYPE_LABELS = {
+    ScopeType.PROCUREMENT_CONTRACT: "采购合同",
+    ScopeType.SALES_CONTRACT: "销售合同",
+    ScopeType.CONTRACT_ITEM: "合同商品",
+    ScopeType.SHIPMENT: "出运/出口",
+}
+
+CENTER_STATUS_LABELS = {
+    ExceptionStatus.OPEN: "未解决",
+    ExceptionStatus.RESOLVED: "已解决",
+    MatchCaseStatus.HUMAN_CONFIRMATION_REQUIRED: "待人工确认",
+    ComputedBlockerStatus.PRESENT: "本期存在",
+}
+
+CENTER_PERIOD_REQUIRED_NOTE = "月结阻断项需选择期间后计算。"
+CENTER_UNLOCATABLE_SCOPE_NOTE = "尚未形成可定位的业务对象"
+CENTER_COMPUTED_EPHEMERAL_NOTE = "本期计算 · 未持久化"
+
+
+def _fmt_datetime(value) -> str:
+    if value is None:
+        return "—"
+    return value.strftime("%Y-%m-%d %H:%M")
+
+
+class _ScopeDisplayResolver:
+    """Display-only resolution of a structured scope id to its canonical
+    business display value (contract_no, sales_contract_no, ...) through
+    existing repositories — never summary-text parsing. A missing object
+    never errors: the structured id stays the truthful fallback
+    (docs/PHASE2D4-DECISIONS.md §14). Read-only; constructed under the
+    route's ``session.no_autoflush``."""
+
+    def __init__(self, session: Session) -> None:
+        self._contracts = ContractRepository(session)
+        self._sales = SalesContractRepository(session)
+        self._items = ContractItemRepository(session)
+        self._shipments = ShipmentRepository(session)
+
+    def display(self, scope: UnresolvedWorkScope) -> str:
+        if scope.scope_type == ScopeType.PROCUREMENT_CONTRACT:
+            contract = self._contracts.get(scope.scope_id)
+            return contract.contract_no if contract is not None else str(scope.scope_id)
+        if scope.scope_type == ScopeType.SALES_CONTRACT:
+            sales = self._sales.get(scope.scope_id)
+            return sales.sales_contract_no if sales is not None else str(scope.scope_id)
+        if scope.scope_type == ScopeType.CONTRACT_ITEM:
+            item = self._items.get(scope.scope_id)
+            if item is not None:
+                return item.source_item_key or item.product_name or str(scope.scope_id)
+            return str(scope.scope_id)
+        if scope.scope_type == ScopeType.SHIPMENT:
+            shipment = self._shipments.get(scope.scope_id)
+            if shipment is not None:
+                return shipment.external_reference or str(scope.scope_id)
+            return str(scope.scope_id)
+        return str(scope.scope_id)
+
+
+class UnresolvedWorkScopeVM:
+    def __init__(self, scope: UnresolvedWorkScope, resolver: _ScopeDisplayResolver) -> None:
+        self.scope_type = scope.scope_type
+        self.scope_id = scope.scope_id
+        self.type_label = CENTER_SCOPE_TYPE_LABELS.get(scope.scope_type, scope.scope_type)
+        self.display = resolver.display(scope)
+        # Deep-link ONLY where an existing safe GET surface is stable: the
+        # procurement Contract 360 page. Sales contracts have no such page.
+        self.link_url = (
+            f"/contracts/{scope.scope_id}" if scope.scope_type == ScopeType.PROCUREMENT_CONTRACT else None
+        )
+
+
+class UnresolvedWorkItemVM:
+    def __init__(self, item: UnresolvedWorkItem, resolver: _ScopeDisplayResolver) -> None:
+        self.source_type = item.source_type
+        self.source_type_label = EXCEPTION_CENTER_SOURCE_LABELS.get(item.source_type, item.source_type)
+        self.code = item.code
+        self.status = item.status
+        self.status_label = CENTER_STATUS_LABELS.get(item.status, item.status)
+        self.summary = item.summary
+        self.created_at = _fmt_datetime(item.created_at)
+        self.scopes = [UnresolvedWorkScopeVM(s, resolver) for s in item.scopes]
+        self.has_scope = bool(self.scopes)
+        self.no_scope_note = CENTER_UNLOCATABLE_SCOPE_NOTE
+        self.resolution_route = item.resolution_route
+        self.resolution_route_label = EXCEPTION_CENTER_ROUTE_LABELS.get(
+            item.resolution_route, item.resolution_route
+        )
+        # Computed blockers are visibly non-persisted current-period results.
+        self.is_computed = item.source_type == SourceType.COMPUTED_BLOCKER
+        self.computed_ephemeral_note = CENTER_COMPUTED_EPHEMERAL_NOTE
+        self.procurement_contract_id = item.procurement_contract_id
+        self.sales_contract_id = item.sales_contract_id
+        self.invoice_id = item.invoice_id
+        self.payment_id = item.payment_id
+        self.shipment_id = item.shipment_id
+        self.match_case_id = item.match_case_id
+        self.provenance = item.provenance
+
+
+class UnresolvedWorkFiltersVM:
+    def __init__(self, filters: UnresolvedWorkFilters) -> None:
+        self.status = filters.status or ""
+        self.open_only = filters.open_only
+        self.source_type = filters.source_type or ""
+        self.code = filters.code or ""
+        self.procurement_contract_id = str(filters.procurement_contract_id) if filters.procurement_contract_id else ""
+        self.sales_contract_id = str(filters.sales_contract_id) if filters.sales_contract_id else ""
+        self.period = filters.period or ""
+
+
+class UnresolvedWorkCenterVM:
+    """Presentation of the ONE Application projection. Resolves scope ids to
+    display values through repositories (read-only); the route builds this
+    under ``session.no_autoflush``."""
+
+    def __init__(self, center: UnresolvedWorkCenter, session: Session) -> None:
+        resolver = _ScopeDisplayResolver(session)
+        self.items = [UnresolvedWorkItemVM(i, resolver) for i in center.items]
+        self.filters = UnresolvedWorkFiltersVM(center.filters)
+        self.total = center.counts.get("total", 0)
+        self.task_count = center.counts.get(SourceType.TASK_EXCEPTION, 0)
+        self.match_count = center.counts.get(SourceType.MATCH_CASE, 0)
+        self.computed_count = center.counts.get(SourceType.COMPUTED_BLOCKER, 0)
+        # When period is selected the page shows it clearly; without a
+        # period there is deliberately no timeless blocker set and the page
+        # states that 月结阻断项 require a period (§13).
+        self.period = center.filters.period
+        self.period_note = None if self.period else CENTER_PERIOD_REQUIRED_NOTE

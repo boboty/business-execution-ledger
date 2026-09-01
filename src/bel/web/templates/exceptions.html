@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}异常与任务中心 · BEL{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <h1>异常与任务中心</h1>
+  <p class="page-subtitle">一个中立的全局未结工作只读视图：系统任务、待确认匹配与月结阻断项。来源不同、语义不同，仅在同一读投影中汇总；本页不做任何写入，也不提供通用"标记解决"。</p>
+</div>
+
+<section class="panel">
+  <h2>筛选</h2>
+  <form class="ledger-filter-form" method="get" action="/exceptions">
+    <div class="filter-field">
+      <label for="f-source-type">来源</label>
+      <select id="f-source-type" name="source_type">
+        <option value="">全部</option>
+        <option value="TASK_EXCEPTION" {% if vm.filters.source_type == 'TASK_EXCEPTION' %}selected{% endif %}>系统任务</option>
+        <option value="MATCH_CASE" {% if vm.filters.source_type == 'MATCH_CASE' %}selected{% endif %}>待确认匹配</option>
+        <option value="COMPUTED_BLOCKER" {% if vm.filters.source_type == 'COMPUTED_BLOCKER' %}selected{% endif %}>月结阻断项</option>
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="f-status">状态</label>
+      <select id="f-status" name="status">
+        <option value="">全部</option>
+        <option value="OPEN" {% if vm.filters.status == 'OPEN' %}selected{% endif %}>未解决（OPEN）</option>
+        <option value="RESOLVED" {% if vm.filters.status == 'RESOLVED' %}selected{% endif %}>已解决（RESOLVED）</option>
+        <option value="HUMAN_CONFIRMATION_REQUIRED" {% if vm.filters.status == 'HUMAN_CONFIRMATION_REQUIRED' %}selected{% endif %}>待人工确认</option>
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="f-code">类型代码</label>
+      <input id="f-code" type="text" name="code" value="{{ vm.filters.code }}" placeholder="如 BusinessKeyConflict">
+    </div>
+    <div class="filter-field">
+      <label for="f-procurement-id">采购合同 ID</label>
+      <input id="f-procurement-id" type="text" name="procurement_contract_id" value="{{ vm.filters.procurement_contract_id }}" placeholder="UUID">
+    </div>
+    <div class="filter-field">
+      <label for="f-sales-id">销售合同 ID</label>
+      <input id="f-sales-id" type="text" name="sales_contract_id" value="{{ vm.filters.sales_contract_id }}" placeholder="UUID">
+    </div>
+    <div class="filter-field">
+      <label for="f-period">期间（月结阻断项需选择期间）</label>
+      <input id="f-period" type="text" name="period" value="{{ vm.filters.period }}" placeholder="YYYY-MM">
+    </div>
+    <div class="form-actions">
+      <button type="submit">筛选</button>
+      <a class="back-link" href="/exceptions">清除筛选</a>
+    </div>
+  </form>
+  {% if vm.period %}
+  <p class="section-note section-note-muted">当前期间：<strong>{{ vm.period }}</strong> — 月结阻断项为该期间的最新计算结果。</p>
+  {% else %}
+  <p class="section-note">{{ vm.period_note }}</p>
+  {% endif %}
+  <p class="section-note section-note-muted">
+    共 {{ vm.total }} 项 · 系统任务 {{ vm.task_count }} · 待确认匹配 {{ vm.match_count }} · 月结阻断项 {{ vm.computed_count }}
+  </p>
+</section>
+
+<section class="panel">
+  <div class="table-scroll">
+  <table class="grid ledger-grid">
+    <thead>
+      <tr>
+        <th>来源</th>
+        <th>类型</th>
+        <th>状态</th>
+        <th>摘要</th>
+        <th>业务范围</th>
+        <th>处理入口</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in vm.items %}
+      <tr>
+        <td>
+          <span class="tag {% if item.is_computed %}tag-blocker{% elif item.source_type == 'MATCH_CASE' %}tag-match{% else %}tag-status{% endif %}">{{ item.source_type_label }}</span>
+          {% if item.is_computed %}<div class="section-note-muted">{{ item.computed_ephemeral_note }}</div>{% endif %}
+        </td>
+        <td class="mono">{{ item.code }}</td>
+        <td><span class="tag tag-none">{{ item.status_label }}</span></td>
+        <td>{{ item.summary }}</td>
+        <td>
+          {% if item.has_scope %}
+          <ul class="ledger-nested-list">
+            {% for scope in item.scopes %}
+            <li>
+              {{ scope.type_label }}
+              {% if scope.link_url %}<a class="mono" href="{{ scope.link_url }}">{{ scope.display }}</a>{% else %}<span class="mono">{{ scope.display }}</span>{% endif %}
+            </li>
+            {% endfor %}
+          </ul>
+          {% else %}
+          <span class="empty-cell">{{ item.no_scope_note }}</span>
+          {% endif %}
+        </td>
+        <td class="section-note-muted">{{ item.resolution_route_label }}</td>
+      </tr>
+      {% endfor %}
+      {% if not vm.items %}
+      <tr><td colspan="6" class="empty-state">没有符合筛选条件的未结事项。</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="panel">
+  <p class="section-note section-note-muted">处理入口仅为引导文字：这些事项通过既有的领域操作解决（确认匹配、补充客户信息、补充/确认业务事实）。本页是只读视图，不执行任何解决动作，也不提供任何完成、关闭或一键处理类操作。</p>
+</section>
+
+{% endblock %}

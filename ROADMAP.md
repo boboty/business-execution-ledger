@@ -278,6 +278,22 @@ each require a business rule freeze before becoming authoritative. F1
 (read-only Exception & Task Center) and F2 (Exception & Task Data
 Product) implement the frozen semantics.
 
+**F1 (read-only Exception & Task Center) is implemented**: one neutral
+Application projection (`get_unresolved_work_center` in
+`src/bel/application/unresolved_work_center.py`) aggregates persisted
+`TASK_EXCEPTION` rows (the full produced type set), persisted `MATCH_CASE`
+rows in `HUMAN_CONFIRMATION_REQUIRED` (both legs, candidate scopes
+preserved), and — only when a `period` is supplied — the recomputed
+Period Close blockers as `COMPUTED_BLOCKER` items with a deterministic,
+non-persisted `source_id`. The read-only Web surface `GET /exceptions`
+(异常与任务中心) renders the three sources with distinct labels, resolves
+scopes through structured fields/repository lookup (never `summary`
+parsing), keeps genuinely unmappable work visible, and performs zero
+business-state writes. Filters: status/open-only, source_type, code,
+procurement/sales contract scope, period. No generic RESOLVE, no new
+storage table, no migration, no advisory→Task promotion, and no R009–R015
+implementation.
+
 ## FIRST-STAGE CUTOVER GATE
 
 The point at which BEL may be declared the System of Record. Requires at
