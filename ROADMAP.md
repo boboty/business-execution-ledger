@@ -243,8 +243,15 @@ facts, more than one is the deterministic IP-P03 violation
 PURCHASE invoice -> procurement Contracts mapping with the IP-P04
 violation blocker (`PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS`, never
 silently apportioned). Exact amount and exact product-name consistency
-checks emit `MATCH` / `MISMATCH` / `NOT_COMPARABLE_MISSING_FACT` — a
-MISMATCH is a factual outcome, never "unpaid"/"outstanding"/"overdue".
+checks emit `MATCH` / `MISMATCH` / `NOT_COMPARABLE_MISSING_FACT`: a
+MISMATCH conflicts with the frozen accountant-confirmed rule
+(`PURCHASE_INVOICE_AMOUNT_MISMATCH` /
+`PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH`) and makes the scope decision
+`RULE_CONFLICT` — never worded as "unpaid"/"outstanding"/"overdue" —
+while a comparison that cannot be performed for an absent compared
+Fact/value emits an explicit missing-fact blocker and makes the scope
+decision at least `INSUFFICIENT_FACTS` (precedence: `RULE_CONFLICT` >
+`INSUFFICIENT_FACTS` > `PREPARATION_AMOUNT_DETERMINABLE`).
 OUT payments are exposed as context only (IP-P01); no tax-rate
 inference exists (IP-P06 — an actual InvoiceItem's `tax_rate` is
 reachable only as an existing Fact); no requested quantity is

@@ -118,8 +118,8 @@ value and not a tax calculation.
 
 ### IP-P03 — One procurement Contract → one PURCHASE invoice
 
-One procurement Contract is not expected to be split across multiple
-PURCHASE invoices.
+One procurement Contract must not be split across multiple PURCHASE
+invoices.
 
 **Source: `ACCOUNTANT_CONFIRMED`.**
 
@@ -156,7 +156,18 @@ quantity is not established. No quantity calculation may be invented.
 
 ---
 
-## Implementation status map (as of Phase 2D.3-F1b)
+## Implementation status map (as of Phase 2D.3-F1b + F1b pre-Gate repair)
+
+Semantics of the frozen-rule conflicts implemented by F1b: a MISMATCH
+of an IP-P02 amount comparison or an IP-P05 product-name comparison is
+a frozen-rule conflict (`PURCHASE_INVOICE_AMOUNT_MISMATCH` /
+`PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH`) and makes the scope decision
+`RULE_CONFLICT` — never worded as "unpaid"/"outstanding"/"overdue". A
+comparison required by an existing association that cannot be performed
+because the compared Fact/value is absent is NOT a rule conflict: it
+emits an explicit missing-fact blocker and makes the scope decision at
+least `INSUFFICIENT_FACTS`. Status precedence: `RULE_CONFLICT` >
+`INSUFFICIENT_FACTS` > `PREPARATION_AMOUNT_DETERMINABLE`.
 
 | Rule | Standing | Implementation |
 | --- | --- | --- |
@@ -165,9 +176,9 @@ quantity is not established. No quantity calculation may be invented.
 | IP-S03 | `OWNER_CONFIRMED_PROVISIONAL` | Respected by F1a (receipts never consulted) |
 | IP-S04 | `UNRESOLVED_SAFE_BLOCKER` | Safe blocker kept (F1a) |
 | IP-P01 | `ACCOUNTANT_CONFIRMED` | Respected by F1b (payments exposed as context only) |
-| IP-P02 | `ACCOUNTANT_CONFIRMED` | Implemented (F1b) |
-| IP-P03 | `ACCOUNTANT_CONFIRMED` | Implemented as deterministic violation check (F1b) |
+| IP-P02 | `ACCOUNTANT_CONFIRMED` | Implemented (F1b); amount MISMATCH → `PURCHASE_INVOICE_AMOUNT_MISMATCH` conflict; missing compared Fact/value → explicit missing-fact blocker |
+| IP-P03 | `ACCOUNTANT_CONFIRMED` | Implemented as deterministic violation check (F1b) — a Contract must not be split |
 | IP-P04 | `ACCOUNTANT_CONFIRMED` | Implemented as deterministic violation check (F1b) |
-| IP-P05 | `ACCOUNTANT_CONFIRMED` | Implemented as exact product-name check where item facts exist (F1b) |
+| IP-P05 | `ACCOUNTANT_CONFIRMED` | Implemented as exact product-name check where item facts exist (F1b); MISMATCH → `PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH` conflict; missing name → explicit missing-fact blocker |
 | IP-P06 | `ACCOUNTANT_CONFIRMED` | Respected by F1b (no inference; Facts only) |
 | IP-P07 | `UNRESOLVED_SAFE_BLOCKER` | No quantity calculation (F1b) |

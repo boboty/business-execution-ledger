@@ -490,10 +490,16 @@ def test_exact_amount_match(db_session):
     assert check.compared_invoice_gross_amount == Decimal("1000.00")
     assert check.contract_gross_amount == Decimal("1000.00")
     assert check.outcome == SupplierRequestCheckOutcome.MATCH
+    # MATCH conflicts with nothing: no blocker, clean preparation status.
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
     assert decision.blockers == ()
 
 
-def test_amount_mismatch_is_factual_not_overdue(db_session):
+def test_amount_mismatch_is_frozen_rule_conflict(db_session):
+    """IP-P02 is accountant-confirmed: an actual invoice amount unequal
+    to the Contract gross amount CONFLICTS with the frozen rule — the
+    mismatch blocker is emitted and the scope is RULE_CONFLICT. The
+    conflict is never worded as "unpaid"/"outstanding"/"overdue"."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-F1B-9", gross_amount=Decimal("1000.00"))
     invoice, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("800.00"))
@@ -502,20 +508,22 @@ def test_amount_mismatch_is_factual_not_overdue(db_session):
 
     decision = _decision_for(db_session, contract.id)
     assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.MISMATCH
-    # A MISMATCH is a factual comparison outcome — it is not a rule
-    # violation and never becomes "unpaid"/"outstanding"/"overdue": the
-    # status stays the IP-P02 preparation statement, with no blocker.
-    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
-    assert decision.blockers == ()
+    assert [b.code for b in decision.blockers] == [
+        SupplierRequestBlockerCode.PURCHASE_INVOICE_AMOUNT_MISMATCH
+    ]
+    assert decision.blockers[0].related_invoice_ids == (invoice.id,)
+    assert decision.status == SupplierRequestDecisionStatus.RULE_CONFLICT
 
 
 def test_missing_invoice_fact_amount_is_not_comparable():
     """A confirmed association whose Invoice Fact is missing cannot be
-    compared — NOT_COMPARABLE_MISSING_FACT, never a guessed amount. The
-    FK on invoice_allocations.invoice_id makes a dangling association
-    unreachable in storage, so the rule's deterministic outcome for the
-    F0 context's ``invoice is None`` shape is exercised over the
-    pure-function seam."""
+    compared: NOT_COMPARABLE_MISSING_FACT + the explicit
+    MISSING_PURCHASE_INVOICE_FACT missing-fact blocker, scope status
+    INSUFFICIENT_FACTS — never a guessed amount, never a rule conflict.
+    The FK on invoice_allocations.invoice_id makes a dangling
+    association unreachable in storage, so the rule's deterministic
+    outcome for the F0 context's ``invoice is None`` shape is exercised
+    over the pure-function seam."""
     contract_id, invoice_id = uuid.uuid4(), uuid.uuid4()
     contract = Contract(
         id=contract_id, contract_no="PO-F1B-10", contract_type=None, counterparty="Supplier",
@@ -543,8 +551,51 @@ def test_missing_invoice_fact_amount_is_not_comparable():
     assert check.compared_invoice_gross_amount is None
     assert check.contract_gross_amount == Decimal("1000.00")
     assert check.outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
-    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
-    assert decision.blockers == ()
+    assert [b.code for b in decision.blockers] == [
+        SupplierRequestBlockerCode.MISSING_PURCHASE_INVOICE_FACT
+    ]
+    assert decision.blockers[0].related_invoice_ids == (invoice_id,)
+    assert decision.status == SupplierRequestDecisionStatus.INSUFFICIENT_FACTS
+
+
+def test_missing_contract_amount_with_invoice_not_comparable_once():
+    """With the Contract amount unknown AND one associated invoice, the
+    comparison is NOT_COMPARABLE and step A's MISSING_CONTRACT_GROSS_AMOUNT
+    blocker names the absent value exactly once — the amount check never
+    emits a duplicate missing-fact blocker for the same gap."""
+    contract_id, invoice_id = uuid.uuid4(), uuid.uuid4()
+    contract = Contract(
+        id=contract_id, contract_no="PO-F1B-10B", contract_type=None, counterparty="Supplier",
+        buyer="Our Own Entity", gross_amount=None, currency="CNY",
+        contract_date=date(2026, 1, 1), current_source_fragment_id=uuid.uuid4(), created_at=NOW, updated_at=NOW,
+    )
+    invoice = Invoice(
+        id=invoice_id, direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="PINV-F1B-10B", issue_date=date(2031, 1, 10),
+        seller="Supplier", buyer="Our Own Entity", net_amount=Decimal("500.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("500.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW,
+    )
+    context = _context_with_scopes((SupplierScopeContext(
+        contract=contract, items=(), shipments=(),
+        invoice_allocations=(SupplierScopeInvoiceAllocation(
+            allocation=InvoiceAllocation(
+                id=uuid.uuid4(), invoice_id=invoice_id, contract_id=contract_id, match_case_id=uuid.uuid4(),
+                allocated_gross_amount=Decimal("500.00"),
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+            ),
+            invoice=invoice,
+        ),),
+        invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
+    ),))
+
+    decision = evaluate_supplier_invoice_request_from_context(context).decisions[0]
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
+    assert [b.code for b in decision.blockers] == [
+        SupplierRequestBlockerCode.MISSING_CONTRACT_GROSS_AMOUNT
+    ]
+    assert decision.status == SupplierRequestDecisionStatus.INSUFFICIENT_FACTS
 
 
 # ---------------------------------------------------------------------------
@@ -567,9 +618,17 @@ def test_product_name_exact_match(db_session):
     assert check.contract_product_name == "Widget Alpha"
     assert check.invoice_product_name == "Widget Alpha"
     assert check.outcome == SupplierRequestCheckOutcome.MATCH
+    # MATCH conflicts with nothing: no blocker, clean preparation status.
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+    assert decision.blockers == ()
 
 
-def test_product_name_mismatch_is_factual(db_session):
+def test_product_name_mismatch_is_frozen_rule_conflict(db_session):
+    """IP-P05 is accountant-confirmed ("must match"): an explicitly
+    associated InvoiceItem and ContractItem with both product names
+    present and unequal CONFLICTS with the frozen rule — the mismatch
+    blocker is emitted and the scope is RULE_CONFLICT. The conflict is
+    never worded as "unpaid"/"outstanding"/"overdue"."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-F1B-12")
     item = _make_contract_item(db_session, contract, frag.id, product_name="Widget Alpha")
@@ -582,13 +641,21 @@ def test_product_name_mismatch_is_factual(db_session):
     assert check.outcome == SupplierRequestCheckOutcome.MISMATCH
     assert check.contract_product_name == "Widget Alpha"
     assert check.invoice_product_name == "Widget Beta"
-    # A name MISMATCH is a factual outcome, not a rule-violation status.
-    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
-    assert decision.blockers == ()
+    assert [b.code for b in decision.blockers] == [
+        SupplierRequestBlockerCode.PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH
+    ]
+    assert decision.blockers[0].related_contract_item_ids == (item.id,)
+    assert decision.blockers[0].related_invoice_item_ids == (invoice_item.id,)
+    assert decision.blockers[0].related_invoice_ids == (invoice.id,)
+    assert decision.status == SupplierRequestDecisionStatus.RULE_CONFLICT
 
 
 @pytest.mark.parametrize("missing_side", ["contract", "invoice"])
 def test_missing_product_name_is_not_comparable(db_session, missing_side):
+    """A comparison required by the item association but impossible for
+    an absent product name is fact incompleteness, NOT a rule conflict:
+    NOT_COMPARABLE_MISSING_FACT + the explicit missing-fact blocker,
+    scope status INSUFFICIENT_FACTS."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, f"PO-F1B-13-{missing_side}")
     item = _make_contract_item(
@@ -606,8 +673,65 @@ def test_missing_product_name_is_not_comparable(db_session, missing_side):
     # The name that IS known stays exposed as the Fact it is.
     if missing_side == "contract":
         assert check.contract_product_name is None and check.invoice_product_name == "Widget Alpha"
+        assert [b.code for b in decision.blockers] == [
+            SupplierRequestBlockerCode.MISSING_CONTRACT_ITEM_PRODUCT_NAME
+        ]
+        assert decision.blockers[0].related_contract_item_ids == (item.id,)
     else:
         assert check.contract_product_name == "Widget Alpha" and check.invoice_product_name is None
+        assert [b.code for b in decision.blockers] == [
+            SupplierRequestBlockerCode.MISSING_INVOICE_ITEM_PRODUCT_NAME
+        ]
+        assert decision.blockers[0].related_invoice_item_ids == (invoice_item.id,)
+    assert decision.status == SupplierRequestDecisionStatus.INSUFFICIENT_FACTS
+
+
+# ---------------------------------------------------------------------------
+# Status precedence — RULE_CONFLICT > INSUFFICIENT_FACTS > PREPARATION_AMOUNT_DETERMINABLE
+# ---------------------------------------------------------------------------
+
+
+def test_rule_conflict_precedence_over_missing_fact(db_session):
+    """IP-P03 (cardinality conflict) and a missing product name (fact
+    incompleteness) on the same scope: RULE_CONFLICT wins, and BOTH
+    blockers stay exposed — the conflict never masks the gap."""
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id, "PO-F1B-20")
+    item = _make_contract_item(db_session, contract, frag.id, product_name="Widget Alpha")
+    invoice1, invoice_item1 = _make_purchase_invoice(db_session, frag.id, product_name=None)
+    invoice2, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("400.00"))
+    _make_invoice_allocation(db_session, invoice1.id, contract, allocated=Decimal("600.00"))
+    _make_invoice_allocation(db_session, invoice2.id, contract, allocated=Decimal("400.00"))
+    _make_invoice_item_allocation(db_session, invoice_item1, item)
+    db_session.commit()
+
+    decision = _decision_for(db_session, contract.id)
+    assert decision.status == SupplierRequestDecisionStatus.RULE_CONFLICT
+    codes = [b.code for b in decision.blockers]
+    assert SupplierRequestBlockerCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT in codes
+    assert SupplierRequestBlockerCode.MISSING_INVOICE_ITEM_PRODUCT_NAME in codes
+    assert decision.item_name_checks[0].outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
+
+
+def test_mismatch_conflict_precedence_over_missing_fact(db_session):
+    """IP-P02 amount MISMATCH (rule conflict) and a missing contract
+    product name (fact incompleteness) on the same scope:
+    RULE_CONFLICT wins, and BOTH blockers stay exposed."""
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id, "PO-F1B-21", gross_amount=Decimal("1000.00"))
+    item = _make_contract_item(db_session, contract, frag.id, product_name=None)
+    invoice, invoice_item = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("800.00"))
+    _make_invoice_allocation(db_session, invoice.id, contract, allocated=Decimal("800.00"))
+    _make_invoice_item_allocation(db_session, invoice_item, item)
+    db_session.commit()
+
+    decision = _decision_for(db_session, contract.id)
+    assert decision.status == SupplierRequestDecisionStatus.RULE_CONFLICT
+    codes = [b.code for b in decision.blockers]
+    assert SupplierRequestBlockerCode.PURCHASE_INVOICE_AMOUNT_MISMATCH in codes
+    assert SupplierRequestBlockerCode.MISSING_CONTRACT_ITEM_PRODUCT_NAME in codes
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.MISMATCH
+    assert decision.item_name_checks[0].outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +845,21 @@ def test_status_and_dto_vocabulary_carry_no_business_judgment():
         "tax",
     )
     import bel.application.supplier_invoice_request as module
+
+    # Every blocker code belongs to exactly one of the two classes the
+    # status precedence derives from — the classification is total and
+    # the sets disjoint.
+    from bel.application.supplier_invoice_request import (
+        MISSING_FACT_BLOCKER_CODES,
+        RULE_VIOLATION_BLOCKER_CODES,
+        SupplierRequestBlockerCode,
+    )
+
+    all_codes = {
+        v for k, v in vars(SupplierRequestBlockerCode).items() if not k.startswith("_") and isinstance(v, str)
+    }
+    assert MISSING_FACT_BLOCKER_CODES | RULE_VIOLATION_BLOCKER_CODES == all_codes
+    assert MISSING_FACT_BLOCKER_CODES.isdisjoint(RULE_VIOLATION_BLOCKER_CODES)
 
     dto_types = [
         obj
