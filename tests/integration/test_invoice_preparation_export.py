@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import time
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -28,6 +30,7 @@ from bel.application.invoice_preparation import (
     SalesScopePaymentAllocation,
     SupplierScopeContext,
     SupplierScopeInvoiceAllocation,
+    SupplierScopeInvoiceItemAllocation,
     SupplierScopePaymentAllocation,
 )
 from bel.application.invoice_preparation_export import (
@@ -45,7 +48,9 @@ from bel.application.invoice_preparation_workbench import (
     get_invoice_preparation_workbench,
     get_invoice_preparation_workbench_from_context,
 )
-from bel.domain.contract import Contract
+from bel.domain.accrual import InvoiceItemAllocation
+from bel.domain.contract import Contract, ContractItem
+from bel.domain.invoice import Invoice, InvoiceDirection, InvoiceItem
 from bel.domain.matching import (
     AllocationMatchMethod,
     ConfirmationType,
@@ -214,10 +219,18 @@ def test_supplier_reference_amount_and_currency_exported(export_product):
 def test_supplier_p02_deviation_exported_advisory(export_product):
     row = _supplier_row(export_product, "PO-AMT")
     assert row.supplier_amount_check_outcome == "DEVIATION"
-    assert "kind=AMOUNT" in row.supplier_checks
-    assert "outcome=DEVIATION" in row.supplier_checks
-    assert "reference_amount=100.00" in row.supplier_checks
-    assert "invoice_amount=90.00" in row.supplier_checks
+    checks = json.loads(row.supplier_checks_json)
+    # PO-AMT also has a MATCHing item-name check; never a single fake
+    # "overall status" — the two checks are separate structured elements.
+    assert row.supplier_amount_check_count == 1
+    assert row.supplier_item_name_check_count == 1
+    amount = next(c for c in checks if c["kind"] == "AMOUNT")
+    assert amount["outcome"] == "DEVIATION"
+    assert amount["reference_amount"] == "100.00"
+    assert amount["invoice_amount"] == "90.00"
+    # The canonical F1 check_name and invoice id are preserved.
+    assert amount["check_name"] == "PURCHASE_INVOICE_GROSS_AMOUNT_VS_CONTRACT_GROSS_AMOUNT"
+    assert amount["invoice_id"]
     advisories = _attention_for(export_product, code="PURCHASE_INVOICE_AMOUNT_DEVIATION", contract_no="PO-AMT")
     assert len(advisories) == 1
     assert advisories[0].attention_category == ATTENTION_CATEGORY_MANAGEMENT_ADVISORY
@@ -226,8 +239,17 @@ def test_supplier_p02_deviation_exported_advisory(export_product):
 
 def test_supplier_p05_product_deviation_exported(export_product):
     row = _supplier_row(export_product, "PO-PROD")
-    assert "kind=ITEM_NAME" in row.supplier_checks
-    assert "outcome=DEVIATION" in row.supplier_checks
+    checks = json.loads(row.supplier_checks_json)
+    # PO-PROD also carries a MATCHing amount check (100 = 100) — separate
+    # structured elements, not one flattened status.
+    item = next(c for c in checks if c["kind"] == "ITEM_NAME")
+    assert item["outcome"] == "DEVIATION"
+    assert item["check_name"] == "INVOICE_ITEM_PRODUCT_NAME_VS_CONTRACT_ITEM_PRODUCT_NAME"
+    # The canonical P05 allocation/contract-item/invoice-item ids survive.
+    assert item["allocation_id"]
+    assert item["contract_item_id"]
+    assert item["invoice_item_id"]
+    assert row.supplier_item_name_deviation_count == 1
     advisories = _attention_for(export_product, code="PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION", contract_no="PO-PROD")
     assert len(advisories) == 1
     assert advisories[0].attention_category == ATTENTION_CATEGORY_MANAGEMENT_ADVISORY
@@ -460,3 +482,265 @@ def test_formula_injection_neutralized():
     header = [c.value for c in ws[1]]
     col = header.index("sales_contract_no") + 1
     assert str(ws.cell(row=2, column=col).value).startswith("'")
+
+
+# ---------------------------------------------------------------------------
+# F2b pre-Gate repair — traceability, structured JSON, scope identity,
+# and real determinism. All scenarios are pure F0 contexts (no Session).
+# ---------------------------------------------------------------------------
+
+
+def _pure_supplier_scope(contract, *, invoice_allocations=(), payment_allocations=(), shipments=(),
+                         items=(), invoice_item_allocations=()):
+    return SupplierScopeContext(
+        contract=contract, items=tuple(items), shipments=tuple(shipments),
+        invoice_allocations=tuple(invoice_allocations),
+        invoice_item_allocations=tuple(invoice_item_allocations),
+        payment_allocations=tuple(payment_allocations), unresolved_work=(),
+    )
+
+
+def _pure_sales_scope(sales_contract, *, invoice_allocations=(), payment_allocations=(), links=()):
+    return SalesScopeContext(
+        sales_contract=sales_contract,
+        linked_procurement_contracts=tuple(links),
+        invoice_allocations=tuple(invoice_allocations),
+        payment_allocations=tuple(payment_allocations), unresolved_work=(),
+    )
+
+
+def _pure_contract(no, *, gross=Decimal("100.00")):
+    return Contract(
+        id=uuid.uuid4(), contract_no=no, contract_type=None, counterparty="Supplier",
+        buyer="Our Own Entity", gross_amount=gross, currency="USD", contract_date=date(2026, 1, 1),
+        current_source_fragment_id=uuid.uuid4(), created_at=NOW, updated_at=NOW,
+    )
+
+
+def _pure_sales_contract(no, our_entity="Our Own Entity"):
+    return SalesContract(
+        id=uuid.uuid4(), our_entity=our_entity, sales_contract_no=no,
+        customer="Customer", currency="USD", gross_amount=Decimal("100.00"),
+        contract_date=date(2026, 1, 1), current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+
+
+def _pure_invoice(direction, key, *, gross=Decimal("100.00")):
+    return Invoice(
+        id=uuid.uuid4(), direction=direction, invoice_type=None, invoice_no=None, digital_invoice_no=None,
+        external_invoice_key=key, issue_date=date(2031, 1, 10), seller="Supplier", buyer="Our Own Entity",
+        net_amount=gross, tax_amount=Decimal("0"), gross_amount=gross, invoice_status=None,
+        source_fragment_id=uuid.uuid4(), created_at=NOW, updated_at=NOW, currency="USD",
+    )
+
+
+def _dangling_purchase_alloc(contract, invoice_id=None):
+    return SupplierScopeInvoiceAllocation(
+        allocation=InvoiceAllocation(
+            id=uuid.uuid4(), invoice_id=invoice_id or uuid.uuid4(), contract_id=contract.id,
+            match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+            match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+            confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+        ),
+        invoice=None,
+    )
+
+
+def _dangling_sales_invoice_alloc(sales_contract):
+    return SalesScopeInvoiceAllocation(
+        allocation=SalesInvoiceAllocation(
+            id=uuid.uuid4(), invoice_id=uuid.uuid4(), sales_contract_id=sales_contract.id,
+            match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+            confirmation_type=ConfirmationType.HUMAN_CONFIRMED, created_at=NOW,
+        ),
+        invoice=None,
+    )
+
+
+def _pure_two_contracts_shared_invoice():
+    contract_a, contract_b = _pure_contract("PO-SHARED-A"), _pure_contract("PO-SHARED-B")
+    invoice = _pure_invoice(InvoiceDirection.PURCHASE, "PINV-SHARED")
+
+    def alloc(contract):
+        return SupplierScopeInvoiceAllocation(
+            allocation=InvoiceAllocation(
+                id=uuid.uuid4(), invoice_id=invoice.id, contract_id=contract.id,
+                match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+            ),
+            invoice=invoice,
+        )
+
+    return InvoicePreparationContext(
+        sales_scopes=(),
+        supplier_scopes=(_pure_supplier_scope(contract_a, invoice_allocations=(alloc(contract_a),)),
+                         _pure_supplier_scope(contract_b, invoice_allocations=(alloc(contract_b),))),
+    )
+
+
+def _pure_duplicate_contract_no():
+    contract_a, contract_b = _pure_contract("DUP-1"), _pure_contract("DUP-1")
+    return InvoicePreparationContext(
+        sales_scopes=(),
+        supplier_scopes=(
+            _pure_supplier_scope(contract_a, invoice_allocations=(_dangling_purchase_alloc(contract_a),)),
+            _pure_supplier_scope(contract_b, invoice_allocations=(_dangling_purchase_alloc(contract_b),)),
+        ),
+    )
+
+
+def _pure_duplicate_sales_no():
+    sc_a, sc_b = _pure_sales_contract("DUP-SC", our_entity="Entity A"), _pure_sales_contract("DUP-SC", our_entity="Entity B")
+    return InvoicePreparationContext(
+        sales_scopes=(
+            _pure_sales_scope(sc_a, invoice_allocations=(_dangling_sales_invoice_alloc(sc_a),)),
+            _pure_sales_scope(sc_b, invoice_allocations=(_dangling_sales_invoice_alloc(sc_b),)),
+        ),
+        supplier_scopes=(),
+    )
+
+
+def _pure_dangerous_product_names():
+    contract = _pure_contract("PO-DANGER")
+    contract_item = ContractItem(
+        id=uuid.uuid4(), contract_id=contract.id, source_item_key="ITEM-DANGER", sku=None,
+        product_name="A;outcome=DEVIATION||B=C", specification=None, quantity=Decimal("1"), unit=None,
+        unit_price=None, gross_amount=Decimal("0"), tax_rate=None, net_amount=Decimal("0"),
+        current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    invoice = _pure_invoice(InvoiceDirection.PURCHASE, "PINV-DANGER")
+    invoice_item = InvoiceItem(
+        id=uuid.uuid4(), invoice_id=invoice.id, line_no=1, product_name="Widget", specification=None,
+        unit=None, quantity=Decimal("1"), unit_price=None, net_amount=Decimal("100.00"),
+        tax_rate=None, tax_amount=Decimal("0"), gross_amount=Decimal("100.00"), source_fragment_id=uuid.uuid4(),
+    )
+    item_alloc = SupplierScopeInvoiceItemAllocation(
+        allocation=InvoiceItemAllocation(
+            id=uuid.uuid4(), invoice_item_id=invoice_item.id, contract_item_id=contract_item.id,
+            allocated_quantity=Decimal("1"), allocated_net_amount=Decimal("100.00"),
+            confirmation_type="MANUAL_CONFIRMED", source_fragment_id=uuid.uuid4(), created_at=NOW,
+            superseded_by_fact_id=None,
+        ),
+        invoice_item=invoice_item,
+        invoice=invoice,
+    )
+    return InvoicePreparationContext(
+        sales_scopes=(),
+        supplier_scopes=(_pure_supplier_scope(contract, items=(contract_item,), invoice_item_allocations=(item_alloc,)),),
+    )
+
+
+def _pure_product(workbench):
+    return build_invoice_preparation_data_product(workbench)
+
+
+def test_xlsx_byte_identity_across_time_boundary(export_product):
+    """openpyxl stamps created/modified into docProps/core.xml and each zip
+    entry with the CURRENT time — the fixed workbook properties + zip
+    normalization must keep two exports byte-identical across a REAL second
+    boundary, not just back-to-back within one second."""
+    a = export_invoice_preparation_xlsx(export_product)
+    time.sleep(1.5)  # guarantee at least one wall-clock second boundary
+    b = export_invoice_preparation_xlsx(export_product)
+    assert a == b
+
+
+def test_sales_comparison_exports_trace_ids(export_product):
+    row = _sales_row(export_product, "SC-MTCH")
+    assert row.comparison_shipment_id
+    assert row.comparison_sales_invoice_id
+    assert row.comparison_shipment_id != row.comparison_sales_invoice_id
+    # The ambiguous declaration leg leaves the shipment trace None; the
+    # single confirmed invoice is still traced.
+    amb = _sales_row(export_product, "SC-AMB")
+    assert amb.comparison_shipment_id is None
+    assert amb.comparison_sales_invoice_id
+    # No confirmed invoice -> the invoice trace is None (missing Fact).
+    noinv = _sales_row(export_product, "SC-NOINV")
+    assert noinv.comparison_sales_invoice_id is None
+    assert noinv.comparison_shipment_id
+
+
+def test_supplier_p03_preserves_all_related_invoice_ids(export_product):
+    advisories = _attention_for(export_product, code="MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT", contract_no="PO-MULTI")
+    assert len(advisories) == 1
+    ids = json.loads(advisories[0].related_invoice_ids)
+    assert len(ids) == 2  # BOTH purchase invoices — never truncated to one
+
+
+def test_supplier_p04_preserves_all_related_contract_ids():
+    context = _pure_two_contracts_shared_invoice()
+    product = _pure_product(get_invoice_preparation_workbench_from_context(context))
+    advisories = [r for r in product.supplier_attention if r.attention_code == "PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS"]
+    assert len(advisories) == 2  # surfaced on every involved contract
+    for row in advisories:
+        ids = json.loads(row.related_contract_ids)
+        assert len(ids) == 2  # the offending invoice's FULL contract set
+        assert row.related_invoice_ids
+
+
+def test_sales_advisory_preserves_invoice_and_shipment_ids(export_product):
+    advisories = _attention_for(export_product, code="SALES_INVOICE_AMOUNT_DEVIATION", sales_no="SC-DEV")
+    assert len(advisories) == 1
+    invoice_ids = json.loads(advisories[0].related_invoice_ids)
+    shipment_ids = json.loads(advisories[0].related_shipment_ids)
+    assert len(invoice_ids) == 1 and len(shipment_ids) == 1
+    # They agree with the comparison's own trace ids on the row.
+    row = _sales_row(export_product, "SC-DEV")
+    assert invoice_ids[0] == row.comparison_sales_invoice_id
+    assert shipment_ids[0] == row.comparison_shipment_id
+
+
+def test_duplicate_contract_no_unambiguous_in_supplier_attention():
+    context = _pure_duplicate_contract_no()
+    product = _pure_product(get_invoice_preparation_workbench_from_context(context))
+    attention = product.supplier_attention
+    assert len(attention) == 2
+    assert all(r.contract_no == "DUP-1" for r in attention)
+    # contract_no is NOT unique — the procurement_contract_id distinguishes
+    # the two rows.
+    assert len({r.procurement_contract_id for r in attention}) == 2
+
+
+def test_same_sales_contract_no_unambiguous_in_sales_attention():
+    context = _pure_duplicate_sales_no()
+    product = _pure_product(get_invoice_preparation_workbench_from_context(context))
+    attention = product.sales_attention
+    assert len(attention) == 2
+    assert all(r.sales_contract_no == "DUP-SC" for r in attention)
+    # SalesContract identity is (our_entity, sales_contract_no) — the id
+    # column keeps the two rows unambiguous.
+    assert len({r.sales_contract_id for r in attention}) == 2
+
+
+def test_product_names_with_dangerous_chars_cannot_corrupt_checks_or_summary():
+    """Product names containing ';', '=' and '||' must not corrupt the
+    structured JSON check serialization, and the Summary must derive its
+    counts from the explicit neutral fields — never from parsing the
+    serialized text (a name like 'A;outcome=DEVIATION||B=C' would have
+    inflated a text-parsing counter)."""
+    context = _pure_dangerous_product_names()
+    product = _pure_product(get_invoice_preparation_workbench_from_context(context))
+    row = product.supplier_request[0]
+    checks = json.loads(row.supplier_checks_json)  # parses cleanly
+    item = next(c for c in checks if c["kind"] == "ITEM_NAME")
+    assert item["contract_product_name"] == "A;outcome=DEVIATION||B=C"
+    assert item["outcome"] == "DEVIATION"
+    # Explicit neutral counts are exact.
+    assert row.supplier_item_name_deviation_count == 1
+    assert row.supplier_item_name_check_count == 1
+    assert product.summary["supplier_item_name_check_DEVIATION"] == 1
+    assert product.summary["supplier_item_name_check_count"] == 1
+
+
+def test_summary_never_parses_serialized_check_text():
+    """The summary fields are computed from explicit neutral row fields;
+    no serialized text (supplier_checks_json / comparison_message) is ever
+    parsed to recover business structure."""
+    context = _pure_dangerous_product_names()
+    product = _pure_product(get_invoice_preparation_workbench_from_context(context))
+    # The dangerous-name scenario proves it: a naive text parse of the
+    # check JSON could not have produced these exact counts.
+    assert product.summary["supplier_item_name_check_DEVIATION"] == 1
+    assert product.summary["supplier_amount_check_count"] == 0

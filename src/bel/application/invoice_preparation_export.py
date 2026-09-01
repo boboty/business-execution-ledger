@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import re
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
@@ -68,6 +70,11 @@ ATTENTION_CATEGORY_INCOMPLETE_ASSOCIATION = "INCOMPLETE_ASSOCIATION"
 ATTENTION_CATEGORY_MANAGEMENT_ADVISORY = "MANAGEMENT_ADVISORY"
 
 _DANGEROUS_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+# Fixed XLSX created/modified timestamp so repeated exports of identical
+# state are byte-identical regardless of wall-clock time (openpyxl would
+# otherwise stamp the current time into docProps/core.xml).
+_FIXED_XLSX_DATETIME = datetime(1980, 1, 1, 0, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -159,14 +166,30 @@ class InvoicePreparationExportRow:
     declared_currency: str | None = None
     sales_invoice_amount: Decimal | None = None
     sales_invoice_currency: str | None = None
-    # Supplier P02 amount-check outcome (naturally 0 or 1 per contract) and
-    # the full deterministic serialization of ALL supplier checks.
+    # The F1f comparison's canonical trace identifiers — the resolved
+    # Shipment/Export Fact and confirmed SALES Invoice Fact the comparison
+    # was scoped to (None when missing or ambiguous). Never reconstructed.
+    comparison_shipment_id: str | None = None
+    comparison_sales_invoice_id: str | None = None
+    # Supplier P02 amount-check outcome (naturally 0 or 1 per contract),
+    # explicit check-count fields, and the full deterministic JSON
+    # serialization of ALL supplier checks.
     supplier_amount_check_outcome: str | None = None
-    supplier_checks: str | None = None
-    # Attention
+    supplier_amount_check_count: int | None = None
+    supplier_item_name_check_count: int | None = None
+    supplier_item_name_deviation_count: int | None = None
+    supplier_checks_json: str | None = None
+    # Attention — the canonical scope identity is carried on every
+    # attention row (contract_no / sales_contract_no alone are NOT unique),
+    # and management-advisory rows preserve their full canonical related-id
+    # sets as deterministic JSON arrays (never a truncated first id).
     attention_category: str | None = None
     attention_code: str | None = None
     attention_message: str | None = None
+    related_invoice_ids: str | None = None
+    related_contract_ids: str | None = None
+    related_invoice_item_ids: str | None = None
+    related_shipment_ids: str | None = None
     source_id: str | None = None
     allocated_amount: Decimal | None = None
 
@@ -267,10 +290,6 @@ def _incomplete_out_payments(scope) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-def _decimal_text(value: Decimal | None) -> str:
-    return format(value, "f") if value is not None else ""
-
-
 def _sales_preparation_row(scope, decision) -> InvoicePreparationExportRow:
     sc = scope.sales_contract
     check = decision.amount_check
@@ -293,6 +312,9 @@ def _sales_preparation_row(scope, decision) -> InvoicePreparationExportRow:
         declared_currency=check.declared_currency if check else None,
         sales_invoice_amount=check.sales_invoice_amount if check else None,
         sales_invoice_currency=check.sales_invoice_currency if check else None,
+        # The F1f comparison's resolved trace identifiers, verbatim.
+        comparison_shipment_id=str(check.shipment_id) if check and check.shipment_id else None,
+        comparison_sales_invoice_id=str(check.sales_invoice_id) if check and check.sales_invoice_id else None,
     )
 
 
@@ -301,15 +323,18 @@ def _incomplete_association_row(
     kind_key: str,
     allocation,
     *,
-    scope_key: str,
+    scope_id: str,
+    scope_no: str,
 ) -> InvoicePreparationExportRow:
     allocated = getattr(allocation, "allocated_gross_amount", None)
     if allocated is None:
         allocated = getattr(allocation, "allocated_amount", None)
     return InvoicePreparationExportRow(
         record_type=record_type,
-        sales_contract_no=scope_key if record_type == RECORD_TYPE_SALES_ATTENTION else None,
-        contract_no=scope_key if record_type == RECORD_TYPE_SUPPLIER_ATTENTION else None,
+        sales_contract_id=scope_id if record_type == RECORD_TYPE_SALES_ATTENTION else None,
+        sales_contract_no=scope_no if record_type == RECORD_TYPE_SALES_ATTENTION else None,
+        procurement_contract_id=scope_id if record_type == RECORD_TYPE_SUPPLIER_ATTENTION else None,
+        contract_no=scope_no if record_type == RECORD_TYPE_SUPPLIER_ATTENTION else None,
         attention_category=ATTENTION_CATEGORY_INCOMPLETE_ASSOCIATION,
         attention_code=None,  # no canonical code exists for this context
         attention_message=INCOMPLETE_ASSOCIATION_KIND_LABELS.get(kind_key, kind_key),
@@ -318,11 +343,17 @@ def _incomplete_association_row(
     )
 
 
-def _advisory_source_id(advisory) -> str | None:
-    for ids in (getattr(advisory, "related_invoice_ids", ()), getattr(advisory, "related_shipment_ids", ())):
-        for value in ids:
-            return str(value)
-    return None
+def _related_ids_json(ids) -> str | None:
+    """Deterministic JSON array of the advisory's full related-id set —
+    never truncated to a first id, never a fabricated trace."""
+    if not ids:
+        return None
+    return json.dumps(
+        sorted(str(value) for value in ids),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _sales_attention_rows(scope, decision) -> tuple[InvoicePreparationExportRow, ...]:
@@ -332,6 +363,7 @@ def _sales_attention_rows(scope, decision) -> tuple[InvoicePreparationExportRow,
         rows.append(
             InvoicePreparationExportRow(
                 record_type=RECORD_TYPE_SALES_ATTENTION,
+                sales_contract_id=str(sc.id),
                 sales_contract_no=sc.sales_contract_no,
                 attention_category=ATTENTION_CATEGORY_UNRESOLVED_WORK,
                 attention_code=work.exception_type,
@@ -340,54 +372,72 @@ def _sales_attention_rows(scope, decision) -> tuple[InvoicePreparationExportRow,
             )
         )
     for entry in _incomplete_sales_invoices(scope):
-        rows.append(_incomplete_association_row(RECORD_TYPE_SALES_ATTENTION, "SALES_INVOICE", entry.allocation, scope_key=sc.sales_contract_no))
+        rows.append(_incomplete_association_row(RECORD_TYPE_SALES_ATTENTION, "SALES_INVOICE", entry.allocation, scope_id=str(sc.id), scope_no=sc.sales_contract_no))
     for entry in _incomplete_sales_receipts(scope):
-        rows.append(_incomplete_association_row(RECORD_TYPE_SALES_ATTENTION, "SALES_RECEIPT", entry.allocation, scope_key=sc.sales_contract_no))
+        rows.append(_incomplete_association_row(RECORD_TYPE_SALES_ATTENTION, "SALES_RECEIPT", entry.allocation, scope_id=str(sc.id), scope_no=sc.sales_contract_no))
     for advisory in decision.advisories:
         rows.append(
             InvoicePreparationExportRow(
                 record_type=RECORD_TYPE_SALES_ATTENTION,
+                sales_contract_id=str(sc.id),
                 sales_contract_no=sc.sales_contract_no,
                 attention_category=ATTENTION_CATEGORY_MANAGEMENT_ADVISORY,
                 attention_code=advisory.code,
                 attention_message=ADVISORY_MESSAGES.get(advisory.code, advisory.code),
-                source_id=_advisory_source_id(advisory),
+                related_invoice_ids=_related_ids_json(getattr(advisory, "related_invoice_ids", ())),
+                related_shipment_ids=_related_ids_json(getattr(advisory, "related_shipment_ids", ())),
             )
         )
     return tuple(rows)
 
 
-def _supplier_check_text(check) -> str:
+def _decimal_json(value: Decimal | None) -> str | None:
+    return format(value, "f") if value is not None else None
+
+
+def _supplier_check_dict(check) -> dict:
+    """One check's full canonical trace, preserving the F1 check_name and
+    ids — the JSON element never collapses checks into an overall status."""
     if hasattr(check, "compared_invoice_gross_amount"):
-        return ";".join(
-            (
-                "kind=AMOUNT",
-                f"outcome={check.outcome}",
-                f"reference_amount={_decimal_text(check.contract_gross_amount)}",
-                f"reference_currency={check.contract_currency or ''}",
-                f"invoice_amount={_decimal_text(check.compared_invoice_gross_amount)}",
-                f"invoice_currency={check.compared_invoice_currency or ''}",
-            )
-        )
-    return ";".join(
-        (
-            "kind=ITEM_NAME",
-            f"outcome={check.outcome}",
-            f"contract_product_name={check.contract_product_name or ''}",
-            f"invoice_product_name={check.invoice_product_name or ''}",
-        )
-    )
+        # P02 amount check
+        return {
+            "kind": "AMOUNT",
+            "check_name": check.check_name,
+            "outcome": check.outcome,
+            "invoice_id": str(check.invoice_id),
+            "contract_id": str(check.contract_id),
+            "reference_amount": _decimal_json(check.contract_gross_amount),
+            "reference_currency": check.contract_currency,
+            "invoice_amount": _decimal_json(check.compared_invoice_gross_amount),
+            "invoice_currency": check.compared_invoice_currency,
+        }
+    # P05 item-name check
+    return {
+        "kind": "ITEM_NAME",
+        "check_name": check.check_name,
+        "outcome": check.outcome,
+        "allocation_id": str(check.allocation_id),
+        "contract_item_id": str(check.contract_item_id),
+        "invoice_item_id": str(check.invoice_item_id),
+        "contract_id": str(check.contract_id),
+        "contract_product_name": check.contract_product_name,
+        "invoice_product_name": check.invoice_product_name,
+    }
 
 
-def _supplier_checks_text(amount_checks, item_name_checks) -> str | None:
-    """Deterministic serialization of ALL supplier checks — never a fake
-    single "overall status". Sorted for stability."""
-    texts = [_supplier_check_text(c) for c in amount_checks] + [
-        _supplier_check_text(c) for c in item_name_checks
+def _supplier_checks_json(amount_checks, item_name_checks) -> str | None:
+    """Deterministic JSON array of ALL supplier checks — never a fake
+    single "overall status". ``sort_keys=True`` keeps the encoding stable;
+    the array order is sorted by (kind, check_name, allocation_id) so a
+    product name containing ';', '=' or '||' can never corrupt the
+    structure (JSON is not parsed by the Summary)."""
+    checks = [_supplier_check_dict(c) for c in amount_checks] + [
+        _supplier_check_dict(c) for c in item_name_checks
     ]
-    if not texts:
+    if not checks:
         return None
-    return " || ".join(sorted(texts))
+    checks.sort(key=lambda d: (d["kind"], d["check_name"], str(d.get("allocation_id", "") or "")))
+    return json.dumps(checks, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _supplier_request_row(scope, decision) -> InvoicePreparationExportRow:
@@ -405,7 +455,12 @@ def _supplier_request_row(scope, decision) -> InvoicePreparationExportRow:
         confirmed_purchase_invoice_count=len(_confirmed_purchase_invoices(scope)),
         confirmed_out_payment_count=len(_confirmed_out_payments(scope)),
         supplier_amount_check_outcome=decision.amount_checks[0].outcome if decision.amount_checks else None,
-        supplier_checks=_supplier_checks_text(decision.amount_checks, decision.item_name_checks),
+        supplier_amount_check_count=len(decision.amount_checks),
+        supplier_item_name_check_count=len(decision.item_name_checks),
+        supplier_item_name_deviation_count=sum(
+            1 for c in decision.item_name_checks if c.outcome == "DEVIATION"
+        ),
+        supplier_checks_json=_supplier_checks_json(decision.amount_checks, decision.item_name_checks),
     )
 
 
@@ -416,6 +471,7 @@ def _supplier_attention_rows(scope, decision) -> tuple[InvoicePreparationExportR
         rows.append(
             InvoicePreparationExportRow(
                 record_type=RECORD_TYPE_SUPPLIER_ATTENTION,
+                procurement_contract_id=str(contract.id),
                 contract_no=contract.contract_no,
                 attention_category=ATTENTION_CATEGORY_UNRESOLVED_WORK,
                 attention_code=work.exception_type,
@@ -424,18 +480,21 @@ def _supplier_attention_rows(scope, decision) -> tuple[InvoicePreparationExportR
             )
         )
     for entry in _incomplete_purchase_invoices(scope):
-        rows.append(_incomplete_association_row(RECORD_TYPE_SUPPLIER_ATTENTION, "PURCHASE_INVOICE", entry.allocation, scope_key=contract.contract_no))
+        rows.append(_incomplete_association_row(RECORD_TYPE_SUPPLIER_ATTENTION, "PURCHASE_INVOICE", entry.allocation, scope_id=str(contract.id), scope_no=contract.contract_no))
     for entry in _incomplete_out_payments(scope):
-        rows.append(_incomplete_association_row(RECORD_TYPE_SUPPLIER_ATTENTION, "OUT_PAYMENT", entry.allocation, scope_key=contract.contract_no))
+        rows.append(_incomplete_association_row(RECORD_TYPE_SUPPLIER_ATTENTION, "OUT_PAYMENT", entry.allocation, scope_id=str(contract.id), scope_no=contract.contract_no))
     for advisory in decision.advisories:
         rows.append(
             InvoicePreparationExportRow(
                 record_type=RECORD_TYPE_SUPPLIER_ATTENTION,
+                procurement_contract_id=str(contract.id),
                 contract_no=contract.contract_no,
                 attention_category=ATTENTION_CATEGORY_MANAGEMENT_ADVISORY,
                 attention_code=advisory.code,
                 attention_message=ADVISORY_MESSAGES.get(advisory.code, advisory.code),
-                source_id=_advisory_source_id(advisory),
+                related_invoice_ids=_related_ids_json(getattr(advisory, "related_invoice_ids", ())),
+                related_contract_ids=_related_ids_json(getattr(advisory, "related_contract_ids", ())),
+                related_invoice_item_ids=_related_ids_json(getattr(advisory, "related_invoice_item_ids", ())),
             )
         )
     return tuple(rows)
@@ -509,8 +568,13 @@ def _build_summary(
     supplier_amount_outcomes = Counter(
         r.supplier_amount_check_outcome for r in supplier_req_rows if r.supplier_amount_check_outcome
     )
-    item_name_deviations = sum(
-        (r.supplier_checks or "").count("kind=ITEM_NAME;outcome=DEVIATION") for r in supplier_req_rows
+    # Counts come from the EXPLICIT neutral fields on the supplier rows —
+    # the Summary never parses serialized text (e.g. supplier_checks_json)
+    # to recover business structure.
+    supplier_amount_check_count = sum((r.supplier_amount_check_count or 0) for r in supplier_req_rows)
+    supplier_item_name_check_count = sum((r.supplier_item_name_check_count or 0) for r in supplier_req_rows)
+    supplier_item_name_deviation_count = sum(
+        (r.supplier_item_name_deviation_count or 0) for r in supplier_req_rows
     )
     attention_categories = Counter(
         r.attention_category for r in sales_attn_rows + supplier_attn_rows if r.attention_category
@@ -524,7 +588,9 @@ def _build_summary(
         summary[f"sales_comparison_{outcome}"] = sales_outcomes.get(outcome, 0)
     for outcome in ("MATCH", "DEVIATION", "NOT_COMPARABLE_MISSING_FACT", "NOT_COMPARABLE_CURRENCY_MISMATCH"):
         summary[f"supplier_amount_check_{outcome}"] = supplier_amount_outcomes.get(outcome, 0)
-    summary["supplier_item_name_check_DEVIATION"] = item_name_deviations
+    summary["supplier_amount_check_count"] = supplier_amount_check_count
+    summary["supplier_item_name_check_count"] = supplier_item_name_check_count
+    summary["supplier_item_name_check_DEVIATION"] = supplier_item_name_deviation_count
     for category in (
         ATTENTION_CATEGORY_UNRESOLVED_WORK,
         ATTENTION_CATEGORY_INCOMPLETE_ASSOCIATION,
@@ -564,11 +630,20 @@ CSV_HEADERS = [
     "declared_currency",
     "sales_invoice_amount",
     "sales_invoice_currency",
+    "comparison_shipment_id",
+    "comparison_sales_invoice_id",
     "supplier_amount_check_outcome",
-    "supplier_checks",
+    "supplier_amount_check_count",
+    "supplier_item_name_check_count",
+    "supplier_item_name_deviation_count",
+    "supplier_checks_json",
     "attention_category",
     "attention_code",
     "attention_message",
+    "related_invoice_ids",
+    "related_contract_ids",
+    "related_invoice_item_ids",
+    "related_shipment_ids",
     "source_id",
     "allocated_amount",
 ]
@@ -657,13 +732,18 @@ _SALES_PREPARATION_COLUMNS = [
     "declared_currency",
     "sales_invoice_amount",
     "sales_invoice_currency",
+    "comparison_shipment_id",
+    "comparison_sales_invoice_id",
 ]
 
 _SALES_ATTENTION_COLUMNS = [
+    "sales_contract_id",
     "sales_contract_no",
     "attention_category",
     "attention_code",
     "attention_message",
+    "related_invoice_ids",
+    "related_shipment_ids",
     "source_id",
     "allocated_amount",
 ]
@@ -680,14 +760,21 @@ _SUPPLIER_REQUEST_COLUMNS = [
     "confirmed_purchase_invoice_count",
     "confirmed_out_payment_count",
     "supplier_amount_check_outcome",
-    "supplier_checks",
+    "supplier_amount_check_count",
+    "supplier_item_name_check_count",
+    "supplier_item_name_deviation_count",
+    "supplier_checks_json",
 ]
 
 _SUPPLIER_ATTENTION_COLUMNS = [
+    "procurement_contract_id",
     "contract_no",
     "attention_category",
     "attention_code",
     "attention_message",
+    "related_invoice_ids",
+    "related_contract_ids",
+    "related_invoice_item_ids",
     "source_id",
     "allocated_amount",
 ]
@@ -699,18 +786,36 @@ def _write_summary_sheet(ws, product: InvoicePreparationDataProduct) -> None:
         ws.append([_xlsx_cell(key), _xlsx_cell(value)])
 
 
+# openpyxl's save_workbook ALWAYS overwrites properties.modified with the
+# current time (writer/excel.py), so the docProps/core.xml dcterms:modified
+# must be pinned here — the fixed created property survives, modified does
+# not. Both are pinned to the same fixed timestamp.
+_MODIFIED_TIMESTAMP_RE = re.compile(r"(<dcterms:modified[^>]*>)[^<]*(</dcterms:modified>)")
+_FIXED_XLSX_TIMESTAMP_ISO = "1980-01-01T00:00:00Z"
+
+
 def _deterministic_xlsx_bytes(content: bytes) -> bytes:
-    """openpyxl stamps every zip entry with the CURRENT time, so two
-    identical exports would differ in raw bytes. Rewrite the XLSX zip with
-    fixed entry timestamps so byte identity is reproducible (Phase 2D.3-F2b
-    reproducibility requirement). The workbook content is untouched."""
+    """openpyxl stamps every zip entry with the CURRENT time and pins
+    docProps/core.xml dcterms:modified to the current time at save, so two
+    identical exports would differ in raw bytes across a second boundary.
+    Rewrite the XLSX zip with fixed entry timestamps AND a fixed core.xml
+    modified timestamp so byte identity is reproducible (Phase 2D.3-F2b
+    reproducibility requirement). The workbook content is otherwise
+    untouched."""
     out = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(content), "r") as src, zipfile.ZipFile(
         out, "w", compression=zipfile.ZIP_DEFLATED
     ) as dst:
         for info in src.infolist():
+            data = src.read(info.filename)
+            if info.filename == "docProps/core.xml":
+                text = data.decode("utf-8")
+                text = _MODIFIED_TIMESTAMP_RE.sub(
+                    lambda m: m.group(1) + _FIXED_XLSX_TIMESTAMP_ISO + m.group(2), text
+                )
+                data = text.encode("utf-8")
             info.date_time = (1980, 1, 1, 0, 0, 0)
-            dst.writestr(info, src.read(info.filename))
+            dst.writestr(info, data)
     return out.getvalue()
 
 
@@ -720,6 +825,13 @@ def export_invoice_preparation_xlsx(product: InvoicePreparationDataProduct) -> b
     computation, no raw repository access. Decimal amounts are numeric
     cells; missing Facts are blank. Byte-stable across identical inputs."""
     wb = Workbook()
+    # Deterministic workbook properties: openpyxl otherwise stamps the
+    # CURRENT time into docProps/core.xml (created/modified), which would
+    # break byte identity across a real time boundary. Fixed values here
+    # (plus the deterministic zip-entry normalization below) make repeated
+    # exports of identical state byte-identical.
+    wb.properties.created = _FIXED_XLSX_DATETIME
+    wb.properties.modified = _FIXED_XLSX_DATETIME
     _write_summary_sheet(wb.active, product)
     wb.active.title = "01_Summary"
     _write_rows_sheet(wb.create_sheet("02_Sales_Preparation"), _SALES_PREPARATION_COLUMNS, product.sales_preparation)
