@@ -26,6 +26,11 @@ from bel.application.contract_ledger_export import (
     export_contract_business_ledger_csv,
     export_contract_business_ledger_xlsx,
 )
+from bel.application.exception_task_data_product import (
+    build_exception_task_data_product,
+    export_exception_task_csv,
+    export_exception_task_xlsx,
+)
 from bel.application.invoice_preparation_export import (
     build_invoice_preparation_data_product,
     export_invoice_preparation_csv,
@@ -356,6 +361,56 @@ def exceptions_page(
         vm = viewmodels.UnresolvedWorkCenterVM(center, session)
     return _templates(request).TemplateResponse(
         request, "exceptions.html", {"page": "exceptions", "vm": vm}
+    )
+
+
+def _exception_export_filename(filters: UnresolvedWorkFilters, ext: str) -> str:
+    """Deterministic filename — ``exceptions.xlsx`` or, when a period is
+    requested, ``exceptions-YYYY-MM.xlsx``."""
+    if filters.period:
+        return f"exceptions-{filters.period}.{ext}"
+    return f"exceptions.{ext}"
+
+
+@router.get("/exceptions/export.xlsx")
+def exceptions_export_xlsx(
+    request: Request,
+    session: Session = Depends(_session),
+) -> Response:
+    """Phase 2D.4-F2 — Exception & Task Data Product XLSX. The SAME
+    Application path as the page (get_unresolved_work_center -> data
+    product -> serializer), accepting the same filters; strictly
+    read-only."""
+    with session.no_autoflush:
+        filters = _unresolved_work_filters_from_query(request)
+        center = get_unresolved_work_center(session, filters=filters)
+    product = build_exception_task_data_product(center)
+    content = export_exception_task_xlsx(product)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={_exception_export_filename(filters, 'xlsx')}"},
+    )
+
+
+@router.get("/exceptions/export.csv")
+def exceptions_export_csv(
+    request: Request,
+    session: Session = Depends(_session),
+) -> Response:
+    """Phase 2D.4-F2 — Exception & Task Data Product CSV. The SAME
+    Application path as the page (get_unresolved_work_center -> data
+    product -> serializer), accepting the same filters; strictly
+    read-only."""
+    with session.no_autoflush:
+        filters = _unresolved_work_filters_from_query(request)
+        center = get_unresolved_work_center(session, filters=filters)
+    product = build_exception_task_data_product(center)
+    content = export_exception_task_csv(product)
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={_exception_export_filename(filters, 'csv')}"},
     )
 
 

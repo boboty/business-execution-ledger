@@ -294,6 +294,29 @@ procurement/sales contract scope, period. No generic RESOLVE, no new
 storage table, no migration, no advisory→Task promotion, and no R009–R015
 implementation.
 
+**F2 (Exception & Task Data Product) is implemented**: the ONE Application
+path Web and CLI share —
+
+    get_unresolved_work_center(session, filters)
+        -> build_exception_task_data_product(center)   (pure, accepts ONLY the Center)
+        -> export_exception_task_xlsx() / export_exception_task_csv()
+
+(`src/bel/application/exception_task_data_product.py`). The XLSX has
+exactly four sheets (01_Summary / 02_System_Tasks / 03_Match_Confirmation /
+04_Period_Close_Blockers); the CSV is one unified long table keyed by
+`record_type` (== `source_type`). Every row preserves the frozen neutral
+fields plus the full repeatable scope/id set as deterministic JSON (never
+first-id truncated); unmappable tasks export with blank scope fields, never
+dropped. Computed blockers keep the F1 deterministic `source_id` and a
+blank `created_at`; 04 is present but empty without a period. Web routes
+`GET /exceptions/export.xlsx` and `GET /exceptions/export.csv` accept the
+same F1 filters, and `bel exceptions export` accepts `--format/--output/
+--status/--source-type/--code/--procurement-contract-id/--sales-contract-id/
+--period` — CLI and Web produce byte-identical output for the same
+state/filters. Byte determinism, formula-injection neutralization and the
+no-generated_at rule reuse the proven Period Close / Invoice Preparation
+export techniques. No schema/migration change, nothing persisted.
+
 ## FIRST-STAGE CUTOVER GATE
 
 The point at which BEL may be declared the System of Record. Requires at

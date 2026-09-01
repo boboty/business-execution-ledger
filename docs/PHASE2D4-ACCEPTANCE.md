@@ -150,6 +150,28 @@ F1 adds no schema/migration (no `unresolved_work` table, no new columns),
 no generic RESOLVE endpoint, and no advisory→Task promotion. The F0
 frozen invariants above are unchanged.
 
+## How to run — F2 (Exception & Task Data Product)
+
+F2 is implemented over the same F1 projection, sharing ONE Application
+path Web and CLI byte-for-byte:
+
+```bash
+.venv/bin/python -m pytest tests/unit/test_exception_task_data_product.py       # builder + serializers (pure)
+.venv/bin/python -m pytest tests/integration/test_exception_task_data_product_db.py   # mixed-source DB scenarios + filter parity
+.venv/bin/python -m pytest tests/web/test_web_exceptions_export.py              # Web export endpoints
+.venv/bin/python -m pytest tests/integration/test_exception_task_export_cli.py  # CLI export + CLI==Web bytes
+python tools/privacy_scan.py --staged                    # must PASS
+python tools/check_migration_immutability.py --staged    # must PASS
+git diff --check                                         # must be clean
+```
+
+F2 adds no schema/migration, no export/snapshot table, and persists
+nothing. Determinism is byte-level (identical XLSX across a wall-clock
+second boundary; CSV and XLSX identical across repeated exports of the
+same Center state). Web accepts the same filters as the F1 page; the CLI
+(`bel exceptions export`) accepts the same meaningful filters. The F0
+frozen invariants above are unchanged.
+
 ## Explicitly out of scope (F0, and until explicitly re-opened)
 
 - The Center UI / Web surface (F1).

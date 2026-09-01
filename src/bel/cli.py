@@ -43,6 +43,12 @@ from bel.application.period_close_export import (
     export_period_close_xlsx,
 )
 from bel.application.period_close_workbench import get_period_close_workbench
+from bel.application.exception_task_data_product import (
+    build_exception_task_data_product,
+    export_exception_task_csv,
+    export_exception_task_xlsx,
+)
+from bel.application.unresolved_work_center import UnresolvedWorkFilters, get_unresolved_work_center
 from bel.application.search_contracts import search_contracts_by_no
 from bel.application.procurement_sales_link import (
     ProcurementSalesLinkFactError,
@@ -1861,6 +1867,69 @@ def invoice_preparation_export(ctx: click.Context, fmt: str, output_path: Path) 
     content = export_invoice_preparation_xlsx(product) if fmt == "xlsx" else export_invoice_preparation_csv(product)
     output_path.write_bytes(content)
     click.echo(f"Invoice Preparation Data Product written: {output_path} ({fmt})")
+
+
+@cli.group("exceptions")
+def exceptions_group() -> None:
+    """Exception & Task Center (异常与任务中心) — read-only global
+    unresolved-work surface."""
+
+
+@exceptions_group.command("export")
+@click.option("--format", "fmt", type=click.Choice(["xlsx", "csv"]), required=True, help="Output format.")
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="File to write the Data Product to.",
+)
+@click.option("--status", type=str, default=None, help="Exact status on the projection (e.g. OPEN / RESOLVED).")
+@click.option(
+    "--source-type",
+    "source_type",
+    type=click.Choice(["TASK_EXCEPTION", "MATCH_CASE", "COMPUTED_BLOCKER"]),
+    default=None,
+    help="Restrict to one source type.",
+)
+@click.option("--code", type=str, default=None, help="Exact code (exception_type / match_method / blocker_type).")
+@click.option("--procurement-contract-id", "procurement_contract_id", type=click.UUID, default=None, help="Procurement contract scope id.")
+@click.option("--sales-contract-id", "sales_contract_id", type=click.UUID, default=None, help="Sales contract scope id.")
+@click.option("--period", type=str, default=None, help="YYYY-MM period; adds that period's computed blockers.")
+@click.pass_context
+def exceptions_export(
+    ctx: click.Context,
+    fmt: str,
+    output_path: Path,
+    status: str | None,
+    source_type: str | None,
+    code: str | None,
+    procurement_contract_id,
+    sales_contract_id,
+    period: str | None,
+) -> None:
+    """Generate the Exception & Task Data Product as XLSX or CSV. Strictly
+    read-only: calls the SAME Application Data Product path Web uses
+    (get_unresolved_work_center -> data product -> serializer), accepts the
+    same filters, and writes nothing to the database."""
+    filters = UnresolvedWorkFilters(
+        status=status,
+        source_type=source_type,
+        code=code,
+        procurement_contract_id=procurement_contract_id,
+        sales_contract_id=sales_contract_id,
+        period=period,
+    )
+    session_factory = _session_factory(ctx.obj["database_url"])
+    with session_factory() as session:
+        try:
+            center = get_unresolved_work_center(session, filters=filters)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+    product = build_exception_task_data_product(center)
+    content = export_exception_task_xlsx(product) if fmt == "xlsx" else export_exception_task_csv(product)
+    output_path.write_bytes(content)
+    click.echo(f"Exception & Task Data Product written: {output_path} ({fmt})")
 
 
 @cli.command("web")

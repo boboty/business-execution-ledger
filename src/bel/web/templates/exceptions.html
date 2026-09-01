@@ -57,6 +57,12 @@
   <p class="section-note section-note-muted">
     共 {{ vm.total }} 项 · 系统任务 {{ vm.task_count }} · 待确认匹配 {{ vm.match_count }} · 月结阻断项 {{ vm.computed_count }}
   </p>
+  {% set qs = request.query_string.decode() %}
+  <p class="section-note section-note-muted">
+    <a href="/exceptions/export.csv{% if qs %}?{{ qs }}{% endif %}">下载 CSV</a>
+    ·
+    <a href="/exceptions/export.xlsx{% if qs %}?{{ qs }}{% endif %}">下载 XLSX</a>
+  </p>
 </section>
 
 <section class="panel">
