@@ -220,6 +220,8 @@ def _shipment_revision_to_domain(m: ShipmentRevisionModel) -> ShipmentRevision:
         revision_type=m.revision_type,
         contract_item_id=m.contract_item_id,
         quantity=m.quantity,
+        declared_amount=m.declared_amount,
+        declared_currency=m.declared_currency,
         source_fragment_id=m.source_fragment_id,
         superseded_by_revision_id=m.superseded_by_revision_id,
         created_at=m.created_at,
@@ -231,7 +233,8 @@ def _assemble_shipment(anchor: ShipmentModel, current_revision: ShipmentRevision
     """The anchor + current-revision join, in ONE place, mirroring
     ``_assemble_contract_item``. See docs/PHASE2D1-R0-DECISIONS.md
     section 1.3 — current-revision resolution is defined once, in the
-    repository layer."""
+    repository layer. Phase 2D.3-F1c: the declaration values resolve
+    through the current revision exactly like ``quantity``."""
     return Shipment(
         id=anchor.id,
         contract_id=anchor.contract_id,
@@ -239,6 +242,8 @@ def _assemble_shipment(anchor: ShipmentModel, current_revision: ShipmentRevision
         execution_date=anchor.execution_date,
         contract_item_id=current_revision.contract_item_id,
         quantity=current_revision.quantity,
+        declared_amount=current_revision.declared_amount,
+        declared_currency=current_revision.declared_currency,
         current_source_fragment_id=current_revision.source_fragment_id,
         created_at=anchor.created_at,
     )
@@ -1053,6 +1058,8 @@ class ShipmentRepository:
             revision_type=revision.revision_type,
             contract_item_id=revision.contract_item_id,
             quantity=revision.quantity,
+            declared_amount=revision.declared_amount,
+            declared_currency=revision.declared_currency,
             source_fragment_id=revision.source_fragment_id,
             superseded_by_revision_id=revision.superseded_by_revision_id,
             created_at=revision.created_at,

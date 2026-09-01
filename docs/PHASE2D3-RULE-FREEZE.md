@@ -64,15 +64,25 @@ of IP-S02.
 
 **Source: `OWNER_CONFIRMED_PROVISIONAL`.**
 
-**Canonical Fact / intake gap (recorded, not worked around):** the
-current canonical Shipment does NOT carry an export/customs declaration
-amount. IP-S02 is therefore FROZEN AS A RULE but NOT YET FULLY
-EVALUABLE: one of its three compared amounts has no canonical Fact
-today. This is an intake gap to close with real Evidence (a declaration
-amount on the Shipment/Export fact side), never by deriving or faking
-the declaration amount from the SalesContract or the SALES Invoice. No
-code path may substitute `SalesContract.gross_amount` or an invoice
-amount for the declaration amount.
+**Canonical declaration amount/currency (closed for F1c):** the
+canonical Shipment/Export Fact now carries `declared_amount` and
+`declared_currency` (Phase 2D.3-F1c) — the amount and currency
+explicitly stated by the confirmed export/customs declaration Evidence,
+asserted only with Evidence, never inferred, never FX-converted, and
+never defaulted to CNY/USD. An amount known without its currency remains
+a representable incomplete Fact.
+
+**Remaining limitation (recorded structurally, not worked around):**
+IP-S02 is FROZEN AS A RULE but its full three-way consistency
+evaluation is still PENDING. The current Invoice Fact has no explicit
+currency field, so comparing declaration amount/currency against the
+final SALES Invoice gross amount must not introduce an implicit currency
+assumption merely to make the rule appear complete — any downstream
+three-way comparison must refuse cross-currency comparison, and none is
+implemented yet. No code path may substitute `SalesContract.gross_amount`
+or an invoice amount for the declaration amount, and no legacy sales
+amount is backfilled as a customs-declaration amount: real declaration
+Evidence or an explicit human-confirmed Fact is required.
 
 ### IP-S03 — Receipt is not a hard prerequisite
 
@@ -156,7 +166,7 @@ quantity is not established. No quantity calculation may be invented.
 
 ---
 
-## Implementation status map (as of Phase 2D.3-F1b + F1b pre-Gate repair)
+## Implementation status map (as of Phase 2D.3-F1c)
 
 Semantics of the frozen-rule conflicts implemented by F1b: a MISMATCH
 of an IP-P02 amount comparison or an IP-P05 product-name comparison is
@@ -172,7 +182,7 @@ least `INSUFFICIENT_FACTS`. Status precedence: `RULE_CONFLICT` >
 | Rule | Standing | Implementation |
 | --- | --- | --- |
 | IP-S01 | `ACCOUNTANT_CONFIRMED` | Implemented (F1a) |
-| IP-S02 | `OWNER_CONFIRMED_PROVISIONAL` | Frozen as a rule; NOT fully evaluable — canonical export-declaration amount gap (IP-S02 gap above) |
+| IP-S02 | `OWNER_CONFIRMED_PROVISIONAL` | Frozen as a rule; canonical declaration amount/currency supported after F1c, but full three-way consistency evaluation still pending (IP-S02 limitation above) |
 | IP-S03 | `OWNER_CONFIRMED_PROVISIONAL` | Respected by F1a (receipts never consulted) |
 | IP-S04 | `UNRESOLVED_SAFE_BLOCKER` | Safe blocker kept (F1a) |
 | IP-P01 | `ACCOUNTANT_CONFIRMED` | Respected by F1b (payments exposed as context only) |

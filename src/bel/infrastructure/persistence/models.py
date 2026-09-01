@@ -339,6 +339,13 @@ class ShipmentRevisionModel(Base):
     revision_type: Mapped[str] = mapped_column(String, nullable=False)  # INITIAL / SUPPLEMENT / CORRECTION
     contract_item_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("contract_items.id"), nullable=True)
     quantity: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    # Phase 2D.3-F1c — canonical export/customs declaration values
+    # (docs/PHASE2D3-RULE-FREEZE.md IP-S02). Nullable: a pre-F1c Shipment
+    # row has no declaration Evidence and stays NULL; amount known with
+    # currency unknown remains a representable incomplete Fact. Never
+    # derived from quantity / contract amounts at write time.
+    declared_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    declared_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
     # Provenance reference — the exact Evidence for THIS revision. Never
     # re-pointed. See docs/PHASE2D1-R0-DECISIONS.md sections 1.3 and 3.2.
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)

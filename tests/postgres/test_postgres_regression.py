@@ -66,6 +66,12 @@ from bel.application.period_close_workbench import get_period_close_workbench
 from bel.application.procurement_sales_link import add_procurement_sales_link
 from bel.application.sales_contract_facts import create_sales_contract_fact
 from bel.application.sales_matching import confirm_sales_invoice_match, propose_sales_invoice_match
+from bel.application.shipment_facts import (
+    correct_shipment_fact,
+    create_shipment_fact,
+    get_shipment_history,
+    supplement_shipment_fact,
+)
 from bel.application.supplier_invoice_request import (
     PurchaseInvoiceContractAssociation,
     SupplierRequestCheckOutcome,
@@ -79,6 +85,7 @@ from bel.domain.matching import AllocationMatchMethod, ConfirmationType, MatchCa
 from bel.domain.matching import PaymentAllocation
 from bel.domain.payment import Payment, PaymentDirection
 from bel.domain.procurement_sales_link import ConfirmationType as LinkConfirmationType
+from bel.domain.shipment import ShipmentRevisionType
 from bel.infrastructure.persistence.database import DatabaseRuntime, is_database_busy, make_engine, make_session_factory
 from bel.infrastructure.persistence.models import Base
 from bel.infrastructure.persistence.repositories import (
@@ -90,6 +97,7 @@ from bel.infrastructure.persistence.repositories import (
     PaymentAllocationRepository,
     PaymentRepository,
     SalesInvoiceAllocationRepository,
+    ShipmentRepository,
 )
 from fixtures.synthetic import scenarios
 from fixtures.synthetic.bank_pdf import build_cmb_bank_statement_pdf
@@ -380,6 +388,75 @@ def test_invoice_preparation_context_against_postgres(pg_runtime, tmp_path):
             s for s in ctx.supplier_scopes if s.invoice_allocations
         )
         assert all(i.invoice.direction == InvoiceDirection.PURCHASE for i in supplier_scope.invoice_allocations)
+
+
+def test_shipment_declared_amount_currency_round_trip_against_postgres(pg_runtime):
+    """Phase 2D.3-F1c: the canonical declaration values survive a full
+    write/read cycle against real PostgreSQL — the two nullable columns
+    genuinely persist (initially None for a pre-declaration Shipment,
+    then asserted, then corrected), and a fresh session reads back the
+    current values with the current revision. The amount/currency are
+    stored independently (no inferred currency default)."""
+    with pg_runtime.session_factory() as session:
+        frag = _make_fragment(session)
+        contract = Contract(
+            id=uuid.uuid4(), contract_no=f"C-PG-F1C-{uuid.uuid4().hex[:8]}", contract_type=None,
+            counterparty="Supplier", buyer="Buyer Co", gross_amount=Decimal("1000.00"), currency="CNY",
+            contract_date=None, current_source_fragment_id=frag.id, created_at=NOW, updated_at=NOW,
+        )
+        ContractRepository(session).add(contract)
+        session.commit()
+
+        # 1) Create with NO declaration evidence -> both NULL in PostgreSQL.
+        created = create_shipment_fact(
+            session, contract_id=contract.id, external_reference="EXP-PG-F1C", execution_date=date(2031, 3, 10),
+            fields={"quantity": Decimal("10")}, source_fragment_id=frag.id, created_at=NOW,
+        )
+        session.commit()
+        assert created.shipment.declared_amount is None
+        assert created.shipment.declared_currency is None
+
+        # 2) Assert amount + currency; a fresh session must read them back.
+        current = ShipmentRepository(session).get_current_revision(created.shipment.id)
+        frag2 = _make_fragment(session)
+
+        supplemented = supplement_shipment_fact(
+            session, shipment_id=created.shipment.id, based_on_revision_id=current.id,
+            fields={"declared_amount": Decimal("12345.67"), "declared_currency": "USD"},
+            source_fragment_id=frag2.id, created_at=NOW,
+        )
+        session.commit()
+
+        with pg_runtime.session_factory() as fresh_session:
+            reloaded = ShipmentRepository(fresh_session).get(created.shipment.id)
+            assert reloaded.declared_amount == Decimal("12345.67")
+            assert reloaded.declared_currency == "USD"
+            assert reloaded.quantity == Decimal("10")  # carried forward unchanged
+
+        # 3) Correction in a NEW session -> the current projection resolves
+        #    the corrected amount and the history keeps the original.
+        current2 = ShipmentRepository(session).get_current_revision(created.shipment.id)
+        frag3 = _make_fragment(session)
+
+        corrected = correct_shipment_fact(
+            session, shipment_id=created.shipment.id, based_on_revision_id=current2.id,
+            fields={"declared_amount": Decimal("54321.00")},
+            source_fragment_id=frag3.id, created_at=NOW,
+        )
+        session.commit()
+        assert corrected.shipment.declared_amount == Decimal("54321.00")
+        # Currency was not re-asserted — carried forward, never defaulted away.
+        assert corrected.shipment.declared_currency == "USD"
+
+        history = get_shipment_history(session, created.shipment.id)
+        assert [r.revision_type for r in history] == [
+            ShipmentRevisionType.INITIAL,
+            ShipmentRevisionType.SUPPLEMENT,
+            ShipmentRevisionType.CORRECTION,
+        ]
+        assert history[0].declared_amount is None
+        assert history[1].declared_amount == Decimal("12345.67")  # retired, unmutated
+        assert history[2].declared_amount == Decimal("54321.00")  # current
 
 
 def test_cutover_reconciliation_snapshot_builds_against_postgres(pg_runtime, tmp_path):
@@ -809,11 +886,12 @@ def _stamp_alembic_head(engine) -> None:
     precondition for these two subprocess tests without slowing down the
     rest of the module — not a stamp-as-repair (M5): the schema really is
     the head schema, this only makes the tracking row agree with a fact
-    that's already true."""
+    that's already true. The stamped hash must match the current chain
+    head (93e9d48c5cc8 after the Phase 2D.3-F1c migration)."""
     with engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)")
         connection.exec_driver_sql("DELETE FROM alembic_version")
-        connection.exec_driver_sql("INSERT INTO alembic_version (version_num) VALUES ('f5796c006707')")
+        connection.exec_driver_sql("INSERT INTO alembic_version (version_num) VALUES ('93e9d48c5cc8')")
 
 
 def _run_bel_cli(database_url: str, *args: str) -> subprocess.CompletedProcess:

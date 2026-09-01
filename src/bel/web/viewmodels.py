@@ -628,6 +628,10 @@ class LedgerShipmentVM:
         self.external_reference = shipment.external_reference or "—"
         self.execution_date = _fmt(shipment.execution_date)
         self.quantity = _fmt(shipment.quantity)
+        # Phase 2D.3-F1c — canonical export/customs declaration values;
+        # unknown stays unknown, never defaulted.
+        self.declared_amount = _fmt(shipment.declared_amount)
+        self.declared_currency = shipment.declared_currency or "—"
         self.item = ItemPresentationVM(item_by_id.get(shipment.contract_item_id))
 
 
@@ -871,6 +875,11 @@ class InvoicePrepShipmentVM:
         self.external_reference = shipment.external_reference or "—"
         self.execution_date = _fmt(shipment.execution_date)
         self.quantity = _fmt(shipment.quantity)
+        # Phase 2D.3-F1c — canonical export/customs declaration values,
+        # exposed as facts only (IP-S02 full three-way comparison is not
+        # implemented); unknown stays unknown.
+        self.declared_amount = _fmt(shipment.declared_amount)
+        self.declared_currency = shipment.declared_currency or "—"
         self.item = ItemPresentationVM(item_by_id.get(shipment.contract_item_id))
 
 

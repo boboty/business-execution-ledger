@@ -913,6 +913,20 @@ def contract_item_history(ctx: click.Context, item_id) -> None:
 _SHIPMENT_FIELD_OPTIONS = (
     click.option("--item", "contract_item_id", type=click.UUID, default=None, help="ContractItem id (item scope, where known)."),
     click.option("--quantity", "quantity", default=None, help="Quantity."),
+    click.option(
+        "--declared-amount",
+        "declared_amount",
+        default=None,
+        help="Export/customs declaration amount as stated on the confirmed declaration Evidence "
+        "(Phase 2D.3-F1c). Never inferred from quantity or a contract amount.",
+    ),
+    click.option(
+        "--declared-currency",
+        "declared_currency",
+        default=None,
+        help="Currency explicitly associated with --declared-amount. Never defaulted; an amount with no "
+        "currency remains an incomplete Fact.",
+    ),
 )
 
 
@@ -922,13 +936,20 @@ def _shipment_field_options(f):
     return f
 
 
-def _shipment_fields_from_options(contract_item_id, quantity) -> dict:
+def _shipment_fields_from_options(contract_item_id, quantity, declared_amount=None, declared_currency=None) -> dict:
     """Only options the caller actually passed become dict entries — an
     omitted --flag is "not asserted this call", not "assert NULL"."""
-    raw = {"contract_item_id": contract_item_id, "quantity": quantity}
+    raw = {
+        "contract_item_id": contract_item_id,
+        "quantity": quantity,
+        "declared_amount": declared_amount,
+        "declared_currency": declared_currency,
+    }
     fields = {k: v for k, v in raw.items() if v is not None}
     if "quantity" in fields:
         fields["quantity"] = Decimal(fields["quantity"])
+    if "declared_amount" in fields:
+        fields["declared_amount"] = Decimal(fields["declared_amount"])
     return fields
 
 
@@ -1004,7 +1025,8 @@ def shipment_create(
     click.echo(
         f"Shipment {result.shipment.id} {outcome}: contract={result.shipment.contract_id} "
         f"external_reference={result.shipment.external_reference!r} execution_date={result.shipment.execution_date} "
-        f"item={result.shipment.contract_item_id} quantity={result.shipment.quantity}"
+        f"item={result.shipment.contract_item_id} quantity={result.shipment.quantity} "
+        f"declared_amount={result.shipment.declared_amount} declared_currency={result.shipment.declared_currency}"
     )
 
 
@@ -1038,7 +1060,8 @@ def shipment_supplement(ctx: click.Context, shipment_id, based_on_revision_id, *
     click.echo(
         f"Shipment {result.shipment.id} supplemented"
         f"{' (idempotent replay — no new revision)' if not result.revision_written else ''}: "
-        f"item={result.shipment.contract_item_id} quantity={result.shipment.quantity}"
+        f"item={result.shipment.contract_item_id} quantity={result.shipment.quantity} "
+        f"declared_amount={result.shipment.declared_amount} declared_currency={result.shipment.declared_currency}"
     )
 
 
@@ -1074,7 +1097,8 @@ def shipment_correct(ctx: click.Context, shipment_id, based_on_revision_id, **fi
     click.echo(
         f"Shipment {result.shipment.id} corrected"
         f"{' (idempotent replay — no new revision)' if not result.revision_written else ''}: "
-        f"item={result.shipment.contract_item_id} quantity={result.shipment.quantity}"
+        f"item={result.shipment.contract_item_id} quantity={result.shipment.quantity} "
+        f"declared_amount={result.shipment.declared_amount} declared_currency={result.shipment.declared_currency}"
     )
 
 

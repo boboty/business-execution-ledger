@@ -29,9 +29,11 @@ Frozen semantics this module implements (docs/PHASE2D1-R0-DECISIONS.md):
   frozen business identity (4.4) and therefore live on the anchor,
   immutable after creation — this module never lets a caller change them
   (re-identification is out of scope, exactly like ContractItem's
-  `(contract_id, source_item_key)` in R1). `contract_item_id` and
-  `quantity` are the correctable business values, living on
-  `ShipmentRevision`.
+  `(contract_id, source_item_key)` in R1). `contract_item_id`,
+  `quantity`, and — since Phase 2D.3-F1c —
+  `declared_amount`/`declared_currency` (the canonical export/customs
+  declaration values, docs/PHASE2D3-RULE-FREEZE.md IP-S02) are the
+  correctable business values, living on `ShipmentRevision`.
 - 3.3 — a Shipment names exactly one procurement `Contract`. A shipment
   genuinely spanning contracts is an explicit unresolved case out of R2's
   scope (never a silent split) — this module simply does not offer an
@@ -65,8 +67,17 @@ What this module deliberately does NOT do: it does not let a caller
 change `contract_id`, `external_reference` or `execution_date`; it does
 not create a `ProcurementSalesLink`; it does not create a
 `CostRecognitionFact`; it does not treat `quantity` as invoiceable
-quantity; and it does not add a generic Fact revision engine — the three
+quantity; it does not add a generic Fact revision engine — the three
 functions below (plus their `execute_*` wrappers) are the whole surface.
+
+Phase 2D.3-F1c boundaries, unchanged by the two new fields: this module
+never applies FX conversion, never defaults a missing currency, and never
+substitutes `quantity`, `Contract.gross_amount` or
+`SalesContract.gross_amount` as a declaration amount — `declared_amount`
+must come from actual export/customs declaration Evidence or an explicit
+human-confirmed Fact. An amount without a currency remains a representable
+incomplete Fact (the values are stored independently); full three-way
+IP-S02 comparison is NOT implemented here.
 """
 
 from __future__ import annotations
@@ -237,8 +248,11 @@ def create_shipment_fact(
     identity_confirmed: bool = False,
 ) -> ShipmentFactResult:
     """Case A (docs/PHASE2D1-R0-DECISIONS.md 1.1): a Shipment did not
-    exist before. `fields` may include `contract_item_id` and/or
-    `quantity` — both optional per section 3.2.
+    exist before. `fields` may include `contract_item_id`, `quantity`,
+    and (Phase 2D.3-F1c) `declared_amount` / `declared_currency` — all
+    optional per section 3.2. The declaration fields, like every other
+    value, require Evidence: they are never inferred from the contract
+    or from `quantity`.
 
     When `external_reference` is `None`, the business identity is
     "incomplete" (section 4.4: "requires human confirmation") — Phase
@@ -446,7 +460,8 @@ def supplement_shipment_fact(
     created_at: datetime,
 ) -> ShipmentFactResult:
     """Case B-supplement: a previously-unknown attribute
-    (`contract_item_id` and/or `quantity`) becomes known. Every key in
+    (`contract_item_id`, `quantity`, or Phase 2D.3-F1c
+    `declared_amount` / `declared_currency`) becomes known. Every key in
     `fields` must currently be NULL on the current revision — supplementing
     a field that already holds a DIFFERENT value is rejected
     (`ShipmentFactConflict`: that is a correction). Resupplying the SAME

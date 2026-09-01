@@ -28,9 +28,21 @@ class ShipmentRevisionType:
 # an identity component is out of R2's scope, per the same reasoning R1
 # applied to ContractItem's identity fields (section 4.4's
 # "re-identification... always produces a Task", deferred to R5).
+#
+# Phase 2D.3-F1c: `declared_amount` / `declared_currency` are the
+# canonical export/customs declaration values evidenced by the
+# Shipment/Export Fact (docs/PHASE2D3-RULE-FREEZE.md IP-S02). They close
+# the canonical Fact gap on the EXISTING Shipment — deliberately NOT a new
+# ExportDeclaration aggregate. Neither is an identity field; both are
+# optional (a declaration amount known without its currency remains a
+# representable incomplete Fact). No FX conversion, no currency default,
+# and no substitution from quantity / Contract.gross_amount /
+# SalesContract.gross_amount is ever applied at write time.
 SHIPMENT_FACT_FIELDS: tuple[str, ...] = (
     "contract_item_id",
     "quantity",
+    "declared_amount",
+    "declared_currency",
 )
 
 
@@ -42,7 +54,14 @@ class Shipment:
     field list and section 3.3 for the Contract association (a Shipment
     names exactly one procurement Contract; a shipment genuinely
     spanning contracts is an unresolved case out of R2's scope, never a
-    silent split)."""
+    silent split).
+
+    Phase 2D.3-F1c (docs/PHASE2D3-RULE-FREEZE.md IP-S02):
+    ``declared_amount`` / ``declared_currency`` are the canonical
+    export/customs declaration values resolved through the current
+    revision. Both stay ``None`` when no declaration Evidence has been
+    asserted — an incomplete Fact, never a defaulted value and never
+    derived from quantity or a contract amount."""
 
     id: UUID
     contract_id: UUID
@@ -52,6 +71,11 @@ class Shipment:
     quantity: Decimal | None
     current_source_fragment_id: UUID
     created_at: datetime
+    # Phase 2D.3-F1c declaration values — placed at the end (after the
+    # non-default fields) so the dataclass ordering stays valid and every
+    # existing keyword constructor site keeps working.
+    declared_amount: Decimal | None = None
+    declared_currency: str | None = None
 
 
 @dataclass
@@ -73,7 +97,14 @@ class ShipmentRevision:
     ``asserted_field_names`` is the exact set of field names the writing
     command actually asserted, captured verbatim at write time — see
     ContractItemRevision's docstring for why this must never be
-    reconstructed after the fact by diffing against the predecessor."""
+    reconstructed after the fact by diffing against the predecessor.
+
+    Phase 2D.3-F1c: ``declared_amount`` / ``declared_currency`` follow
+    the SAME revision semantics as ``quantity`` — INITIAL can carry them,
+    SUPPLEMENT adds them when previously unknown, CORRECTION supersedes
+    the current values in a NEW revision without mutating history. Both
+    default to ``None`` so existing constructor call sites (and older
+    Facts) remain valid."""
 
     id: UUID
     shipment_id: UUID
@@ -84,3 +115,5 @@ class ShipmentRevision:
     superseded_by_revision_id: UUID | None
     created_at: datetime
     asserted_field_names: list[str] | None = None
+    declared_amount: Decimal | None = None
+    declared_currency: str | None = None
