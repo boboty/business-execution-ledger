@@ -44,8 +44,12 @@ Capability implemented; first-stage coverage not yet cutover-complete.
 
 Excel remains legitimate as an **import format**, an **export format**,
 a **cutover/backfill source**, a **downstream handoff format**, and a
-**human-readable data product**. Excel is no longer the authoritative
-System of Record — BEL is. See
+**human-readable data product**. V1's Definition of Done is BEL becoming
+the System of Record **instead of** Excel
+([PHASE2D0-DECISIONS.md](PHASE2D0-DECISIONS.md)) — but that replacement
+has **not yet happened**: until the first-stage cutover completes, Excel
+remains authoritative in practice for the historical ledger, and BEL is
+not yet declared System of Record (section 7). See
 [PHASE2D0-DECISIONS.md](PHASE2D0-DECISIONS.md) for the reasoning and
 [ARCHITECTURE.md](ARCHITECTURE.md) for the frozen boundary this sits
 inside.
