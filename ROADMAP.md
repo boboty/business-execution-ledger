@@ -254,13 +254,29 @@ strictly read-only and byte-reproducible.
 
 异常与任务中心 plus the Exception/Task export.
 
-The infrastructure can immediately carry the authoritative unresolved
-work that already exists (`BusinessKeyConflict`,
-`AllocationCapacityExceeded`, `MatchCase` in
-`HUMAN_CONFIRMATION_REQUIRED`, period-close blockers). Additional
-producers — R009 `InvoiceUnmatched`, R010 `PaymentUnmatched`, R011
-`EvidenceMissing`, R012 `AmountMismatch`, all still `PROPOSED` — each
-require a business rule freeze before becoming authoritative.
+**F0 (semantics & product freeze) is documentation-only**: the Center is
+ONE landing surface over several authoritative unresolved-work sources —
+never ONE fake domain object. Storage semantics stay separate: persisted
+`TaskException`, persisted `MatchCase` in `HUMAN_CONFIRMATION_REQUIRED`,
+and computed (period-scoped, never persisted) Period Close blockers.
+Phase 2D.3 management advisories stay advisories and are not promoted
+into Tasks. The frozen inventory, source taxonomy, global identity
+`(source_type, source_id)`, lifecycle (no generic RESOLVE), period
+handling and `resolution_route` policy are recorded in
+`docs/PHASE2D4-DECISIONS.md`; the phase-wide invariants in
+`docs/PHASE2D4-ACCEPTANCE.md`.
+
+The Center infrastructure can immediately carry the authoritative
+unresolved work that already exists — the full implemented producer set
+inventoried in `docs/PHASE2D4-DECISIONS.md` §1, including the Phase
+2D.1-R1..R5 producers (ContractItem / Shipment fact supersession, the
+Shipment and SalesContract identity types, the ProcurementSalesLink
+family, backfill identity tasks) — without waiting for R009–R012.
+Additional producers — R009 `InvoiceUnmatched`, R010 `PaymentUnmatched`,
+R011 `EvidenceMissing`, R012 `AmountMismatch`, all still `PROPOSED` —
+each require a business rule freeze before becoming authoritative. F1
+(read-only Exception & Task Center) and F2 (Exception & Task Data
+Product) implement the frozen semantics.
 
 ## FIRST-STAGE CUTOVER GATE
 

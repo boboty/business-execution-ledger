@@ -495,14 +495,17 @@ This is BEL's formal mechanism for the "does not guess" principle (A05).
 It must eventually be the single landing surface for unresolved work.
 
 **Authoritative unresolved work already exists today** and does not wait
-on any new rule freeze:
+on any new rule freeze. The full implemented producer inventory is
+recorded in [PHASE2D4-DECISIONS.md](PHASE2D4-DECISIONS.md) §1: persisted
+`TaskException` types written by the contract-ledger importer,
+matching, fact maintenance (ContractItem / Shipment / SalesContract),
+the ProcurementSalesLink family and cutover backfill; `MatchCase` in
+`HUMAN_CONFIRMATION_REQUIRED`; and computed (period-scoped, never
+persisted) Period Close blockers.
 
-- `BusinessKeyConflict` (written by the contract-ledger importer)
-- `AllocationCapacityExceeded` (written by matching)
-- `MatchCase` in `HUMAN_CONFIRMATION_REQUIRED`
-- Period Close blockers
-
-The Exception Center's infrastructure can carry these immediately.
+The Exception Center's infrastructure can carry these immediately — as a
+**read projection over distinct storage objects**, never a single
+mutable Task.
 
 **Additional exception producers require per-rule business
 confirmation.** R009 `InvoiceUnmatched`, R010 `PaymentUnmatched`, R011
@@ -531,10 +534,19 @@ Exception condition disappears
 Task resolves
 ```
 
-Today's `TaskException` models two exception types and a two-state
-`OPEN`/`RESOLVED` status, with no modeled link from resolution back to
-recompute. Extending the type coverage and freezing the lifecycle is a
-`DEFERRED IMPLEMENTATION DECISION` for Phase 2D.4.
+Today's `TaskException` carries a two-state `OPEN`/`RESOLVED` status and
+a JSON `detail` whose scope keys differ per producer, and `domain.ExceptionType`
+already models many implemented producer types (fact supersession,
+Shipment/SalesContract identity, ProcurementSalesLink, backfill, matching
+capacity, business-key conflict) — but a `TaskException` is **not** all
+unresolved work: a `MatchCase` awaiting human confirmation, a computed
+Period Close blocker and a Phase 2D.3 management advisory are each
+separate, and `TaskException` is the only one with a persisted
+`OPEN`/`RESOLVED` status. Freezing the Center's identity, lifecycle and
+period semantics over these distinct sources — with no generic resolve
+action — is the Phase 2D.4-F0 product freeze
+([PHASE2D4-DECISIONS.md](PHASE2D4-DECISIONS.md)); extending type coverage
+further stays producer-by-producer and requires a business rule freeze.
 
 ## 6. Data Products
 
