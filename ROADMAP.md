@@ -150,7 +150,8 @@ No SQLite → PostgreSQL data migrator exists or is planned — `bel.db` was
 always disposable; a fresh PostgreSQL database is rebuilt from source
 Excel/Evidence.
 
-Phase 2D.2 is **not yet started** by this phase.
+Phase 2D.2 is a **separate phase sequenced after this one** — it is not
+implemented by Phase 2D.1.
 
 ## Phase 2D.2 — Period Close Business Data Product
 
@@ -163,8 +164,7 @@ Data Product carrying a *rule-derived business judgment* rather than a
 projection of stored facts, which is why it is sequenced ahead of
 invoicing and the exception centre.
 
-**Implementation-complete** (pending pre-Gate/Gate review): one
-Application-layer path
+**Completed — Final Gate passed.** One Application-layer path
 (`get_period_close_workbench` -> `build_period_close_data_product` ->
 XLSX/CSV serializer) shared by Web (`GET /period-close/export.xlsx`,
 `.../export.csv`) and CLI (`bel period-close export`). No new close
@@ -250,9 +250,16 @@ concise business messages, carries the confirmed-Fact boundary (a
 dangling association is never counted as a confirmed Fact), and is
 strictly read-only and byte-reproducible.
 
+**Completed — Phase Final Gate passed** (Final-Gate repairs confirmed the
+frozen rule semantics, the F0 preservation boundary, and the
+currency/cardinality safety of the F1 comparisons).
+
 ## Phase 2D.4 — Exception & Task Center
 
 异常与任务中心 plus the Exception/Task export.
+
+**Status: F0 frozen/passed · F1 implemented + Slice Pre-Gate passed ·
+F2 implemented + Slice Pre-Gate passed · Phase Final Gate: pending.**
 
 **F0 (semantics & product freeze) is documentation-only**: the Center is
 ONE landing surface over several authoritative unresolved-work sources —
@@ -311,11 +318,12 @@ dropped. Computed blockers keep the F1 deterministic `source_id` and a
 blank `created_at`; 04 is present but empty without a period. Web routes
 `GET /exceptions/export.xlsx` and `GET /exceptions/export.csv` accept the
 same F1 filters, and `bel exceptions export` accepts `--format/--output/
---status/--source-type/--code/--procurement-contract-id/--sales-contract-id/
---period` — CLI and Web produce byte-identical output for the same
-state/filters. Byte determinism, formula-injection neutralization and the
-no-generated_at rule reuse the proven Period Close / Invoice Preparation
-export techniques. No schema/migration change, nothing persisted.
+--status/--open-only/--no-open-only/--source-type/--code/
+--procurement-contract-id/--sales-contract-id/--period` — CLI and Web
+produce byte-identical output for the same state/filters. Byte
+determinism, formula-injection neutralization and the no-generated_at
+rule reuse the proven Period Close / Invoice Preparation export
+techniques. No schema/migration change, nothing persisted.
 
 ## FIRST-STAGE CUTOVER GATE
 

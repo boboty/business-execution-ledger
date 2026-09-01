@@ -29,8 +29,8 @@ As new business facts continuously enter BEL, BEL must be able to:
 | 2 | Produce a period-close / accrual business judgment at any point in time | **Capability implemented** (Phase 2C.2 read-only preview + Phase 2D.2 Data Product) — first-stage coverage is not yet cutover-complete (see below) |
 | 3 | Generate a deliverable accrual business data product | **Implemented** (Phase 2D.2: Period Close Data Product, XLSX + CSV) — first-stage coverage is not yet cutover-complete |
 | 4 | Give the business data needed to prepare invoicing in both directions — issuing sales invoices to external customers (向客户开票) and requesting supplier invoices (向供应商要票) | **Implemented** (Phase 2D.3) as a read-only Workbench + Data Product built from confirmed Facts with deterministic comparison and management advisories — see section 5.1 |
-| 5 | Expose what cannot be determined, lacks evidence, or needs a human | **Partially implemented** — deterministic exceptions and period-close blockers exist; there is no unified center, and some producer rules are not frozen |
-| 6 | Export business results as an Excel / CSV Data Product | **Implemented for Contract Business Ledger (2D.1), Period Close (2D.2), and Invoice Preparation (2D.3); Exception/Task export still pending (2D.4)** |
+| 5 | Expose what cannot be determined, lacks evidence, or needs a human | **Implemented** (Phase 2D.4-F1) as a read-only global Center — persisted TaskExceptions, `HUMAN_CONFIRMATION_REQUIRED` MatchCases and (for a requested period) computed Period Close blockers in one neutral read projection; no generic resolve workflow, no new unresolved-work storage object, and R009–R015 remain PROPOSED |
+| 6 | Export business results as an Excel / CSV Data Product | **Implemented for Contract Business Ledger (2D.1), Period Close (2D.2), Invoice Preparation (2D.3), and Exception & Task Center (2D.4-F2, CSV + XLSX)** |
 
 **On capability 2 specifically:** the technical ability to answer "given
 the facts confirmed so far, what would this period accrue, reverse,
@@ -407,8 +407,13 @@ V1's Definition of Done requires five core work surfaces. 业务驾驶舱
    read-only Workbench projection of confirmed Facts with deterministic
    comparison and management attention/advisories, and an XLSX/CSV Data
    Product. BEL performs no legal invoice issuance; see section 5.1.
-5. **异常与任务中心 Exception & Task Center** — **not implemented** as a
-   surface, though real unresolved work already exists; see section 5.2.
+5. **异常与任务中心 Exception & Task Center** — **implemented** (Phase
+   2D.4-F1) as a read-only global Center over the authoritative unresolved
+   work that already exists — persisted `TaskException`,
+   `HUMAN_CONFIRMATION_REQUIRED` `MatchCase`, and (for a requested period)
+   computed Period Close blockers — with the Exception & Task Data Product
+   (F2, CSV + XLSX). No generic resolve workflow; R009–R015 still
+   PROPOSED; see section 5.2.
 
 Business Fact Maintenance (section 2.1) is the operating capability
 underneath these surfaces, not a sixth page — it is not inflated into a
@@ -492,7 +497,8 @@ traceable **Invoice Preparation Data Product** (section 6).
 ### 5.2 Exception & Task Center (infrastructure now, producers rule-by-rule)
 
 This is BEL's formal mechanism for the "does not guess" principle (A05).
-It must eventually be the single landing surface for unresolved work.
+It is the single landing surface for unresolved work — a read-only
+neutral projection, never a generic resolve workflow.
 
 **Authoritative unresolved work already exists today** and does not wait
 on any new rule freeze. The full implemented producer inventory is
@@ -503,9 +509,10 @@ the ProcurementSalesLink family and cutover backfill; `MatchCase` in
 `HUMAN_CONFIRMATION_REQUIRED`; and computed (period-scoped, never
 persisted) Period Close blockers.
 
-The Exception Center's infrastructure can carry these immediately — as a
-**read projection over distinct storage objects**, never a single
-mutable Task.
+The Exception Center carries these today — as a **read projection over
+distinct storage objects**, never a single mutable Task (the read-only
+Center surface `GET /exceptions` in Phase 2D.4-F1, plus the F2 Exception
+& Task Data Product).
 
 **Additional exception producers require per-rule business
 confirmation.** R009 `InvoiceUnmatched`, R010 `PaymentUnmatched`, R011
@@ -574,7 +581,7 @@ first-stage format. Current status:
 | Contract Business Ledger export | **Implemented** (Phase 2D.1-R4, CSV + XLSX) |
 | Period Close / Accrual business data export | **Implemented** (Phase 2D.2, CSV + XLSX) |
 | Invoice Preparation Data Product | **Implemented** (Phase 2D.3, CSV + XLSX) |
-| Exception / Task export | **Pending** (Phase 2D.4) |
+| Exception & Task Data Product | **Implemented** (Phase 2D.4-F2, CSV + XLSX) |
 
 Exact schemas and the Application-layer export boundary are
 implementation decisions for the phase that builds each one. Excel
@@ -618,14 +625,14 @@ BEL becomes System of Record
 Excel becomes read-only / Data Product
 ```
 
-**No backfill, cutover, or reconciliation capability exists today.**
-Phase 2D.0 does not implement one. Phase 2D.1-R5 delivers the
-*infrastructure and rehearsal*: the backfill mechanism, the Cutover
-Baseline, and a reconciliation harness, first verified against the
-contract-execution fact layer. The **final first-stage cutover
-acceptance runs after Phase 2D.4**, because a complete switch also
-depends on the 2D.2 accrual Data Product, the 2D.3 invoice preparation
-rules and Data Product, and the 2D.4 exception loop.
+**The backfill mechanism, the Cutover Baseline, and the reconciliation
+harness exist today** as the Phase 2D.1-R5 *infrastructure and rehearsal*,
+first verified against the contract-execution fact layer. **The final
+first-stage cutover has NOT yet happened**: BEL is not yet declared
+System of Record, and no private reconciliation PASS is claimed. The
+**final first-stage cutover acceptance runs after Phase 2D.4**, because a
+complete switch also depends on the 2D.2 accrual Data Product, the 2D.3
+invoice preparation rules and Data Product, and the 2D.4 exception loop.
 
 ### 7.1 The legacy ledger is not Golden Truth
 
