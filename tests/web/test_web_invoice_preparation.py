@@ -1034,3 +1034,65 @@ def test_unresolved_work_is_under_attention_not_facts(prep_ctx):
     assert "已有待处理事项" in response.text
     assert '<p class="wb-sub">待处理事项</p>' not in response.text
     assert '<h4 class="wb-block-title">提醒 / 待关注</h4>' in response.text
+
+
+# ---------------------------------------------------------------------------
+# Phase 2D.3-F2b — Web Data Product endpoints share the Workbench source.
+# ---------------------------------------------------------------------------
+
+
+def test_f2b_export_xlsx_content_type_and_filename(workbench_ctx):
+    client, _ = workbench_ctx
+    response = client.get("/invoice-preparation/export.xlsx")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    assert "filename=invoice-preparation.xlsx" in response.headers["content-disposition"]
+    import openpyxl
+    import io
+
+    wb = openpyxl.load_workbook(io.BytesIO(response.content))
+    assert wb.sheetnames == ["01_Summary", "02_Sales_Preparation", "03_Sales_Attention", "04_Supplier_Request", "05_Supplier_Attention"]
+
+
+def test_f2b_export_csv_content_type_and_filename(workbench_ctx):
+    client, _ = workbench_ctx
+    response = client.get("/invoice-preparation/export.csv")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "filename=invoice-preparation.csv" in response.headers["content-disposition"]
+    assert b"record_type" in response.content
+
+
+def test_f2b_web_exports_share_the_workbench_source(workbench_ctx):
+    """The HTML page, the XLSX export and the CSV export all originate
+    from the SAME InvoicePreparationWorkbench: the exports serialize the
+    same product the builder produces from that workbench."""
+    from bel.application.invoice_preparation_export import (
+        build_invoice_preparation_data_product,
+        export_invoice_preparation_csv,
+        export_invoice_preparation_xlsx,
+    )
+
+    client, app = workbench_ctx
+    from bel.application.invoice_preparation_workbench import get_invoice_preparation_workbench
+
+    with app.state.session_factory() as session:
+        product = build_invoice_preparation_data_product(get_invoice_preparation_workbench(session))
+    expected_csv = export_invoice_preparation_csv(product)
+    expected_xlsx = export_invoice_preparation_xlsx(product)
+
+    assert client.get("/invoice-preparation/export.csv").content == expected_csv
+    assert client.get("/invoice-preparation/export.xlsx").content == expected_xlsx
+    # The page still renders from that same workbench (same scope count).
+    page = client.get("/invoice-preparation")
+    assert f"{len(product.sales_preparation)} 个销售范围" in page.text
+
+
+def test_f2b_web_exports_are_zero_write(workbench_ctx):
+    client, app = workbench_ctx
+    before = _db_counts(app.state.session_factory)
+    client.get("/invoice-preparation/export.xlsx")
+    client.get("/invoice-preparation/export.csv")
+    assert _db_counts(app.state.session_factory) == before

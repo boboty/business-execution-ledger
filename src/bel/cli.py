@@ -31,6 +31,12 @@ from bel.application.list_exceptions import list_exceptions
 from bel.application.list_matches import list_match_cases
 from bel.application.matching import confirm_match, match_invoices, match_payments
 from bel.application.period_close import build_period_close_preview
+from bel.application.invoice_preparation_export import (
+    build_invoice_preparation_data_product,
+    export_invoice_preparation_csv,
+    export_invoice_preparation_xlsx,
+)
+from bel.application.invoice_preparation_workbench import get_invoice_preparation_workbench
 from bel.application.period_close_export import (
     build_period_close_data_product,
     export_period_close_csv,
@@ -1826,6 +1832,35 @@ def period_close_export(ctx: click.Context, period: str, fmt: str, output_path: 
     content = export_period_close_xlsx(product) if fmt == "xlsx" else export_period_close_csv(product)
     output_path.write_bytes(content)
     click.echo(f"Period Close Data Product written: {output_path} ({fmt})")
+
+
+@cli.group("invoice-preparation")
+def invoice_preparation_group() -> None:
+    """Invoice Preparation (read-only fact control + management reminders)."""
+
+
+@invoice_preparation_group.command("export")
+@click.option("--format", "fmt", type=click.Choice(["xlsx", "csv"]), required=True, help="Output format.")
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    required=True,
+    help="File to write the Data Product to.",
+)
+@click.pass_context
+def invoice_preparation_export(ctx: click.Context, fmt: str, output_path: Path) -> None:
+    """Generate the Invoice Preparation Data Product as XLSX or CSV.
+    Strictly read-only: calls the SAME Application Data Product path Web
+    uses (get_invoice_preparation_workbench -> data product -> serializer)
+    and writes nothing to the database."""
+    session_factory = _session_factory(ctx.obj["database_url"])
+    with session_factory() as session:
+        workbench = get_invoice_preparation_workbench(session)
+    product = build_invoice_preparation_data_product(workbench)
+    content = export_invoice_preparation_xlsx(product) if fmt == "xlsx" else export_invoice_preparation_csv(product)
+    output_path.write_bytes(content)
+    click.echo(f"Invoice Preparation Data Product written: {output_path} ({fmt})")
 
 
 @cli.command("web")

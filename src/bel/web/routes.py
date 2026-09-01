@@ -26,6 +26,11 @@ from bel.application.contract_ledger_export import (
     export_contract_business_ledger_csv,
     export_contract_business_ledger_xlsx,
 )
+from bel.application.invoice_preparation_export import (
+    build_invoice_preparation_data_product,
+    export_invoice_preparation_csv,
+    export_invoice_preparation_xlsx,
+)
 from bel.application.invoice_preparation_workbench import get_invoice_preparation_workbench
 from bel.application.period_close_export import (
     build_period_close_data_product,
@@ -183,6 +188,42 @@ def invoice_preparation_page(
     vm = viewmodels.InvoicePreparationVM(workbench)
     return _templates(request).TemplateResponse(
         request, "invoice_preparation.html", {"page": "invoice-preparation", "vm": vm}
+    )
+
+
+@router.get("/invoice-preparation/export.xlsx")
+def invoice_preparation_export_xlsx(
+    request: Request,
+    session: Session = Depends(_session),
+) -> Response:
+    """F2b Data Product XLSX. The SAME Workbench source as the HTML page
+    (workbench -> data product -> serializer); strictly read-only."""
+    with session.no_autoflush:
+        workbench = get_invoice_preparation_workbench(session)
+    product = build_invoice_preparation_data_product(workbench)
+    content = export_invoice_preparation_xlsx(product)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=invoice-preparation.xlsx"},
+    )
+
+
+@router.get("/invoice-preparation/export.csv")
+def invoice_preparation_export_csv(
+    request: Request,
+    session: Session = Depends(_session),
+) -> Response:
+    """F2b Data Product CSV. The SAME Workbench source as the HTML page
+    (workbench -> data product -> serializer); strictly read-only."""
+    with session.no_autoflush:
+        workbench = get_invoice_preparation_workbench(session)
+    product = build_invoice_preparation_data_product(workbench)
+    content = export_invoice_preparation_csv(product)
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=invoice-preparation.csv"},
     )
 
 

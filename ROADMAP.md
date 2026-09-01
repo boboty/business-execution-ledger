@@ -233,8 +233,22 @@ clearly separated surfaces (向客户开票 / 向供应商要票) with three
 structurally distinct blocks per scope: 已确认事实 · 核对结果 ·
 提醒/待关注. Comparison/advisory outcomes are translated to
 business-facing Chinese labels in the presentation layer; no eligibility
-wording is shown. **F2b** (the Invoice Preparation Data Product export)
-is the next slice, sharing this same neutral Workbench projection.
+wording is shown.
+
+**F2b (Invoice Preparation Data Product) implemented:** the Invoice
+Preparation Data Product is built from the SAME neutral Workbench
+projection (`get_invoice_preparation_workbench` ->
+`build_invoice_preparation_data_product` -> XLSX/CSV serializer), shared
+byte-for-byte by the Web (`GET /invoice-preparation/export.xlsx` /
+`export.csv`) and the CLI (`bel invoice-preparation export
+--format xlsx|csv`). The neutral DTO keeps the FACT / COMPARISON /
+ATTENTION layers explicit (record types SALES_PREPARATION /
+SALES_ATTENTION / SUPPLIER_REQUEST / SUPPLIER_ATTENTION; attention
+categories UNRESOLVED_WORK / INCOMPLETE_ASSOCIATION /
+MANAGEMENT_ADVISORY), preserves canonical machine-readable codes with
+concise business messages, carries the confirmed-Fact boundary (a
+dangling association is never counted as a confirmed Fact), and is
+strictly read-only and byte-reproducible.
 
 ## Phase 2D.4 — Exception & Task Center
 
