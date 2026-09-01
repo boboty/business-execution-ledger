@@ -29,9 +29,10 @@ by the four storage/derivation classes the Center must distinguish.
 
 Storage: `TaskExceptionModel` (`src/bel/infrastructure/persistence/models.py`
 lines 644–652); JSON `detail`, `String` status, no `UniqueConstraint` and
-no dedupe constraint — every producer's idempotency is application-level
-(a scan of `ExceptionRepository.list_open()` filtered on a detail-key
-subset), never a database guarantee.
+no dedupe constraint — dedupe is **per-producer and application-level**
+where it exists (a scan of `ExceptionRepository.list_open()` filtered on
+a detail-key subset), never a database guarantee. Some producers raise a
+fresh task on every occurrence (§1A table notes).
 
 | ExceptionType | Producer | `detail` scope-bearing keys | scope / anchor | auto-resolution |
 |---|---|---|---|---|
@@ -39,21 +40,45 @@ subset), never a database guarantee.
 | `AllocationCapacityExceeded` | `bel.application.matching` M001 pass (`matching.py:242`) | `subject_type`, `subject_id`, `contract_id`, amounts | → `contract_id` | none |
 | `ContractItemFactSuperseded` | `bel.application.contract_item_facts` (`contract_item_facts.py:516`) | `contract_item_id`, `superseded_revision_id`, `superseding_revision_id`, `dependents` | → `contract_item_id` | none |
 | `ShipmentFactSuperseded` | `bel.application.shipment_facts` (`shipment_facts.py:662`) | `shipment_id`, `superseded_revision_id`, `superseding_revision_id`, `dependents` | → `shipment_id` | none |
-| `ShipmentIdentityIncomplete` | `bel.application.shipment_facts` (`shipment_facts.py:325`) | `contract_id`, `execution_date`, `source_fragment_id`, `fields` | → `contract_id` only; **no Shipment anchor** | none (see §5.3) |
+| `ShipmentIdentityIncomplete` | `bel.application.shipment_facts` (`shipment_facts.py:325`) | `contract_id`, `execution_date`, `source_fragment_id`, `fields` | → `contract_id` only; **no Shipment anchor** | none (domain action exists — §5.1, `SUPPLY_FACT` §6 — task not auto-closed) |
 | `ShipmentIdentityConflict` | `bel.application.shipment_facts` (`shipment_facts.py:405`) | `shipment_id` (existing anchor), both `source_fragment_id`s, both assertions | → `shipment_id` | none |
 | `SalesContractIdentityIncomplete` | `bel.application.sales_contract_facts` (`sales_contract_facts.py:327`) | `source_fragment_id`, `missing_our_entity`, `missing_sales_contract_no` | **no anchor of any kind** | none |
 | `SalesContractCustomerUnresolved` | `bel.application.sales_contract_facts` (`sales_contract_facts.py:240`) | `sales_contract_id` | → `sales_contract_id` | **yes** — customer SUPPLEMENT closes it (§5.2) |
 | `ProcurementSalesLinkUnconfirmed` | `bel.application.procurement_sales_link` (`procurement_sales_link.py:342`) | `procurement_contract_id`, `sales_contract_id`, `source_fragment_id` | → both contract ids; **no link row** | none |
 | `ProcurementSalesLinkMultipleScopes` | `bel.application.procurement_sales_link` (`procurement_sales_link.py:198`) | `procurement_contract_id`, `sales_contract_ids` | → `procurement_contract_id` | none |
 | `ProcurementSalesLinkCorrectionConflict` | `bel.application.procurement_sales_link` (`procurement_sales_link.py:221`) | `superseded_link_id`, `conflicting_source_fragment_id` | → link id | none |
+| `BackfillIdentityIncomplete` | `bel.application.cutover_backfill` `_find_or_create_backfill_task` (`cutover_backfill.py:177`) | `fact_type`, `identity_key`, `+ extra` (`missing_contract_no`, `missing_counterparty`, …) | **no anchor id ever stored**; contract linkage, where any, lives only inside `identity_key` text | none |
+| `BackfillIdentityAmbiguous` | same | `fact_type`, `identity_key`, `+ extra` (`matches`, `reason`, …) | no anchor id; `identity_key` names the ambiguous candidate set | none |
+| `BackfillConflict` | same | `fact_type`, `identity_key`, `+ extra` (`reason`) | no anchor id | none |
 
-Idempotency reality: `ContractItemFactSuperseded` and
-`ShipmentFactSuperseded` have **no** dedup — every superseding correction
-raises a fresh task. All others dedupe by scanning OPEN tasks on a
-detail-key subset (e.g. backfill `(exception_type, identity_key)` in
-`cutover_backfill.py:169–173`; `ShipmentIdentityIncomplete` by
-`source_fragment_id`; `SalesContractCustomerUnresolved` by
-`sales_contract_id`).
+Idempotency reality (per type):
+
+- **No dedup — a fresh task is raised on every occurrence:**
+  procurement `BusinessKeyConflict` (every import run that maps one
+  `contract_no` to >1 id, `import_contract_ledger.py:169–178`),
+  `AllocationCapacityExceeded` (every M001 pass that hits capacity,
+  `matching.py:241–260`), `ContractItemFactSuperseded`
+  (`contract_item_facts.py:512–526`), `ShipmentFactSuperseded`
+  (`shipment_facts.py:658–672`).
+- **Application-level dedup — an existing matching OPEN task is reused**
+  (scan of `ExceptionRepository.list_open()`, each keyed on a detail-key
+  subset): `ShipmentIdentityIncomplete` by `source_fragment_id`;
+  `ShipmentIdentityConflict` by `(shipment_id, conflicting_source_fragment_id)`;
+  `SalesContractIdentityIncomplete` by `source_fragment_id`;
+  `SalesContractCustomerUnresolved` by `sales_contract_id`;
+  sales-leg `BusinessKeyConflict` by
+  `(sales_contract_id, conflicting_source_fragment_id)`;
+  `ProcurementSalesLinkUnconfirmed` by
+  `(procurement_contract_id, sales_contract_id, source_fragment_id)`;
+  `ProcurementSalesLinkMultipleScopes` by `procurement_contract_id`;
+  `ProcurementSalesLinkCorrectionConflict` by
+  `(superseded_link_id, conflicting_source_fragment_id)`;
+  the three backfill types by `(exception_type, identity_key)`
+  (`cutover_backfill.py:169–173`).
+
+Because `ShipmentIdentityIncomplete` / `ShipmentIdentityConflict` / the
+backfill types are idempotent AND have no resolution path, a replay of
+the same Evidence reuses the OPEN task instead of piling up duplicates.
 
 Declared-but-unproduced: `PROCUREMENT_SALES_LINK_CONFLICT`
 (`src/bel/domain/exception.py:72`) has **no creation site** in code today —
@@ -116,8 +141,22 @@ states "export performs zero database writes",
   `PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS`,
   `SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED`
   (`supplier_invoice_request.py:204,210,214,193,198,226`).
-- Also computed-but-not-Task: the supplier status blocker
-  `MISSING_CONTRACT_GROSS_AMOUNT` (`supplier_invoice_request.py:176`).
+
+Note on `MISSING_CONTRACT_GROSS_AMOUNT` (`SupplierRequestBlockerCode`,
+`supplier_invoice_request.py:176`): this is a **hard missing-fact blocker
+that drives the supplier decision `status`** — it is **not** a management
+advisory and **not** in the advisory list above. It is a
+**locally-computed, scope-scoped invoice-preparation blocker** (one per
+procurement Contract, recomputed each evaluation, never persisted).
+Frozen choice: it is **excluded** from the F1 Center taxonomy (§2) with
+this rationale — the Center's computed source type `COMPUTED_BLOCKER` is
+defined only for period-scoped Period Close blockers (§8); this blocker
+is scope-scoped to the invoice-preparation surface, has no Center
+resolution semantic, and the fix is a Contract fact action (`Contract`
+`gross_amount` supplement). It stays on the Workbench's own read model,
+the same way its advisory siblings do. It is not silently relabelled as
+an advisory — it is a computed blocker that is deliberately outside the
+Center's source types.
 
 The docstring on `SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED` says it
 "Disappears on recomputation once a confirmed PURCHASE invoice is
@@ -128,7 +167,7 @@ exactly what §9 gates behind a future business rule.
 The Invoice Preparation Workbench already surfaces existing unresolved
 work (from `_collect_unresolved_work`, see §10) as an
 `UNRESOLVED_WORK` attention category, **structurally distinct** from
-`MANAGEMENT_ADVISORY` (`invoice_preparation_export.py:68–70`) — the 
+`MANAGEMENT_ADVISORY` (`invoice_preparation_export.py:68–70`) — the
 advisory/Task distinction is already real in the product.
 
 ---
@@ -152,6 +191,15 @@ Center Tasks. Promoting an advisory into a Task requires an explicit
 future business rule (§9). The taxonomy is the vocabulary of the
 projection, not a new storage object.
 
+`COMPUTED_BLOCKER` is defined **only** for period-scoped Period Close
+blockers/decisions (§8). Scope-scoped computed blockers from other
+surfaces are excluded from the Center taxonomy by explicit choice:
+`MISSING_CONTRACT_GROSS_AMOUNT` (§1D) stays on the Invoice Preparation
+Workbench's own read model — it is a hard missing-fact blocker on that
+surface, not a period-scoped Center source, and no Center action exists
+for it. This does not relabel it as an advisory; it is a computed
+blocker that is deliberately outside the Center's source types.
+
 ## 3. One neutral unresolved-work contract (frozen)
 
 The future Center read model is a single presentation DTO,
@@ -162,7 +210,7 @@ optional; a source that has no value for a field leaves it **explicitly
 | Field | Meaning | `TASK_EXCEPTION` | `MATCH_CASE` | `COMPUTED_BLOCKER` |
 |---|---|---|---|---|
 | `source_type` | one of the three taxonomy values | `TASK_EXCEPTION` | `MATCH_CASE` | `COMPUTED_BLOCKER` |
-| `source_id` | the authoritative source object's own identity (§4) | task `id` | match-case `id` | deterministic key, §4 |
+| `source_id` | the authoritative identity of the item (§4): a persisted source object's own id for `TASK_EXCEPTION` / `MATCH_CASE`; a **stable deterministic key** for `COMPUTED_BLOCKER` — no persisted object, no random UUID (§8) | task `id` | match-case `id` | deterministic key (§8) |
 | `code` | machine code of the specific finding | `exception_type` | `match_method` (M001 / MANUAL_SALES_SCOPE) | `blocker_type` |
 | `status` | current state | `ExceptionStatus` | `MatchCaseStatus` | "present for requested period" (constant) |
 | `summary` | existing summary / deterministic presentation text | existing `summary` | derived | derived |
@@ -180,6 +228,10 @@ Rules:
   `summary`.
 - **Missing scope stays explicit `None`**, never guessed and never
   defaulted.
+- **Computed items have no source object.** A `COMPUTED_BLOCKER` has
+  `created_at = None`, a constant `status`, and a `source_id` that is a
+  deterministic, collision-free key (§8) — it is never the id of a
+  persisted row, because none exists.
 
 ## 4. Scope / identity rule (frozen)
 
@@ -196,6 +248,14 @@ Frozen identity:
 Business scope identifiers (`procurement_contract_id`,
 `sales_contract_id`, `invoice_id`, …) are **trace / navigation fields,
 not the identity of the unresolved-work item**. No text parsing.
+
+The identity formula holds for all three source types. For
+`TASK_EXCEPTION` and `MATCH_CASE`, `source_id` is the persisted object's
+own UUID. For `COMPUTED_BLOCKER` there is **no persisted source object**:
+`source_id` is a deterministic normalized key (§8) that is stable across
+recomputes and runs, free of random UUIDs, and collision-free — the
+identity formula `(source_type, source_id)` still identifies the item
+within a given Center view.
 
 Items that must remain visible globally despite having **no** Contract
 anchor (each already exists in code):
@@ -308,10 +368,18 @@ Period Close blockers are **period-dependent**. Frozen V1 contract:
 - A blocker snapshot is **never persisted**; the next recompute reflects
   the current facts.
 
-The `source_id` of a computed blocker is a deterministic key derived from
-its identity fields (period + `blocker_type` + scope ids), not a
-persisted UUID — consistent with §4 because computed blockers are
-ephemeral and are never the object of a resolve action.
+The `source_id` of a computed blocker is a **stable, deterministic,
+collision-free normalized key** — never a random UUID and never a
+persisted id. It covers, in fixed canonical order: the `period`, the
+`blocker_type`, and **every scope id the blocker carries** — for
+`CloseBlocker` that is `contract_id`, and where present `contract_item_id`,
+`accrual_id`, or the full `accrual_ids` tuple ordered canonically (sorted
+by `str(uuid)`, since `MULTIPLE_OPEN_ACCRUALS_REQUIRE_EXPLICIT_SCOPE`
+names several). The key is a pure function of these fields, so the same
+facts recompute the same item across runs and views; it exists only
+inside the Center projection and is never stored (§7). Consistent with
+§4: computed blockers are ephemeral and are never the object of a
+resolve action.
 
 ## 9. Duplication / correlation (frozen)
 
@@ -338,11 +406,21 @@ R012 `AmountMismatch` — and R013–R015 — remain **PROPOSED** in
 
 The Exception & Task Center can ship over the **existing** authoritative
 unresolved work (§1) without waiting for R009–R012. Additional producers
-are added rule-by-rule, each after a business rule freeze. The existing
-neutral projection `_collect_unresolved_work`
-(`contract_business_ledger.py:206–290`), already reused by the Contract
-Business Ledger and the Invoice Preparation Workbench
-(`invoice_preparation.py:233`), is the seed of the Center projection.
+are added rule-by-rule, each after a business rule freeze.
+
+`_collect_unresolved_work` (`contract_business_ledger.py:206–290`),
+already reused by the Contract Business Ledger and the Invoice
+Preparation Workbench (`invoice_preparation.py:233`), is the **precedent
+for the structured scope-resolution technique** (§3's first rule) — it is
+**not** the Center projection. It is contract-scoped by construction and
+drops genuinely unmappable items (e.g. `SalesContractIdentityIncomplete`,
+`contract_business_ledger.py:269–270`), it carries no Period Close
+blockers, and its DTO has no status/scope fields. F1 must therefore build
+a **new global aggregation** over the full §1 inventory that (a) preserves
+unmappable items (§4), (b) keeps `(source_type, source_id)` identity, and
+(c) adds period-scoped computed blockers when a period is requested (§8) —
+reusing `_collect_unresolved_work`'s structured-resolution discipline,
+never its contract-scoped drop behavior.
 
 ## 11. Product shape for F1 / F2 (frozen)
 

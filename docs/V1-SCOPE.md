@@ -534,6 +534,21 @@ Exception condition disappears
 Task resolves
 ```
 
+"Task resolves" in that loop is the **end-state of the recompute loop,
+not a Center action** — the Center never flips a status. The loop applies
+to persisted sources as a principle, but only two transitions actually
+flip a row to `RESOLVED` today: a `MatchCase` `HUMAN_CONFIRMATION_REQUIRED`
+→ `RESOLVED` on confirmation (`confirm_match` /
+`confirm_sales_invoice_match` / `confirm_sales_payment_match`), and
+`SalesContractCustomerUnresolved` → `RESOLVED` on a customer SUPPLEMENT.
+Every other `TaskException` has no automatic transition: it stays OPEN as
+a historical record while a human changes the underlying facts (and some,
+like backfill identity tasks, stay OPEN and block reconciliation by
+design). Computed conditions (Period Close blockers, Phase 2D.3
+advisories) have no row to flip — they simply disappear on the next
+recompute. The Center surface presents all of these distinctly, per
+[PHASE2D4-DECISIONS.md](PHASE2D4-DECISIONS.md).
+
 Today's `TaskException` carries a two-state `OPEN`/`RESOLVED` status and
 a JSON `detail` whose scope keys differ per producer, and `domain.ExceptionType`
 already models many implemented producer types (fact supersession,

@@ -69,45 +69,65 @@ F1/F2. They are the product contract of the Center.
    sources; `period` adds the current computed blockers for that period.
    Without a requested period, no timeless blocker set is presented.
 
-7. **Unmappable work stays visible globally.** An item with no Contract
+7. **Computed-blocker identity is deterministic and source-less.** Every
+   `COMPUTED_BLOCKER` item has `source_id` = a stable, collision-free,
+   deterministic normalized key — no random UUID, no DB row, and identical
+   for the same facts across recomputes and runs. The key covers, in fixed
+   canonical order, the `period`, the `blocker_type`, and every scope id
+   the blocker carries (including `accrual_ids` ordered canonically for
+   `MULTIPLE_OPEN_ACCRUALS_REQUIRE_EXPLICIT_SCOPE`). Computed items have
+   `created_at = None` and a constant `status` — the "created_at comes
+   from the source object" wording of invariant 11 applies to persisted
+   sources only.
+
+8. **Unmappable work stays visible globally.** An item with no Contract
    anchor — e.g. `SalesContractIdentityIncomplete`, backfill identity
    issues, `ShipmentIdentityIncomplete` — still appears in the Center.
    The Center does not require every item to map to a Contract.
 
-8. **No summary-text parsing for scope.** Scope/identity is resolved only
-   from structured fields (`detail` keys, repository lookups by id).
-   `summary` text is never parsed to infer a Contract or any scope.
+9. **F1 builds its own global aggregation.** The Center projection is
+   **not** `_collect_unresolved_work`, which is contract-scoped and drops
+   unmappable items. F1 must construct a new global aggregation over the
+   full §1 inventory that preserves unmappable items (invariant 8) and
+   adds period-scoped computed blockers when a period is requested
+   (invariant 6), while reusing `_collect_unresolved_work`'s
+   structured-scope-resolution discipline (never summary-text parsing).
 
-9. **Canonical source trace preserved.** Every Center item carries its
-   authoritative `(source_type, source_id)` identity plus the producer
-   where available; `code`, `status`, `created_at` come from the source
-   object, never fabricated. Business scope ids are trace/navigation
-   fields, not the item's identity.
+10. **No summary-text parsing for scope.** Scope/identity is resolved only
+    from structured fields (`detail` keys, repository lookups by id).
+    `summary` text is never parsed to infer a Contract or any scope.
 
-10. **Center is a read model first.** F1 is strictly read-only. Nothing
+11. **Canonical source trace preserved.** Every Center item carries its
+    authoritative `(source_type, source_id)` identity plus the producer
+    where available; for persisted sources, `code`, `status`, `created_at`
+    come from the source object, never fabricated; for computed items they
+    are derived per invariant 7. Business scope ids are trace/navigation
+    fields, not the item's identity.
+
+12. **Center is a read model first.** F1 is strictly read-only. Nothing
     in the Center writes facts, relationships, confirmations, or statuses.
 
-11. **Export uses the same neutral projection.** F2's XLSX/CSV Data
+13. **Export uses the same neutral projection.** F2's XLSX/CSV Data
     Product is built from the same `UnresolvedWorkItem` projection that
     powers the F1 page, shared byte-for-byte by Web and CLI — never a
     second projection that can drift.
 
 ## F0 documentation acceptance
 
-12. `docs/PHASE2D4-DECISIONS.md` inventories every currently implemented
+14. `docs/PHASE2D4-DECISIONS.md` inventories every currently implemented
     unresolved-work producer and classifies each as
     `TASK_EXCEPTION` / `MATCH_CASE` / `COMPUTED_BLOCKER` / management
     advisory, with the `detail` scope keys that make each mappable (or
     deliberately unmappable).
-13. The frozen global identity `(source_type, source_id)`, the lifecycle
+15. The frozen global identity `(source_type, source_id)`, the lifecycle
     (no generic resolve), the period-handling rule, and the
     `resolution_route` policy (real capabilities only, `REVIEW_ONLY`
     default) are stated.
-14. `ROADMAP.md` Phase 2D.4 and `docs/V1-SCOPE.md` section 5.2 reflect
+16. `ROADMAP.md` Phase 2D.4 and `docs/V1-SCOPE.md` section 5.2 reflect
     current code reality: the producer inventory is not the stale
     two-type statement, and `TaskException != all unresolved work` is
     stated. History is not rewritten.
-15. The two documents are internally consistent with each other, with
+17. The two documents are internally consistent with each other, with
     `docs/V1-SCOPE.md`, `docs/ROADMAP.md`, `docs/DOMAIN.md` (Task /
     Exception) and with the source.
 
