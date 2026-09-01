@@ -186,86 +186,55 @@ invoice-preparation directions:
    should the supplier invoice us?" (primary axis: procurement
    `Contract`; `Contract.buyer` is our own entity, never a customer).
 
-The product-scope clarification above is frozen; the BUSINESS RULES
-inside those directions are not.
-
-**Prerequisites:** the ContractItem pipeline (R1), Shipment/Export facts
-(R2), sales-side association (R3), and an **invoicing eligibility /
-preparation rule freeze** — the business must confirm what fact
-combination means *not eligible*, *ready for invoice preparation*,
-*already invoiced*, and *blocked/unresolved* **in each direction**. No
-eligibility rule may be invented in advance. A Shipment does not by
-itself mean invoice eligibility; a receipt/payment does not by itself
-mean invoice eligibility; no amount/quantity is apportioned across the
-many-to-many ProcurementSalesLink bridge. BEL prepares invoice data; it
-never performs the legal act of invoicing. Neither direction's request /
-preparation calculations are implemented until the rules freeze.
+Both directions are FACT CONTROL + MANAGEMENT REMINDERS, NOT a workflow
+approval engine: BEL prepares invoice data, reports deterministic
+comparisons and review signals, and never performs the legal act of
+invoicing. No eligibility rule is invented beyond the frozen rules in
+`docs/PHASE2D3-RULE-FREEZE.md`; a Shipment or receipt/payment never by
+itself means invoice eligibility; no amount/quantity is apportioned
+across the many-to-many ProcurementSalesLink bridge.
 
 **F0 (rule-neutral factual context) implemented:** a read-only
-Application path (`get_invoice_preparation_context`) plus the Web fact
-context page `GET /invoice-preparation` (向客户开票 / 向供应商要票),
-exposing only already-confirmed/current Facts and associations per
-SalesContract and per procurement Contract — no eligibility, readiness,
-remaining-quantity/amount, or cross-bridge apportionment concept, no
-schema change. The Phase 2D.3 business-rule discovery itself is
-external/private; eligibility/preparation rules remain unfrozen and
-unimplemented, and no final export Data Product is built in this round.
+Application path (`get_invoice_preparation_context`) exposing only
+already-confirmed/current Facts and associations per SalesContract and
+per procurement Contract — no eligibility, readiness, remaining-quantity/
+amount, or cross-bridge apportionment concept; no schema change.
 
-**F1a (sales-direction rule foundation) implemented:** the
-`SALES_INVOICE_PREPARATION` rule layer
-(`bel.application.sales_invoice_preparation`) evaluates the THREE frozen
-required inputs per SalesContract scope — SalesContract, at least one
-CURRENT linked procurement Contract, and a Shipment/Export Fact on the
-linked contract — and emits an explicit blocker / insufficient-fact
-outcome when one is missing (`NO_CURRENT_PROCUREMENT_LINK`,
-`NO_SHIPMENT_FACT_ON_LINKED_CONTRACT`). Under MULTIPLE current links the
-any/all shipment judgment is deliberately NOT made
-(`SHIPMENT_JUDGMENT_DEFERRED_MULTIPLE_LINKS`) — that rule is not frozen
-and the system does not guess. `INPUTS_PRESENT` states required-input
-fact completeness only: it is not readiness, not an eligibility
-Decision, and no should-invoice amount/quantity, receipt-triggered
-invoicing, or supplier-direction calculation exists. `customer` comes
-only from `SalesContract.customer` (never judged by this rule); the
-Fact -> Decision layering is preserved (pure function over the F0 fact
-context, strictly read-only), and a deliberately-empty Application-layer
-seam is reserved for the future 一致性校验 whose compared field set is
-not frozen.
+**F1 (deterministic invoice-preparation controls) implemented:** the two
+direction rule layers (`bel.application.sales_invoice_preparation`,
+`bel.application.supplier_invoice_request`) consume ONLY confirmed Facts
+from F0 and emit facts + comparison results + non-blocking advisories —
+never a workflow gate, never a `RULE_CONFLICT`. Comparisons are
+currency-safe (explicit comparable currency only; no FX, no default, no
+inference) and cardinality-safe (multiple invoices/links/shipments are
+`NOT_COMPARABLE_AMBIGUOUS_SCOPE` — no sum, no apportionment, no
+arbitrary selection; an absent compared Fact is a check result only,
+never a preparation blocker). The export/customs declaration
+(`Shipment.declared_amount` / `declared_currency`, F1c) is the preferred
+management anchor for reviewing BOTH directions (IP-X01). Sales: the
+three preparation inputs report fact completeness / comparison
+availability, and the IP-S02 three-way amount comparison is implemented
+for the unambiguous 1:1:1 scope (F1f). Supplier: the IP-P02 expected
+amount (= `Contract.gross_amount` + `Contract.currency`) and the
+amount/product-name consistency checks emit deviation advisories;
+cardinality review signals (IP-P03 / IP-P04), the paid-but-no-invoice
+follow-up (`SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED`, IP-P09 — recomputed
+from current Facts, never persisted as a Task), and payment-as-context
+(IP-P01) are exposed; the tax-classification-code rule (IP-P08) is
+frozen but NOT implemented — no guessed code anywhere. Missing
+genuinely-required data stays a factual finding (e.g.
+`MISSING_CONTRACT_GROSS_AMOUNT`), never a workflow blocker.
 
-**F1b (supplier-direction rule foundation + rule provenance registry)
-implemented:** the `SUPPLIER_INVOICE_REQUEST` rule layer
-(`bel.application.supplier_invoice_request`) evaluates, per procurement
-Contract scope over the F0 fact context: the IP-P02 expected purchase
-invoice gross amount == the Contract gross amount (explicit
-missing-fact blocker when unknown — never an estimate); PURCHASE
-invoice cardinality (zero is factual state only, one is exposed as
-facts, more than one is the deterministic IP-P03 violation
-`MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT`); and the complete-context
-PURCHASE invoice -> procurement Contracts mapping with the IP-P04
-violation blocker (`PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS`, never
-silently apportioned). Exact amount and exact product-name consistency
-checks emit `MATCH` / `MISMATCH` / `NOT_COMPARABLE_MISSING_FACT`: a
-MISMATCH conflicts with the frozen accountant-confirmed rule
-(`PURCHASE_INVOICE_AMOUNT_MISMATCH` /
-`PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH`) and makes the scope decision
-`RULE_CONFLICT` — never worded as "unpaid"/"outstanding"/"overdue" —
-while a comparison that cannot be performed for an absent compared
-Fact/value emits an explicit missing-fact blocker and makes the scope
-decision at least `INSUFFICIENT_FACTS` (precedence: `RULE_CONFLICT` >
-`INSUFFICIENT_FACTS` > `PREPARATION_AMOUNT_DETERMINABLE`).
-OUT payments are exposed as context only (IP-P01); no tax-rate
-inference exists (IP-P06 — an actual InvoiceItem's `tax_rate` is
-reachable only as an existing Fact); no requested quantity is
-calculated (IP-P07 unresolved safe blocker). The decision vocabulary is
-fact/preparation-only (`PREPARATION_AMOUNT_DETERMINABLE` /
-`INSUFFICIENT_FACTS` / `RULE_CONFLICT` — no READY/ELIGIBLE/OVERDUE
-member, and "amount determinable" does NOT mean "supplier should
-invoice now"). Rule provenance (accountant-confirmed vs
-owner-confirmed-provisional vs unresolved-safe-blocker) is registered
-publicly in `docs/PHASE2D3-RULE-FREEZE.md`, including the IP-S02 gap:
-the canonical Shipment carries no export/customs declaration amount, so
-IP-S02 is frozen as a rule but NOT fully evaluable — the declaration
-amount is never faked from the SalesContract or the Invoice. No schema
-change, no migration; the F1a sales layer is unchanged.
+**F2a (integrated Workbench) implemented:** the rule-neutral F0 page
+`GET /invoice-preparation` becomes the Invoice Preparation Workbench —
+one read-only Application path (`get_invoice_preparation_workbench`)
+composes the F0 context with both F1 reports, and the page presents two
+clearly separated surfaces (向客户开票 / 向供应商要票) with three
+structurally distinct blocks per scope: 已确认事实 · 核对结果 ·
+提醒/待关注. Comparison/advisory outcomes are translated to
+business-facing Chinese labels in the presentation layer; no eligibility
+wording is shown. **F2b** (the Invoice Preparation Data Product export)
+is the next slice, sharing this same neutral Workbench projection.
 
 ## Phase 2D.4 — Exception & Task Center
 

@@ -29,7 +29,7 @@ from bel.application.contract_360 import (
     ContractInvoice,
     ContractPayment,
 )
-from bel.application.invoice_preparation import InvoicePreparationContext
+from bel.application.invoice_preparation_workbench import InvoicePreparationWorkbench
 from bel.application.period_close import (
     ITEM_MATCH_REQUIRED_FOR_REVERSAL,
     MISSING_ACCRUAL_BASIS,
@@ -44,6 +44,15 @@ from bel.application.period_close_workbench import (
     WorkbenchCandidate,
     WorkbenchDifference,
     WorkbenchReversal,
+)
+from bel.application.sales_invoice_preparation import (
+    SalesAmountCheckOutcome,
+    SalesInvoiceAdvisoryCode,
+)
+from bel.application.supplier_invoice_request import (
+    SupplierRequestAdvisoryCode,
+    SupplierRequestBlockerCode,
+    SupplierRequestCheckOutcome,
 )
 from bel.domain.contract import ContractItem
 
@@ -774,17 +783,21 @@ class Contract360VM:
         self.decisions = ContractDecisionsVM(dto.decisions)
 
 
-# ---- Phase 2D.3-F0: /invoice-preparation — a FACT CONTEXT workbench. ----
-# Every label below describes known data ("已关联…事实", "已确认…",
-# "待处理事项"). Deliberately NO label may read as a business judgment:
-# 应开票 / 可开票 / 已开完 / 应请票 / 尚欠发票 / 本次请票 all require the
-# Phase 2D.3 rule freeze, which has not happened. Absence of a Fact is
+# ---- Phase 2D.3-F0/F2a: /invoice-preparation — the integrated Invoice
+# Preparation Workbench. ----
+# Every fact label below describes known data ("已关联…事实", "已确认…",
+# "待处理事项"). Deliberately NO label may read as a business judgment or
+# workflow eligibility: 应开票 / 可开票 / 已开完 / 应请票 / 尚欠发票 /
+# 本次请票 / 可以开票 / 不允许开票 / 已具备开票资格 all require a frozen
+# workflow rule that does not exist. F1's frozen rules are presented as
+# FACT CONTROL + MANAGEMENT REMINDERS (comparison results + non-blocking
+# advisories), never as an approval verdict. Absence of a Fact is
 # rendered as factual absence ("暂无已关联销项发票事实"), never as
 # "未开票".
 
 INVOICE_PREPARATION_PAGE_NOTE = (
-    "开票/请票业务规则尚未冻结。本页仅展示当前已确认的事实与关联；"
-    "开票资格、准备状态等业务判断将在规则冻结后另行提供。"
+    "本页为开票/请票事实控制与管理工作台：展示已确认事实、可确定性比较的"
+    "核对结果与需要关注的管理提醒。它不构成开票资格判定，也不作为开票审批流程。"
 )
 
 # Fact-presence labels — "what we know", never "what should happen".
@@ -851,8 +864,132 @@ class InvoicePrepUnresolvedWorkVM:
         self.source = work.source
 
 
+# ---- Phase 2D.3-F2a: the integrated Invoice Preparation Workbench.
+# The comparison/advisory ENUM values from the F1 rule layers are
+# translated into business-facing labels HERE, in one presentation layer.
+# The template never interprets the raw enums; technical internal names
+# (RULE_CONFLICT / INPUTS_PRESENT / NOT_COMPARABLE_* / the advisory and
+# blocker codes) never leak into primary business UI. No label reads as
+# workflow eligibility: nothing says 可开票 / 不可开票 / 已具备开票资格. ----
+
+SALES_AMOUNT_CONTROL_OUTCOME_LABELS = {
+    SalesAmountCheckOutcome.MATCH: "金额核对一致",
+    SalesAmountCheckOutcome.DEVIATION: "金额存在偏差，建议复核",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT: "当前信息不足，暂无法核对",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH: "币种不同，暂不直接比较金额",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_AMBIGUOUS_SCOPE: "对应范围不唯一，暂无法自动核对",
+}
+
+# CSS tag class per comparison outcome — legible at a glance: MATCH is
+# neutral-positive, DEVIATION / currency-mismatch is a review signal, an
+# unavailable comparison is muted (never a red "blocked").
+SALES_AMOUNT_CONTROL_OUTCOME_TAG = {
+    SalesAmountCheckOutcome.MATCH: "tag-match",
+    SalesAmountCheckOutcome.DEVIATION: "tag-deviation",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT: "tag-unavailable",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH: "tag-deviation",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_AMBIGUOUS_SCOPE: "tag-unavailable",
+}
+
+SALES_INVOICE_ADVISORY_LABELS = {
+    SalesInvoiceAdvisoryCode.SALES_INVOICE_AMOUNT_DEVIATION: "销项发票金额与合同/报关金额存在偏差，建议复核",
+    SalesInvoiceAdvisoryCode.SALES_INVOICE_CURRENCY_DEVIATION: "销项发票币种与合同/报关币种不一致，暂不直接比较金额，建议复核",
+}
+
+SUPPLIER_AMOUNT_CHECK_OUTCOME_LABELS = {
+    SupplierRequestCheckOutcome.MATCH: "已有发票与参考信息一致",
+    SupplierRequestCheckOutcome.DEVIATION: "存在金额偏差，建议复核",
+    SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT: "当前信息不足或范围无法直接比较",
+    SupplierRequestCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH: "币种不同，暂不直接比较金额",
+}
+
+SUPPLIER_AMOUNT_CHECK_OUTCOME_TAG = {
+    SupplierRequestCheckOutcome.MATCH: "tag-match",
+    SupplierRequestCheckOutcome.DEVIATION: "tag-deviation",
+    SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT: "tag-unavailable",
+    SupplierRequestCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH: "tag-deviation",
+}
+
+SUPPLIER_ITEM_NAME_CHECK_OUTCOME_LABELS = {
+    SupplierRequestCheckOutcome.MATCH: "商品名称与合同确认名称一致",
+    SupplierRequestCheckOutcome.DEVIATION: "商品名称与合同确认名称不一致，建议复核",
+    SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT: "当前信息不足，暂无法核对",
+}
+
+SUPPLIER_INVOICE_ADVISORY_LABELS = {
+    SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED: (
+        "已付款，尚未收到对应进项发票，建议催供应商开票"
+    ),
+    SupplierRequestAdvisoryCode.PURCHASE_INVOICE_AMOUNT_DEVIATION: "采购发票金额与合同参考金额存在偏差，建议复核",
+    SupplierRequestAdvisoryCode.PURCHASE_INVOICE_CURRENCY_DEVIATION: "采购发票币种与合同参考币种不一致，暂不直接比较金额，建议复核",
+    SupplierRequestAdvisoryCode.PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION: "商品名称与合同确认名称不一致，建议复核",
+    SupplierRequestAdvisoryCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT: "一个采购合同关联多张已确认采购发票，建议复核",
+    SupplierRequestAdvisoryCode.PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS: "一张采购发票关联多个采购合同，建议复核",
+}
+
+# The sole genuinely-required-data finding on the supplier side — a
+# factual statement ("amount not provided"), never an eligibility verdict.
+SUPPLIER_REQUEST_BLOCKER_LABELS = {
+    SupplierRequestBlockerCode.MISSING_CONTRACT_GROSS_AMOUNT: "合同金额未提供，暂无法确定参考金额",
+}
+
+class SalesAmountControlVM:
+    """The F1f IP-S02 three-way comparison, presented for review: outcome
+    label + the three compared legs (None -> "—", never a fake zero or a
+    fabricated value)."""
+
+    def __init__(self, check) -> None:
+        self.outcome_label = SALES_AMOUNT_CONTROL_OUTCOME_LABELS.get(check.outcome, check.outcome)
+        self.outcome_tag = SALES_AMOUNT_CONTROL_OUTCOME_TAG.get(check.outcome, "tag-unavailable")
+        self.contract_amount = _fmt(check.sales_contract_amount)
+        self.contract_currency = check.sales_contract_currency or "—"
+        self.declared_amount = _fmt(check.declared_amount)
+        self.declared_currency = check.declared_currency or "—"
+        self.invoice_amount = _fmt(check.sales_invoice_amount)
+        self.invoice_currency = check.sales_invoice_currency or "—"
+
+
+class SalesInvoiceAdvisoryVM:
+    """One non-blocking sales review signal — business copy only; the
+    internal advisory code never appears in primary UI."""
+
+    def __init__(self, advisory) -> None:
+        self.label = SALES_INVOICE_ADVISORY_LABELS.get(advisory.code, advisory.code)
+
+
+class SupplierAmountCheckVM:
+    """The F1e currency-safe P02 amount check, presented for review."""
+
+    def __init__(self, check) -> None:
+        self.outcome_label = SUPPLIER_AMOUNT_CHECK_OUTCOME_LABELS.get(check.outcome, check.outcome)
+        self.outcome_tag = SUPPLIER_AMOUNT_CHECK_OUTCOME_TAG.get(check.outcome, "tag-unavailable")
+        self.contract_amount = _fmt(check.contract_gross_amount)
+        self.contract_currency = check.contract_currency or "—"
+        self.invoice_amount = _fmt(check.compared_invoice_gross_amount)
+        self.invoice_currency = check.compared_invoice_currency or "—"
+
+
+class SupplierItemNameCheckVM:
+    """The P05 product-name comparison, presented for review."""
+
+    def __init__(self, check) -> None:
+        self.outcome_label = SUPPLIER_ITEM_NAME_CHECK_OUTCOME_LABELS.get(check.outcome, check.outcome)
+        self.outcome_tag = SUPPLIER_AMOUNT_CHECK_OUTCOME_TAG.get(check.outcome, "tag-unavailable")
+        self.contract_product_name = check.contract_product_name or "—"
+        self.invoice_product_name = check.invoice_product_name or "—"
+
+
+class SupplierRequestAdvisoryVM:
+    """One non-blocking supplier review signal / management reminder —
+    business copy only (e.g. 已付款，尚未收到对应进项发票，建议催供应商开票);
+    the internal advisory code never appears in primary UI."""
+
+    def __init__(self, advisory) -> None:
+        self.label = SUPPLIER_INVOICE_ADVISORY_LABELS.get(advisory.code, advisory.code)
+
+
 class InvoicePrepSalesScopeVM:
-    def __init__(self, scope) -> None:
+    def __init__(self, scope, decision) -> None:
         sc = scope.sales_contract
         self.sales_contract_id = sc.id
         self.sales_contract_no = sc.sales_contract_no
@@ -868,6 +1005,14 @@ class InvoicePrepSalesScopeVM:
         self.invoice_allocations = [InvoicePrepSalesInvoiceVM(e) for e in scope.invoice_allocations]
         self.payment_allocations = [InvoicePrepSalesReceiptVM(e) for e in scope.payment_allocations]
         self.unresolved_work = [InvoicePrepUnresolvedWorkVM(w) for w in scope.unresolved_work]
+        # F2a — the F1 decision's comparison + advisories, translated once
+        # in the presentation layer. The amount check is always present
+        # (every sales scope has a SalesContract); a NOT_COMPARABLE
+        # outcome is presented as an unavailable comparison, never as a
+        # blocker and never as "may not issue invoice".
+        self.amount_control = SalesAmountControlVM(decision.amount_check) if decision.amount_check else None
+        self.advisories = [SalesInvoiceAdvisoryVM(a) for a in decision.advisories]
+        self.has_advisories = bool(self.advisories)
 
 
 class InvoicePrepShipmentVM:
@@ -919,7 +1064,7 @@ class InvoicePrepOutgoingPaymentVM:
 
 
 class InvoicePrepSupplierScopeVM:
-    def __init__(self, scope) -> None:
+    def __init__(self, scope, decision) -> None:
         contract = scope.contract
         self.contract_id = contract.id
         self.contract_no = contract.contract_no
@@ -938,12 +1083,38 @@ class InvoicePrepSupplierScopeVM:
         self.invoice_item_allocations = [InvoicePrepItemAllocationVM(e) for e in scope.invoice_item_allocations]
         self.payment_allocations = [InvoicePrepOutgoingPaymentVM(e) for e in scope.payment_allocations]
         self.unresolved_work = [InvoicePrepUnresolvedWorkVM(w) for w in scope.unresolved_work]
+        # F2a — the F1 decision's reference amount, management-control
+        # checks and advisories, translated once in the presentation layer.
+        self.expected_invoice_amount = _fmt(decision.expected_purchase_invoice_gross_amount)
+        self.expected_invoice_currency = decision.expected_purchase_invoice_currency or "—"
+        self.reference_known = decision.expected_purchase_invoice_gross_amount is not None
+        self.amount_checks = [SupplierAmountCheckVM(c) for c in decision.amount_checks]
+        self.item_name_checks = [SupplierItemNameCheckVM(c) for c in decision.item_name_checks]
+        self.advisories = [SupplierRequestAdvisoryVM(a) for a in decision.advisories]
+        self.has_advisories = bool(self.advisories)
+        # The genuinely-required-data finding, presented factually.
+        self.blocker_labels = [
+            SUPPLIER_REQUEST_BLOCKER_LABELS.get(b.code, b.code) for b in decision.blockers
+        ]
 
 
 class InvoicePreparationVM:
-    def __init__(self, dto: InvoicePreparationContext) -> None:
-        self.sales_scopes = [InvoicePrepSalesScopeVM(s) for s in dto.sales_scopes]
-        self.supplier_scopes = [InvoicePrepSupplierScopeVM(s) for s in dto.supplier_scopes]
+    """The Phase 2D.3-F2a integrated Workbench projection. Built from the
+    ONE read-only Workbench (F0 context + the two F1 reports over the same
+    context): each scope VM pairs its F0 fact context with its F1
+    decision, so Facts / Comparison / Advisory are never flattened into
+    one status. Presentation only — no rule is decided here."""
+
+    def __init__(self, workbench: InvoicePreparationWorkbench) -> None:
+        dto = workbench.context
+        sales_decision_by_id = {d.sales_contract_id: d for d in workbench.sales_report.decisions}
+        supplier_decision_by_id = {d.contract_id: d for d in workbench.supplier_report.decisions}
+        self.sales_scopes = [
+            InvoicePrepSalesScopeVM(s, sales_decision_by_id[s.sales_contract.id]) for s in dto.sales_scopes
+        ]
+        self.supplier_scopes = [
+            InvoicePrepSupplierScopeVM(s, supplier_decision_by_id[s.contract.id]) for s in dto.supplier_scopes
+        ]
         self.sales_scope_count = len(self.sales_scopes)
         self.supplier_scope_count = len(self.supplier_scopes)
         self.page_note = INVOICE_PREPARATION_PAGE_NOTE

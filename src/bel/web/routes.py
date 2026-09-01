@@ -26,7 +26,7 @@ from bel.application.contract_ledger_export import (
     export_contract_business_ledger_csv,
     export_contract_business_ledger_xlsx,
 )
-from bel.application.invoice_preparation import get_invoice_preparation_context
+from bel.application.invoice_preparation_workbench import get_invoice_preparation_workbench
 from bel.application.period_close_export import (
     build_period_close_data_product,
     export_period_close_csv,
@@ -171,14 +171,16 @@ def invoice_preparation_page(
     request: Request,
     session: Session = Depends(_session),
 ) -> HTMLResponse:
-    """Phase 2D.3-F0 read-only fact-context workbench. Presentation
-    only — the page composes the SAME Application context
-    (``get_invoice_preparation_context``) and decides nothing: no
-    eligibility, readiness or should-invoice judgment exists until the
-    Phase 2D.3 rule freeze."""
+    """Phase 2D.3-F2a integrated Invoice Preparation Workbench. The page
+    composes the ONE read-only Application path
+    (``get_invoice_preparation_workbench``: F0 context + the two F1
+    reports over the same context) and presents it — it decides nothing:
+    the comparison, cardinality, currency-safety and follow-up outcomes
+    come from the frozen F1 layers, the page is strictly read-only, and
+    it never reads as an eligibility or approval verdict."""
     with session.no_autoflush:
-        dto = get_invoice_preparation_context(session)
-    vm = viewmodels.InvoicePreparationVM(dto)
+        workbench = get_invoice_preparation_workbench(session)
+    vm = viewmodels.InvoicePreparationVM(workbench)
     return _templates(request).TemplateResponse(
         request, "invoice_preparation.html", {"page": "invoice-preparation", "vm": vm}
     )

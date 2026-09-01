@@ -193,6 +193,21 @@ table.grid a:hover { text-decoration: underline; }
 .tag-blocker { background: var(--danger-soft); color: var(--danger); }
 .tag-none { background: var(--gray-tag); color: var(--gray-tag-ink); }
 
+/* Invoice Preparation Workbench (F2a): comparison-outcome and advisory
+   tags — MATCH is neutral-positive, DEVIATION / currency-mismatch is a
+   review signal, an unavailable comparison is muted (never "blocked"),
+   and advisories are management reminders. */
+.tag-match { background: var(--ok-soft); color: var(--ok); }
+.tag-deviation { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
+.tag-unavailable { background: var(--gray-tag); color: var(--gray-tag-ink); }
+.tag-advisory { background: var(--warn-soft); color: var(--warn); }
+
+/* The three structurally distinct blocks per scope: facts, comparison,
+   advisories. */
+.wb-block { border-top: 2px solid var(--line-strong); margin-top: 14px; padding-top: 10px; }
+.wb-block-title { margin: 0 0 8px; font-size: 13px; font-weight: 700; color: var(--accent); }
+.wb-sub { margin: 10px 0 4px; font-size: 12px; font-weight: 600; color: var(--muted); }
+
 .blocker-meaning { color: var(--danger); white-space: normal; min-width: 320px; }
 
 /* ---- blocker business cards (spec 4.5) ---- */

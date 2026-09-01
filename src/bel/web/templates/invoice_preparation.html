@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 {% from "partials/_macros.html" import item_scope %}
-{% block title %}开票准备事实 · BEL{% endblock %}
+{% block title %}开票准备工作台 · BEL{% endblock %}
 {% block content %}
 
 <div class="page-head">
-  <h1>开票准备事实</h1>
-  <p class="page-subtitle">按销售合同（向客户开票）与采购合同（向供应商要票）两条主线，展示当前已确认的事实与关联。本页只回答"我们现在知道什么"；开票与请票的业务判断待规则冻结后提供。</p>
+  <h1>开票准备工作台</h1>
+  <p class="page-subtitle">按销售合同（向客户开票）与采购合同（向供应商要票）两条主线，展示已确认事实、可确定性比较的核对结果与需要关注的管理提醒。外部客户仅来自销售合同自身的客户字段；合同买方是我方自身主体。本页是事实控制与管理提醒，不是开票审批流程。</p>
 </div>
 
 <section class="panel">
@@ -20,7 +20,7 @@
 <div id="sales-section">
   <section class="panel">
     <h2>向客户开票 · {{ vm.sales_scope_count }} 个销售范围</h2>
-    <p class="section-note section-note-muted">主线：销售合同。外部客户仅来自销售合同自身的客户字段；关联的采购合同仅逐条列出，从不跨关联分摊或汇总金额、数量。</p>
+    <p class="section-note section-note-muted">主线：销售合同。关联的采购合同仅逐条列出，从不跨关联分摊或汇总金额、数量；核对结果仅为管理参考，不代表开票资格。</p>
     {% if not vm.sales_scopes %}
     <p class="empty-state">暂无销售合同事实。</p>
     {% endif %}
@@ -29,56 +29,88 @@
   {% for scope in vm.sales_scopes %}
   <section class="panel">
     <h3 class="mono">{{ scope.sales_contract_no }}</h3>
-    <dl class="kv-grid">
-      <div class="kv"><dt>我方主体</dt><dd>{{ scope.our_entity }}</dd></div>
-      <div class="kv"><dt>客户</dt><dd>{{ scope.customer }}{% if not scope.customer_known %} <span class="tag tag-none">客户待补充</span>{% endif %}</dd></div>
-      <div class="kv"><dt>合同金额</dt><dd class="num">{{ scope.gross_amount }} {{ scope.currency }}</dd></div>
-      <div class="kv"><dt>合同日期</dt><dd>{{ scope.contract_date }}</dd></div>
-    </dl>
 
-    <h4>已关联采购合同（当前关联）</h4>
-    {% if scope.linked_procurement_contracts %}
-    <ul class="ledger-nested-list">
-      {% for entry in scope.linked_procurement_contracts %}
-      <li><a class="mono" href="/contracts/{{ entry.contract_id }}">{{ entry.contract_no }}</a> · {{ entry.supplier }} · <span class="tag tag-status">{{ entry.confirmation_type_label }}</span></li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">暂无当前关联采购合同</p>
-    {% endif %}
+    <div class="wb-block">
+      <h4 class="wb-block-title">已确认事实</h4>
+      <dl class="kv-grid">
+        <div class="kv"><dt>我方主体</dt><dd>{{ scope.our_entity }}</dd></div>
+        <div class="kv"><dt>客户</dt><dd>{{ scope.customer }}{% if not scope.customer_known %} <span class="tag tag-none">客户待补充</span>{% endif %}</dd></div>
+        <div class="kv"><dt>合同金额</dt><dd class="num">{{ scope.gross_amount }} {{ scope.currency }}</dd></div>
+        <div class="kv"><dt>合同日期</dt><dd>{{ scope.contract_date }}</dd></div>
+      </dl>
 
-    <h4>已关联销项发票事实</h4>
-    {% if scope.invoice_allocations %}
-    <ul class="ledger-nested-list">
-      {% for inv in scope.invoice_allocations %}
-      <li>{{ inv.invoice_no }} · 开票日期 {{ inv.issue_date }} · 发票价税合计 {{ inv.gross_amount }} · 关联金额 {{ inv.allocated_gross_amount }}</li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">暂无已关联销项发票事实</p>
-    {% endif %}
+      <p class="wb-sub">已关联采购合同（当前关联）</p>
+      {% if scope.linked_procurement_contracts %}
+      <ul class="ledger-nested-list">
+        {% for entry in scope.linked_procurement_contracts %}
+        <li><a class="mono" href="/contracts/{{ entry.contract_id }}">{{ entry.contract_no }}</a> · {{ entry.supplier }} · <span class="tag tag-status">{{ entry.confirmation_type_label }}</span></li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无当前关联采购合同</p>
+      {% endif %}
 
-    <h4>已关联收款事实</h4>
-    {% if scope.payment_allocations %}
-    <ul class="ledger-nested-list">
-      {% for rec in scope.payment_allocations %}
-      <li>{{ rec.bank_reference }} · {{ rec.transaction_date }} · 收款金额 {{ rec.amount }} · 关联金额 {{ rec.allocated_amount }}</li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">暂无已关联收款事实</p>
-    {% endif %}
+      <p class="wb-sub">已关联销项发票事实</p>
+      {% if scope.invoice_allocations %}
+      <ul class="ledger-nested-list">
+        {% for inv in scope.invoice_allocations %}
+        <li>{{ inv.invoice_no }} · 开票日期 {{ inv.issue_date }} · 发票价税合计 {{ inv.gross_amount }} · 关联金额 {{ inv.allocated_gross_amount }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无已关联销项发票事实</p>
+      {% endif %}
 
-    <h4>待处理事项</h4>
-    {% if scope.unresolved_work %}
-    <ul class="ledger-nested-list">
-      {% for work in scope.unresolved_work %}
-      <li><span class="tag tag-blocker">未结</span> {{ work.summary }}</li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">无</p>
-    {% endif %}
+      <p class="wb-sub">已关联收款事实</p>
+      {% if scope.payment_allocations %}
+      <ul class="ledger-nested-list">
+        {% for rec in scope.payment_allocations %}
+        <li>{{ rec.bank_reference }} · {{ rec.transaction_date }} · 收款金额 {{ rec.amount }} · 关联金额 {{ rec.allocated_amount }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无已关联收款事实</p>
+      {% endif %}
+
+      <p class="wb-sub">待处理事项</p>
+      {% if scope.unresolved_work %}
+      <ul class="ledger-nested-list">
+        {% for work in scope.unresolved_work %}
+        <li><span class="tag tag-blocker">未结</span> {{ work.summary }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">无</p>
+      {% endif %}
+    </div>
+
+    <div class="wb-block">
+      <h4 class="wb-block-title">核对结果</h4>
+      {% if scope.amount_control %}
+      <p class="wb-sub">金额核对（销售合同金额 / 报关申报金额 / 已确认销项发票金额）</p>
+      <p><span class="tag {{ scope.amount_control.outcome_tag }}">{{ scope.amount_control.outcome_label }}</span></p>
+      <ul class="ledger-nested-list">
+        <li>销售合同金额：{{ scope.amount_control.contract_amount }} {{ scope.amount_control.contract_currency }}</li>
+        <li>报关申报金额：{{ scope.amount_control.declared_amount }} {{ scope.amount_control.declared_currency }}</li>
+        <li>已确认销项发票金额：{{ scope.amount_control.invoice_amount }} {{ scope.amount_control.invoice_currency }}</li>
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无法核对</p>
+      {% endif %}
+    </div>
+
+    <div class="wb-block">
+      <h4 class="wb-block-title">提醒 / 待关注</h4>
+      {% if scope.has_advisories %}
+      <ul class="ledger-nested-list">
+        {% for adv in scope.advisories %}
+        <li><span class="tag tag-advisory">建议关注</span> {{ adv.label }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">无</p>
+      {% endif %}
+    </div>
   </section>
   {% endfor %}
 </div>
@@ -95,78 +127,123 @@
   {% for scope in vm.supplier_scopes %}
   <section class="panel">
     <h3 class="mono">{{ scope.contract_no }}</h3>
-    <dl class="kv-grid">
-      <div class="kv"><dt>供应商</dt><dd>{{ scope.supplier }}</dd></div>
-      <div class="kv"><dt>我方主体（买方）</dt><dd>{{ scope.our_entity }}</dd></div>
-      <div class="kv"><dt>合同金额</dt><dd class="num">{{ scope.gross_amount }} {{ scope.currency }}</dd></div>
-      <div class="kv"><dt>合同日期</dt><dd>{{ scope.contract_date }}</dd></div>
-    </dl>
 
-    <h4>当前商品明细</h4>
-    {% if scope.items %}
-    <ul class="ledger-nested-list">
-      {% for item in scope.items %}
-      <li>{{ item_scope(item) }}</li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">暂无已确认商品明细</p>
-    {% endif %}
+    <div class="wb-block">
+      <h4 class="wb-block-title">已确认事实</h4>
+      <dl class="kv-grid">
+        <div class="kv"><dt>供应商</dt><dd>{{ scope.supplier }}</dd></div>
+        <div class="kv"><dt>我方主体（买方）</dt><dd>{{ scope.our_entity }}</dd></div>
+        <div class="kv"><dt>合同金额</dt><dd class="num">{{ scope.gross_amount }} {{ scope.currency }}</dd></div>
+        <div class="kv"><dt>合同日期</dt><dd>{{ scope.contract_date }}</dd></div>
+      </dl>
 
-    <h4>已确认出货事实</h4>
-    {% if scope.shipments %}
-    <ul class="ledger-nested-list">
-      {% for s in scope.shipments %}
-      <li>{{ s.external_reference }} · {{ s.execution_date }}{% if s.quantity != '—' %} · 数量 {{ s.quantity }}{% endif %}</li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">暂无已确认出货事实</p>
-    {% endif %}
+      <p class="wb-sub">当前商品明细</p>
+      {% if scope.items %}
+      <ul class="ledger-nested-list">
+        {% for item in scope.items %}
+        <li>{{ item_scope(item) }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无已确认商品明细</p>
+      {% endif %}
 
-    <h4>已确认采购发票</h4>
-    {% if scope.invoice_allocations %}
-    <ul class="ledger-nested-list">
-      {% for inv in scope.invoice_allocations %}
-      <li>{{ inv.invoice_no }} · 开票日期 {{ inv.issue_date }} · 关联金额 {{ inv.allocated_gross_amount }} · <span class="tag tag-status">{{ inv.confirmation_type_label }}</span></li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">暂无已确认采购发票</p>
-    {% endif %}
+      <p class="wb-sub">已确认出货事实</p>
+      {% if scope.shipments %}
+      <ul class="ledger-nested-list">
+        {% for s in scope.shipments %}
+        <li>{{ s.external_reference }} · {{ s.execution_date }}{% if s.quantity != '—' %} · 数量 {{ s.quantity }}{% endif %}{% if s.declared_amount != '—' %} · 报关申报金额 {{ s.declared_amount }} {{ s.declared_currency }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无已确认出货事实</p>
+      {% endif %}
 
-    <h4>已确认明细关联</h4>
-    {% if scope.invoice_item_allocations %}
-    <ul class="ledger-nested-list">
-      {% for a in scope.invoice_item_allocations %}
-      <li>{{ a.invoice_no }} 第 {{ a.line_no }} 行 · 关联数量 {{ a.allocated_quantity }} · 关联未税金额 {{ a.allocated_net_amount }}</li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">暂无已确认明细关联</p>
-    {% endif %}
+      <p class="wb-sub">已确认采购发票</p>
+      {% if scope.invoice_allocations %}
+      <ul class="ledger-nested-list">
+        {% for inv in scope.invoice_allocations %}
+        <li>{{ inv.invoice_no }} · 开票日期 {{ inv.issue_date }} · 关联金额 {{ inv.allocated_gross_amount }} · <span class="tag tag-status">{{ inv.confirmation_type_label }}</span></li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无已确认采购发票</p>
+      {% endif %}
 
-    <h4>已确认付款</h4>
-    {% if scope.payment_allocations %}
-    <ul class="ledger-nested-list">
-      {% for p in scope.payment_allocations %}
-      <li>{{ p.bank_reference }} · {{ p.transaction_date }} · 关联金额 {{ p.allocated_amount }} · <span class="tag tag-status">{{ p.confirmation_type_label }}</span></li>
-      {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">暂无已确认付款</p>
-    {% endif %}
+      <p class="wb-sub">已确认明细关联</p>
+      {% if scope.invoice_item_allocations %}
+      <ul class="ledger-nested-list">
+        {% for a in scope.invoice_item_allocations %}
+        <li>{{ a.invoice_no }} 第 {{ a.line_no }} 行 · 关联数量 {{ a.allocated_quantity }} · 关联未税金额 {{ a.allocated_net_amount }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无已确认明细关联</p>
+      {% endif %}
 
-    <h4>待处理事项</h4>
-    {% if scope.unresolved_work %}
-    <ul class="ledger-nested-list">
-      {% for work in scope.unresolved_work %}
-      <li><span class="tag tag-blocker">未结</span> {{ work.summary }}</li>
+      <p class="wb-sub">已确认付款</p>
+      {% if scope.payment_allocations %}
+      <ul class="ledger-nested-list">
+        {% for p in scope.payment_allocations %}
+        <li>{{ p.bank_reference }} · {{ p.transaction_date }} · 关联金额 {{ p.allocated_amount }} · <span class="tag tag-status">{{ p.confirmation_type_label }}</span></li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无已确认付款</p>
+      {% endif %}
+
+      <p class="wb-sub">待处理事项</p>
+      {% if scope.unresolved_work %}
+      <ul class="ledger-nested-list">
+        {% for work in scope.unresolved_work %}
+        <li><span class="tag tag-blocker">未结</span> {{ work.summary }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">无</p>
+      {% endif %}
+    </div>
+
+    <div class="wb-block">
+      <h4 class="wb-block-title">管理核对</h4>
+      <p class="wb-sub">参考应开金额（按采购合同金额）</p>
+      {% if scope.reference_known %}
+      <p><span class="num">{{ scope.expected_invoice_amount }} {{ scope.expected_invoice_currency }}</span></p>
+      {% else %}
+      <p><span class="tag tag-unavailable">{% if scope.blocker_labels %}{{ scope.blocker_labels[0] }}{% else %}暂无法确定参考金额{% endif %}</span></p>
+      {% endif %}
+
+      {% for check in scope.amount_checks %}
+      <p class="wb-sub">金额核对（参考金额 / 已确认采购发票金额）</p>
+      <p><span class="tag {{ check.outcome_tag }}">{{ check.outcome_label }}</span></p>
+      <ul class="ledger-nested-list">
+        <li>参考金额（合同金额）：{{ check.contract_amount }} {{ check.contract_currency }}</li>
+        <li>已确认采购发票金额：{{ check.invoice_amount }} {{ check.invoice_currency }}</li>
+      </ul>
       {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-cell">无</p>
-    {% endif %}
+
+      {% for check in scope.item_name_checks %}
+      <p class="wb-sub">商品名称核对</p>
+      <p><span class="tag {{ check.outcome_tag }}">{{ check.outcome_label }}</span></p>
+      <ul class="ledger-nested-list">
+        <li>合同商品名称：{{ check.contract_product_name }}</li>
+        <li>发票商品名称：{{ check.invoice_product_name }}</li>
+      </ul>
+      {% endfor %}
+    </div>
+
+    <div class="wb-block">
+      <h4 class="wb-block-title">提醒 / 待关注</h4>
+      {% if scope.has_advisories %}
+      <ul class="ledger-nested-list">
+        {% for adv in scope.advisories %}
+        <li><span class="tag tag-advisory">建议关注</span> {{ adv.label }}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="empty-cell">无</p>
+      {% endif %}
+    </div>
   </section>
   {% endfor %}
 </div>
