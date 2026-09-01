@@ -259,7 +259,7 @@ currency/cardinality safety of the F1 comparisons).
 异常与任务中心 plus the Exception/Task export.
 
 **Status: F0 frozen/passed · F1 implemented + Slice Pre-Gate passed ·
-F2 implemented + Slice Pre-Gate passed · Phase Final Gate: pending.**
+F2 implemented + Slice Pre-Gate passed · Phase Final Gate passed.**
 
 **F0 (semantics & product freeze) is documentation-only**: the Center is
 ONE landing surface over several authoritative unresolved-work sources —
@@ -339,7 +339,23 @@ minimum:
 
 Reconciliation is against a business-confirmed **Cutover Baseline**, not
 against the raw legacy spreadsheet — the legacy ledger is not Golden
-Truth. See [docs/V1-SCOPE.md](docs/V1-SCOPE.md) section 7.
+Truth. See [docs/V1-SCOPE.md](docs/V1-SCOPE.md) section 7 and
+[docs/FIRST-STAGE-CUTOVER-GATE.md](docs/FIRST-STAGE-CUTOVER-GATE.md).
+
+**The FIRST-STAGE CUTOVER GATE harness is implemented** (`bel cutover gate
+--period YYYY-MM`, application seam
+`bel.application.first_stage_cutover_gate`, contract in
+[docs/FIRST-STAGE-CUTOVER-GATE.md](docs/FIRST-STAGE-CUTOVER-GATE.md)):
+PostgreSQL-only, schema-at-head verified, canonical reconciliation with
+UNRESOLVED = 0, all first-stage work surfaces and Data Products verified
+(byte-deterministic), privacy-boundary enforced, and strictly read-only.
+**The actual private Gate is still pending** — a PASS has NOT been
+claimed, and BEL is NOT yet declared System of Record. The Gate is a
+judge, never a switch: it performs no backfill, no baseline synthesis, no
+discrepancy repair, no Task auto-resolution, and no System-of-Record
+declaration. A Gate PASS means BEL MAY be declared System of Record; the
+declaration is a separate human/business acceptance step after the REAL
+private Gate PASS.
 
 **Passing this gate is what makes BEL the System of Record and demotes
 the legacy Excel to a read-only reference / Data Product.**

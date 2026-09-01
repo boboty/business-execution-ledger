@@ -153,10 +153,19 @@ def cli(ctx: click.Context, database_url: str) -> None:
     """
     ctx.ensure_object(dict)
     ctx.obj["database_url"] = database_url
-    try:
-        assert_schema_at_head(make_engine(database_url))
-    except SchemaNotAtHeadError as exc:
-        raise click.ClickException(str(exc)) from exc
+    # `cutover gate` is the exception to the global startup schema gate: it
+    # is strictly read-only, so running it against a schema-not-at-head
+    # database is safe, and its whole purpose is to REPORT that mismatch as
+    # a FAIL dimension (with the private diagnostic report) rather than be
+    # blocked before it can judge. The Gate performs its OWN dialect +
+    # schema-at-head verification (docs/FIRST-STAGE-CUTOVER-GATE.md section
+    # 2) and can never PASS a mismatched schema. Every other command keeps
+    # the hard startup gate.
+    if ctx.invoked_subcommand != "gate":
+        try:
+            assert_schema_at_head(make_engine(database_url))
+        except SchemaNotAtHeadError as exc:
+            raise click.ClickException(str(exc)) from exc
 
 
 @cli.command("import-contract-ledger")
@@ -2054,9 +2063,11 @@ def _write_cutover_report(period_dir: Path, filename: str, diagnostic: dict) -> 
 
 @cli.group("cutover")
 def cutover_group() -> None:
-    """Phase 2D.1-R5 cutover infrastructure/rehearsal — backfill and
-    reconciliation only. Never a final-cutover switch: passing
-    reconciliation here does not declare BEL the System of Record."""
+    """Phase 2D.1-R5 cutover infrastructure/rehearsal — backfill,
+    reconciliation, and the FIRST-STAGE CUTOVER GATE (see
+    docs/FIRST-STAGE-CUTOVER-GATE.md). Never a final-cutover switch:
+    passing reconciliation, or even a Gate PASS, does not itself declare
+    BEL the System of Record."""
 
 
 @cutover_group.command("backfill")
@@ -2129,6 +2140,44 @@ def cutover_reconcile_cmd(ctx: click.Context, period: str) -> None:
         },
     )
     click.echo(f"P2D_CUTOVER_RECONCILIATION: {'PASS' if result.passed else 'FAIL'}")
+
+
+@cutover_group.command("gate")
+@click.option("--period", required=True, help="Period directory name under BEL_PRIVATE_DATA_ROOT — strict YYYY-MM, e.g. 2026-07.")
+@click.pass_context
+def cutover_gate_cmd(ctx: click.Context, period: str) -> None:
+    """Run the FIRST-STAGE CUTOVER GATE against the target PostgreSQL
+    database (docs/FIRST-STAGE-CUTOVER-GATE.md).
+
+    Judges an already-prepared database: PostgreSQL runtime at Alembic
+    head, the period's backfill-plan.json + expected/cutover-baseline.json
+    present, canonical cutover reconciliation with UNRESOLVED = 0, all
+    first-stage work surfaces and Data Products operational and
+    deterministic, and zero business-state writes.
+
+    The Gate NEVER performs the cutover: no backfill, no baseline
+    synthesis, no discrepancy repair, no Task auto-resolution, and no
+    System-of-Record switch. A PASS means BEL MAY be declared System of
+    Record — the declaration itself is a separate human/business step
+    after the REAL private Gate PASS.
+
+    Public stdout is exactly ``FIRST_STAGE_CUTOVER_GATE: PASS`` or
+    ``FIRST_STAGE_CUTOVER_GATE: FAIL`` — never a name, id, count, amount,
+    discrepancy or path. Full diagnostics (including private-derived
+    values) go ONLY to
+    ``$BEL_PRIVATE_DATA_ROOT/reports/first-stage-cutover-gate-<YYYY-MM>.json``.
+    """
+    from bel.application.first_stage_cutover_gate import candidate_sha, run_first_stage_cutover_gate
+
+    session_factory = _session_factory(ctx.obj["database_url"])
+    with session_factory() as session:
+        result = run_first_stage_cutover_gate(
+            session,
+            period=period,
+            candidate_sha=candidate_sha(),
+        )
+    click.echo(f"FIRST_STAGE_CUTOVER_GATE: {'PASS' if result.passed else 'FAIL'}")
+    raise SystemExit(0 if result.passed else 1)
 
 
 if __name__ == "__main__":

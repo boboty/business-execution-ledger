@@ -672,7 +672,13 @@ Reconciliation must distinguish at least three outcomes:
 BEL may be declared able to replace the legacy ledger as System of
 Record only when `UNRESOLVED = 0` **and** the other first-stage
 acceptance gates pass. `UNRESOLVED = 0` means every discrepancy has been
-adjudicated — not that BEL agrees with Excel everywhere.
+adjudicated — not that BEL agrees with Excel everywhere. The concrete
+Gate machinery that encodes this (PostgreSQL-only, schema-at-head,
+canonical reconciliation with `UNRESOLVED = 0`, first-stage surfaces and
+Data Products operational, read-only, privacy-contained) is
+[FIRST-STAGE-CUTOVER-GATE.md](FIRST-STAGE-CUTOVER-GATE.md); it is a
+read-only judge, never a cutover switch, and the actual private Gate has
+not yet passed.
 
 ### 7.2 Cutover reconciliation respects the private-data boundary
 
