@@ -51,9 +51,9 @@
       {% endif %}
 
       <p class="wb-sub">已关联销项发票事实</p>
-      {% if scope.invoice_allocations %}
+      {% if scope.confirmed_invoice_allocations %}
       <ul class="ledger-nested-list">
-        {% for inv in scope.invoice_allocations %}
+        {% for inv in scope.confirmed_invoice_allocations %}
         <li>{{ inv.invoice_no }} · 开票日期 {{ inv.issue_date }} · 发票价税合计 {{ inv.gross_amount }} · 关联金额 {{ inv.allocated_gross_amount }}</li>
         {% endfor %}
       </ul>
@@ -62,25 +62,14 @@
       {% endif %}
 
       <p class="wb-sub">已关联收款事实</p>
-      {% if scope.payment_allocations %}
+      {% if scope.confirmed_receipt_allocations %}
       <ul class="ledger-nested-list">
-        {% for rec in scope.payment_allocations %}
+        {% for rec in scope.confirmed_receipt_allocations %}
         <li>{{ rec.bank_reference }} · {{ rec.transaction_date }} · 收款金额 {{ rec.amount }} · 关联金额 {{ rec.allocated_amount }}</li>
         {% endfor %}
       </ul>
       {% else %}
       <p class="empty-cell">暂无已关联收款事实</p>
-      {% endif %}
-
-      <p class="wb-sub">待处理事项</p>
-      {% if scope.unresolved_work %}
-      <ul class="ledger-nested-list">
-        {% for work in scope.unresolved_work %}
-        <li><span class="tag tag-blocker">未结</span> {{ work.summary }}</li>
-        {% endfor %}
-      </ul>
-      {% else %}
-      <p class="empty-cell">无</p>
       {% endif %}
     </div>
 
@@ -101,13 +90,31 @@
 
     <div class="wb-block">
       <h4 class="wb-block-title">提醒 / 待关注</h4>
+      {% if scope.has_unresolved_work %}
+      <p class="wb-sub">已有待处理事项</p>
+      <ul class="ledger-nested-list">
+        {% for work in scope.unresolved_work %}
+        <li><span class="tag tag-blocker">未结</span> {{ work.summary }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      {% if scope.has_incomplete_allocations %}
+      <p class="wb-sub">关联记录对应的基础事实缺失</p>
+      <ul class="ledger-nested-list">
+        {% for a in scope.incomplete_allocations %}
+        <li>{{ a.kind_label }}{% if a.allocated_gross_amount != '—' %} · 关联金额 {{ a.allocated_gross_amount }}{% elif a.allocated_amount != '—' %} · 关联金额 {{ a.allocated_amount }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
       {% if scope.has_advisories %}
+      <p class="wb-sub">管理提醒</p>
       <ul class="ledger-nested-list">
         {% for adv in scope.advisories %}
         <li><span class="tag tag-advisory">建议关注</span> {{ adv.label }}</li>
         {% endfor %}
       </ul>
-      {% else %}
+      {% endif %}
+      {% if not scope.has_unresolved_work and not scope.has_incomplete_allocations and not scope.has_advisories %}
       <p class="empty-cell">无</p>
       {% endif %}
     </div>
@@ -160,9 +167,9 @@
       {% endif %}
 
       <p class="wb-sub">已确认采购发票</p>
-      {% if scope.invoice_allocations %}
+      {% if scope.confirmed_invoice_allocations %}
       <ul class="ledger-nested-list">
-        {% for inv in scope.invoice_allocations %}
+        {% for inv in scope.confirmed_invoice_allocations %}
         <li>{{ inv.invoice_no }} · 开票日期 {{ inv.issue_date }} · 关联金额 {{ inv.allocated_gross_amount }} · <span class="tag tag-status">{{ inv.confirmation_type_label }}</span></li>
         {% endfor %}
       </ul>
@@ -182,25 +189,14 @@
       {% endif %}
 
       <p class="wb-sub">已确认付款</p>
-      {% if scope.payment_allocations %}
+      {% if scope.confirmed_payment_allocations %}
       <ul class="ledger-nested-list">
-        {% for p in scope.payment_allocations %}
+        {% for p in scope.confirmed_payment_allocations %}
         <li>{{ p.bank_reference }} · {{ p.transaction_date }} · 关联金额 {{ p.allocated_amount }} · <span class="tag tag-status">{{ p.confirmation_type_label }}</span></li>
         {% endfor %}
       </ul>
       {% else %}
       <p class="empty-cell">暂无已确认付款</p>
-      {% endif %}
-
-      <p class="wb-sub">待处理事项</p>
-      {% if scope.unresolved_work %}
-      <ul class="ledger-nested-list">
-        {% for work in scope.unresolved_work %}
-        <li><span class="tag tag-blocker">未结</span> {{ work.summary }}</li>
-        {% endfor %}
-      </ul>
-      {% else %}
-      <p class="empty-cell">无</p>
       {% endif %}
     </div>
 
@@ -234,13 +230,31 @@
 
     <div class="wb-block">
       <h4 class="wb-block-title">提醒 / 待关注</h4>
+      {% if scope.has_unresolved_work %}
+      <p class="wb-sub">已有待处理事项</p>
+      <ul class="ledger-nested-list">
+        {% for work in scope.unresolved_work %}
+        <li><span class="tag tag-blocker">未结</span> {{ work.summary }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      {% if scope.has_incomplete_allocations %}
+      <p class="wb-sub">关联记录对应的基础事实缺失</p>
+      <ul class="ledger-nested-list">
+        {% for a in scope.incomplete_allocations %}
+        <li>{{ a.kind_label }}{% if a.allocated_gross_amount != '—' %} · 关联金额 {{ a.allocated_gross_amount }}{% elif a.allocated_amount != '—' %} · 关联金额 {{ a.allocated_amount }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
       {% if scope.has_advisories %}
+      <p class="wb-sub">管理提醒</p>
       <ul class="ledger-nested-list">
         {% for adv in scope.advisories %}
         <li><span class="tag tag-advisory">建议关注</span> {{ adv.label }}</li>
         {% endfor %}
       </ul>
-      {% else %}
+      {% endif %}
+      {% if not scope.has_unresolved_work and not scope.has_incomplete_allocations and not scope.has_advisories %}
       <p class="empty-cell">无</p>
       {% endif %}
     </div>

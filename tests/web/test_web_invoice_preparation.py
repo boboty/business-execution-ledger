@@ -33,7 +33,10 @@ from bel.application.invoice_preparation import (
     SalesScopeContext,
     SalesScopeInvoiceAllocation,
     SalesScopeLinkedProcurementContract,
+    SalesScopePaymentAllocation,
     SupplierScopeContext,
+    SupplierScopeInvoiceAllocation,
+    SupplierScopePaymentAllocation,
     get_invoice_preparation_context,
 )
 from bel.application.invoice_preparation_workbench import get_invoice_preparation_workbench_from_context
@@ -129,7 +132,6 @@ FACT_PRESENCE_LABELS = (
     "已确认付款",
     "已确认出货事实",
     "当前商品明细",
-    "待处理事项",
 )
 
 
@@ -896,9 +898,139 @@ def test_f2a_incomplete_allocation_does_not_become_confirmed_fact():
     )
     vm = InvoicePreparationVM(get_invoice_preparation_workbench_from_context(context))
     scope = vm.sales_scopes[0]
-    # The dangling allocation is context only: no invoice number, and the
-    # comparison treats the invoice leg as unavailable (business label).
-    assert scope.invoice_allocations[0].invoice_no == "—"
+    # The dangling allocation is NOT a confirmed Invoice Fact: it must NOT
+    # appear in the confirmed sales-invoice list, and the comparison treats
+    # the invoice leg as unavailable (business label). The association
+    # itself stays visible only under the attention wording.
+    assert scope.confirmed_invoice_allocations == []
+    assert len(scope.incomplete_allocations) == 1
+    assert scope.incomplete_allocations[0].kind_label == "销项发票关联"
     assert scope.amount_control.outcome_label == F2A_SALES_MISSING_LABEL
     assert scope.amount_control.invoice_amount == "—"
     assert scope.has_advisories is False
+
+
+def test_f2a_dangling_sales_receipt_is_not_a_confirmed_fact():
+    """A SalesPaymentAllocation whose Payment Fact is missing is NOT a
+    confirmed IN receipt: it must not appear under 已关联收款事实, and stays
+    visible only under the attention wording."""
+    sc_id, dangling_payment_id = uuid.uuid4(), uuid.uuid4()
+    sales_contract = SalesContract(
+        id=sc_id, our_entity="Our Own Entity", sales_contract_no="SC-DANGLING-REC",
+        customer="Customer D", currency="USD", gross_amount=Decimal("100.00"),
+        contract_date=date(2026, 1, 1), current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    context = InvoicePreparationContext(
+        sales_scopes=(
+            SalesScopeContext(
+                sales_contract=sales_contract,
+                linked_procurement_contracts=(),
+                invoice_allocations=(),
+                payment_allocations=(
+                    SalesScopePaymentAllocation(
+                        allocation=SalesPaymentAllocation(
+                            id=uuid.uuid4(), payment_id=dangling_payment_id, sales_contract_id=sc_id,
+                            match_case_id=uuid.uuid4(), allocated_amount=Decimal("60.00"),
+                            confirmation_type=ConfirmationType.HUMAN_CONFIRMED, created_at=NOW,
+                        ),
+                        payment=None,
+                    ),
+                ),
+                unresolved_work=(),
+            ),
+        ),
+        supplier_scopes=(),
+    )
+    vm = InvoicePreparationVM(get_invoice_preparation_workbench_from_context(context))
+    scope = vm.sales_scopes[0]
+    assert scope.confirmed_receipt_allocations == []
+    assert len(scope.incomplete_allocations) == 1
+    assert scope.incomplete_allocations[0].kind_label == "收款关联"
+
+
+def test_f2a_dangling_purchase_invoice_allocation_is_not_a_confirmed_fact():
+    """An InvoiceAllocation whose Invoice Fact is missing is NOT a confirmed
+    PURCHASE invoice: it must not appear under 已确认采购发票, and stays
+    visible only under the attention wording."""
+    contract_id, dangling_invoice_id = uuid.uuid4(), uuid.uuid4()
+    contract = Contract(
+        id=contract_id, contract_no="PO-DANGLING-PINV", contract_type=None, counterparty="Supplier",
+        buyer="Our Own Entity", gross_amount=Decimal("100.00"), currency="USD", contract_date=date(2026, 1, 1),
+        current_source_fragment_id=uuid.uuid4(), created_at=NOW, updated_at=NOW,
+    )
+    context = InvoicePreparationContext(
+        sales_scopes=(),
+        supplier_scopes=(
+            SupplierScopeContext(
+                contract=contract, items=(), shipments=(),
+                invoice_allocations=(
+                    SupplierScopeInvoiceAllocation(
+                        allocation=InvoiceAllocation(
+                            id=uuid.uuid4(), invoice_id=dangling_invoice_id, contract_id=contract_id,
+                            match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+                            match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                            confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                        ),
+                        invoice=None,
+                    ),
+                ),
+                invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
+            ),
+        ),
+    )
+    vm = InvoicePreparationVM(get_invoice_preparation_workbench_from_context(context))
+    scope = vm.supplier_scopes[0]
+    assert scope.confirmed_invoice_allocations == []
+    assert len(scope.incomplete_allocations) == 1
+    assert scope.incomplete_allocations[0].kind_label == "采购发票关联"
+
+
+def test_f2a_dangling_out_payment_allocation_is_not_a_confirmed_fact():
+    """A PaymentAllocation whose Payment Fact is missing is NOT a confirmed
+    OUT payment: it must not appear under 已确认付款, and stays visible only
+    under the attention wording."""
+    contract_id, dangling_payment_id = uuid.uuid4(), uuid.uuid4()
+    contract = Contract(
+        id=contract_id, contract_no="PO-DANGLING-OUT", contract_type=None, counterparty="Supplier",
+        buyer="Our Own Entity", gross_amount=Decimal("100.00"), currency="USD", contract_date=date(2026, 1, 1),
+        current_source_fragment_id=uuid.uuid4(), created_at=NOW, updated_at=NOW,
+    )
+    context = InvoicePreparationContext(
+        sales_scopes=(),
+        supplier_scopes=(
+            SupplierScopeContext(
+                contract=contract, items=(), shipments=(),
+                invoice_allocations=(),
+                invoice_item_allocations=(),
+                payment_allocations=(
+                    SupplierScopePaymentAllocation(
+                        allocation=PaymentAllocation(
+                            id=uuid.uuid4(), payment_id=dangling_payment_id, contract_id=contract_id,
+                            match_case_id=uuid.uuid4(), allocated_amount=Decimal("50.00"),
+                            match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                            confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                        ),
+                        payment=None,
+                    ),
+                ),
+                unresolved_work=(),
+            ),
+        ),
+    )
+    vm = InvoicePreparationVM(get_invoice_preparation_workbench_from_context(context))
+    scope = vm.supplier_scopes[0]
+    assert scope.confirmed_payment_allocations == []
+    assert len(scope.incomplete_allocations) == 1
+    assert scope.incomplete_allocations[0].kind_label == "付款关联"
+
+
+def test_unresolved_work_is_under_attention_not_facts(prep_ctx):
+    """SC-101 carries an OPEN SalesContractCustomerUnresolved task: it must
+    appear under 提醒/待关注 as 已有待处理事项, and the old bare 待处理事项
+    heading must no longer appear inside 已确认事实 (unresolved work is
+    existing Task/Exception context, not a Business Fact)."""
+    client, _ = prep_ctx
+    response = client.get("/invoice-preparation")
+    assert "已有待处理事项" in response.text
+    assert '<p class="wb-sub">待处理事项</p>' not in response.text
+    assert '<h4 class="wb-block-title">提醒 / 待关注</h4>' in response.text

@@ -55,6 +55,8 @@ from bel.application.supplier_invoice_request import (
     SupplierRequestCheckOutcome,
 )
 from bel.domain.contract import ContractItem
+from bel.domain.invoice import InvoiceDirection
+from bel.domain.payment import PaymentDirection
 
 # ---- Blocker business copy (Presentation only — existence/type of a
 # blocker is decided exclusively by period_close.py). ----
@@ -988,6 +990,21 @@ class SupplierRequestAdvisoryVM:
         self.label = SUPPLIER_INVOICE_ADVISORY_LABELS.get(advisory.code, advisory.code)
 
 
+class InvoicePrepIncompleteAllocationVM:
+    """One association whose referenced base Fact is missing (or not the
+    expected direction) — an allocation record is NOT proof that the
+    referenced Invoice/Payment Fact exists. Shown separately under
+    attention/context wording (关联记录对应的基础事实缺失), never under a
+    confirmed-Fact heading. The allocation record itself stays raw
+    context: kind + allocated amount only, never a fabricated Fact."""
+
+    def __init__(self, entry, kind_label: str) -> None:
+        self.kind_label = kind_label
+        allocation = entry.allocation
+        self.allocated_gross_amount = _fmt(getattr(allocation, "allocated_gross_amount", None))
+        self.allocated_amount = _fmt(getattr(allocation, "allocated_amount", None))
+
+
 class InvoicePrepSalesScopeVM:
     def __init__(self, scope, decision) -> None:
         sc = scope.sales_contract
@@ -1002,9 +1019,35 @@ class InvoicePrepSalesScopeVM:
         self.linked_procurement_contracts = [
             InvoicePrepLinkedContractVM(entry) for entry in scope.linked_procurement_contracts
         ]
-        self.invoice_allocations = [InvoicePrepSalesInvoiceVM(e) for e in scope.invoice_allocations]
-        self.payment_allocations = [InvoicePrepSalesReceiptVM(e) for e in scope.payment_allocations]
+        # F2a pre-gate repair — confirmed-Fact lists require actual Facts:
+        # a SALES invoice entry counts only when its Invoice Fact exists
+        # AND is direction SALES; an IN receipt only when its Payment Fact
+        # exists AND is direction IN. An allocation/association is NOT
+        # proof that the referenced Fact exists.
+        self.confirmed_invoice_allocations = [
+            InvoicePrepSalesInvoiceVM(e)
+            for e in scope.invoice_allocations
+            if e.invoice is not None and e.invoice.direction == InvoiceDirection.SALES
+        ]
+        self.confirmed_receipt_allocations = [
+            InvoicePrepSalesReceiptVM(e)
+            for e in scope.payment_allocations
+            if e.payment is not None and e.payment.direction == PaymentDirection.IN
+        ]
+        # Everything else stays raw attention/context — never a confirmed
+        # Fact, never hidden (F0 keeps the association; we surface it).
+        self.incomplete_allocations = [
+            InvoicePrepIncompleteAllocationVM(e, "销项发票关联")
+            for e in scope.invoice_allocations
+            if not (e.invoice is not None and e.invoice.direction == InvoiceDirection.SALES)
+        ] + [
+            InvoicePrepIncompleteAllocationVM(e, "收款关联")
+            for e in scope.payment_allocations
+            if not (e.payment is not None and e.payment.direction == PaymentDirection.IN)
+        ]
+        self.has_incomplete_allocations = bool(self.incomplete_allocations)
         self.unresolved_work = [InvoicePrepUnresolvedWorkVM(w) for w in scope.unresolved_work]
+        self.has_unresolved_work = bool(self.unresolved_work)
         # F2a — the F1 decision's comparison + advisories, translated once
         # in the presentation layer. The amount check is always present
         # (every sales scope has a SalesContract); a NOT_COMPARABLE
@@ -1021,8 +1064,9 @@ class InvoicePrepShipmentVM:
         self.execution_date = _fmt(shipment.execution_date)
         self.quantity = _fmt(shipment.quantity)
         # Phase 2D.3-F1c — canonical export/customs declaration values,
-        # exposed as facts only (IP-S02 full three-way comparison is not
-        # implemented); unknown stays unknown.
+        # exposed as facts; the F1f IP-S02 three-way comparison is
+        # implemented for the unambiguous 1:1:1 scope (this page shows it
+        # in the scope's 核对结果 block); unknown stays unknown.
         self.declared_amount = _fmt(shipment.declared_amount)
         self.declared_currency = shipment.declared_currency or "—"
         self.item = ItemPresentationVM(item_by_id.get(shipment.contract_item_id))
@@ -1079,10 +1123,36 @@ class InvoicePrepSupplierScopeVM:
         item_by_id = {item.id: item for item in scope.items}
         self.items = [ItemPresentationVM(item) for item in scope.items]
         self.shipments = [InvoicePrepShipmentVM(s, item_by_id) for s in scope.shipments]
-        self.invoice_allocations = [InvoicePrepProcurementInvoiceVM(e) for e in scope.invoice_allocations]
+        # F2a pre-gate repair — confirmed-Fact lists require actual Facts:
+        # a PURCHASE invoice entry counts only when its Invoice Fact exists
+        # AND is direction PURCHASE; an OUT payment only when its Payment
+        # Fact exists AND is direction OUT. An allocation/association is
+        # NOT proof that the referenced Fact exists.
+        self.confirmed_invoice_allocations = [
+            InvoicePrepProcurementInvoiceVM(e)
+            for e in scope.invoice_allocations
+            if e.invoice is not None and e.invoice.direction == InvoiceDirection.PURCHASE
+        ]
+        self.confirmed_payment_allocations = [
+            InvoicePrepOutgoingPaymentVM(e)
+            for e in scope.payment_allocations
+            if e.payment is not None and e.payment.direction == PaymentDirection.OUT
+        ]
+        # Everything else stays raw attention/context — never a confirmed
+        # Fact, never hidden (F0 keeps the association; we surface it).
+        self.incomplete_allocations = [
+            InvoicePrepIncompleteAllocationVM(e, "采购发票关联")
+            for e in scope.invoice_allocations
+            if not (e.invoice is not None and e.invoice.direction == InvoiceDirection.PURCHASE)
+        ] + [
+            InvoicePrepIncompleteAllocationVM(e, "付款关联")
+            for e in scope.payment_allocations
+            if not (e.payment is not None and e.payment.direction == PaymentDirection.OUT)
+        ]
+        self.has_incomplete_allocations = bool(self.incomplete_allocations)
         self.invoice_item_allocations = [InvoicePrepItemAllocationVM(e) for e in scope.invoice_item_allocations]
-        self.payment_allocations = [InvoicePrepOutgoingPaymentVM(e) for e in scope.payment_allocations]
         self.unresolved_work = [InvoicePrepUnresolvedWorkVM(w) for w in scope.unresolved_work]
+        self.has_unresolved_work = bool(self.unresolved_work)
         # F2a — the F1 decision's reference amount, management-control
         # checks and advisories, translated once in the presentation layer.
         self.expected_invoice_amount = _fmt(decision.expected_purchase_invoice_gross_amount)
