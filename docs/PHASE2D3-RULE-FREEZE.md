@@ -164,9 +164,27 @@ quantity is not established. No quantity calculation may be invented.
 
 **Source: `UNRESOLVED_SAFE_BLOCKER`.**
 
+### IP-P08 — Tax classification code comes from Evidence, never inference
+
+The goods/services tax classification code (税收分类编码) on a supplier
+PURCHASE invoice line follows confirmed Evidence only:
+
+- an already-confirmed code the system holds for that product category
+  is **directly reused** (直接沿用) — never re-derived or re-asked;
+- a new product category, or a product with no confirmed code, requires
+  the **supplier to confirm** it — the outcome is
+  `HUMAN_CONFIRMATION_REQUIRED`, never a guessed code;
+- BEL **never guesses a tax classification code**: no inference from
+  product name, tax rate, quantity, or any other existing value, and no
+  mapping/synthesis from another field. A product with no confirmed code
+  remains representable as "code unknown" while the system records the
+  need for supplier confirmation.
+
+**Source: `ACCOUNTANT_CONFIRMED`.**
+
 ---
 
-## Implementation status map (as of Phase 2D.3-F1c)
+## Implementation status map (as of Phase 2D.3-F1d)
 
 Semantics of the frozen-rule conflicts implemented by F1b: a MISMATCH
 of an IP-P02 amount comparison or an IP-P05 product-name comparison is
@@ -179,16 +197,37 @@ emits an explicit missing-fact blocker and makes the scope decision at
 least `INSUFFICIENT_FACTS`. Status precedence: `RULE_CONFLICT` >
 `INSUFFICIENT_FACTS` > `PREPARATION_AMOUNT_DETERMINABLE`.
 
-| Rule | Standing | Implementation |
-| --- | --- | --- |
-| IP-S01 | `ACCOUNTANT_CONFIRMED` | Implemented (F1a) |
-| IP-S02 | `OWNER_CONFIRMED_PROVISIONAL` | Frozen as a rule; canonical declaration amount/currency supported after F1c, but full three-way consistency evaluation still pending (IP-S02 limitation above) |
-| IP-S03 | `OWNER_CONFIRMED_PROVISIONAL` | Respected by F1a (receipts never consulted) |
-| IP-S04 | `UNRESOLVED_SAFE_BLOCKER` | Safe blocker kept (F1a) |
-| IP-P01 | `ACCOUNTANT_CONFIRMED` | Respected by F1b (payments exposed as context only) |
-| IP-P02 | `ACCOUNTANT_CONFIRMED` | Implemented (F1b); amount MISMATCH → `PURCHASE_INVOICE_AMOUNT_MISMATCH` conflict; missing compared Fact/value → explicit missing-fact blocker |
-| IP-P03 | `ACCOUNTANT_CONFIRMED` | Implemented as deterministic violation check (F1b) — a Contract must not be split |
-| IP-P04 | `ACCOUNTANT_CONFIRMED` | Implemented as deterministic violation check (F1b) |
-| IP-P05 | `ACCOUNTANT_CONFIRMED` | Implemented as exact product-name check where item facts exist (F1b); MISMATCH → `PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH` conflict; missing name → explicit missing-fact blocker |
-| IP-P06 | `ACCOUNTANT_CONFIRMED` | Respected by F1b (no inference; Facts only) |
-| IP-P07 | `UNRESOLVED_SAFE_BLOCKER` | No quantity calculation (F1b) |
+Advisory / blocker separation (Phase 2D.3-F1d): every implemented rule
+is re-leveled into a **finding level** — the outcome class its findings
+produce on the SUPPLIER_INVOICE_REQUEST Decision:
+
+- `BLOCKER` — hard findings (rule conflicts / missing compared Facts).
+  The decision status is derived from these ALONE
+  (`RULE_CONFLICT` > `INSUFFICIENT_FACTS` > `PREPARATION_AMOUNT_DETERMINABLE`).
+- `ADVISORY` — explicit NON-BLOCKING findings (F1d advisory channel).
+  They record a frozen accountant-confirmed rule consequence that is
+  factual context and never a gate, and they NEVER affect the decision
+  status: a scope with advisories and no blockers is still
+  `PREPARATION_AMOUNT_DETERMINABLE`, and an advisory coexisting with a
+  blocker leaves the blocker's status intact.
+- `CONTEXT` — Facts exposed on the decision; no finding is emitted by
+  this rule today.
+- `NO-FINDING` — the rule emits nothing yet (guard-only or pending).
+
+Provenance standings are unchanged by this re-leveling; the column only
+states the outcome class each rule's findings map onto.
+
+| Rule | Standing | Finding level | Implementation |
+| --- | --- | --- | --- |
+| IP-S01 | `ACCOUNTANT_CONFIRMED` | `BLOCKER` | Implemented (F1a); missing required input → explicit blocker / `INSUFFICIENT_FACTS` |
+| IP-S02 | `OWNER_CONFIRMED_PROVISIONAL` | `CONTEXT` | Frozen as a rule; canonical declaration amount/currency supported after F1c and exposed as Shipment Facts, but full three-way consistency evaluation still pending (IP-S02 limitation above) — no finding emitted |
+| IP-S03 | `OWNER_CONFIRMED_PROVISIONAL` | `CONTEXT` | Respected by F1a (receipts never consulted); no finding emitted |
+| IP-S04 | `UNRESOLVED_SAFE_BLOCKER` | `BLOCKER` | Safe blocker kept (F1a) |
+| IP-P01 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` | F1b exposes OUT payment Facts as context; F1d adds the `OUT_PAYMENT_PRESENT_CONTEXT_ONLY` advisory — payment never gates, never affects status |
+| IP-P02 | `ACCOUNTANT_CONFIRMED` | `BLOCKER` | Implemented (F1b); amount MISMATCH → `PURCHASE_INVOICE_AMOUNT_MISMATCH` conflict; missing compared Fact/value → explicit missing-fact blocker |
+| IP-P03 | `ACCOUNTANT_CONFIRMED` | `BLOCKER` | Implemented as deterministic violation check (F1b) — a Contract must not be split |
+| IP-P04 | `ACCOUNTANT_CONFIRMED` | `BLOCKER` | Implemented as deterministic violation check (F1b) |
+| IP-P05 | `ACCOUNTANT_CONFIRMED` | `BLOCKER` | Implemented as exact product-name check where item facts exist (F1b); MISMATCH → `PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH` conflict; missing name → explicit missing-fact blocker |
+| IP-P06 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` | F1b exposes an existing InvoiceItem `tax_rate` as the Fact it is; F1d adds the `EXISTING_INVOICE_ITEM_TAX_RATE_FACT` advisory — display only, never an inference/recommendation, never a status change |
+| IP-P07 | `UNRESOLVED_SAFE_BLOCKER` | `NO-FINDING` | No quantity calculation (F1b); guard only |
+| IP-P08 | `ACCOUNTANT_CONFIRMED` | `NO-FINDING` | Frozen as a rule; NO tax-classification-code path exists anywhere yet (no field, no confirmation flow) — register-only; eventual outcome class `HUMAN_CONFIRMATION_REQUIRED`, implementation pending a later stage |

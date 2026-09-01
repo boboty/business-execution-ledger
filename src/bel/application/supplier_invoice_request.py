@@ -65,6 +65,19 @@ Status precedence when several apply: ``RULE_CONFLICT`` >
 rule conflict is never masked by fact incompleteness; the violated
 facts remain exposed on the decision either way.
 
+Advisory / blocker separation (Phase 2D.3-F1d): a Decision carries
+exactly two finding channels. ``blockers`` are hard findings — the
+frozen-rule conflicts and missing compared Facts the status precedence
+is derived from. ``advisories`` are explicit NON-BLOCKING findings:
+they record a frozen accountant-confirmed rule consequence that is
+factual context and never a gate (IP-P01: OUT payment Facts present;
+IP-P06: an actual InvoiceItem tax_rate reachable as an existing Fact).
+An advisory NEVER affects ``status`` — status is a function of blockers
+alone, so a scope with advisories and no blockers is still
+``PREPARATION_AMOUNT_DETERMINABLE``. Advisories follow the same
+discipline as blockers: they state what the Facts are, never what
+should be done about them (no "should"/"recommend"/"must pay").
+
 Check results (exact, never tolerant): ``MATCH`` / ``MISMATCH`` /
 ``NOT_COMPARABLE_MISSING_FACT``. A MISMATCH means the confirmed Facts
 conflict with a frozen accountant-confirmed rule (IP-P02 / IP-P05): it
@@ -173,6 +186,38 @@ class SupplierRequestBlockerCode:
     PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH = "PURCHASE_INVOICE_PRODUCT_NAME_MISMATCH"
 
 
+class SupplierRequestAdvisoryCode:
+    """Explicit NON-BLOCKING finding codes (Phase 2D.3-F1d). An advisory
+    records a frozen accountant-confirmed rule consequence that is
+    factual context — it is emitted alongside the exposed Facts, never
+    drives the decision status, and never states what should be done
+    about it. ``status`` is derived from blockers only; an advisory code
+    belongs to no blocker class (disjoint from
+    ``RULE_VIOLATION_BLOCKER_CODES`` and ``MISSING_FACT_BLOCKER_CODES``,
+    enforced by test)."""
+
+    # IP-P01 advisory: the scope carries OUT payment Facts. Payment is
+    # context, never a gate — the request is neither enabled nor blocked
+    # by it, and no readiness is derived from it.
+    OUT_PAYMENT_PRESENT_CONTEXT_ONLY = "OUT_PAYMENT_PRESENT_CONTEXT_ONLY"
+    # IP-P06 advisory: an actual PURCHASE InvoiceItem's tax_rate is
+    # reachable as an existing Fact. The Fact is displayed as it is; no
+    # tax-rate recommendation or inference exists anywhere.
+    EXISTING_INVOICE_ITEM_TAX_RATE_FACT = "EXISTING_INVOICE_ITEM_TAX_RATE_FACT"
+
+
+# The advisory codes, defined once — exhaustive over
+# SupplierRequestAdvisoryCode's members (enforced by test) and disjoint
+# from both blocker classes, because an advisory never participates in
+# the status precedence.
+NON_BLOCKING_ADVISORY_CODES: frozenset[str] = frozenset(
+    {
+        SupplierRequestAdvisoryCode.OUT_PAYMENT_PRESENT_CONTEXT_ONLY,
+        SupplierRequestAdvisoryCode.EXISTING_INVOICE_ITEM_TAX_RATE_FACT,
+    }
+)
+
+
 # The two blocker classes, defined once — the decision status is derived
 # from exactly this classification (RULE_CONFLICT > INSUFFICIENT_FACTS >
 # PREPARATION_AMOUNT_DETERMINABLE). Exhaustive over
@@ -242,6 +287,25 @@ class SupplierRequestBlocker:
 
 
 @dataclass(frozen=True)
+class SupplierRequestAdvisory:
+    """One explicit NON-BLOCKING finding on a procurement Contract scope
+    (Phase 2D.3-F1d). An advisory records a frozen accountant-confirmed
+    rule consequence that is factual context only (IP-P01 OUT payment
+    Facts present; IP-P06 existing InvoiceItem tax_rate Fact displayed).
+    Advisories NEVER affect the decision ``status`` — status is a
+    function of blockers alone. Like blockers, an advisory states what
+    the Facts are, never what should be done about it."""
+
+    code: str
+    # The procurement Contract scope the advisory is emitted on.
+    contract_id: uuid.UUID
+    # InvoiceItem ids the advisory is about (IP-P06: the items whose
+    # existing tax_rate Fact is displayed).
+    related_invoice_item_ids: tuple[uuid.UUID, ...] = ()
+    note: str | None = None
+
+
+@dataclass(frozen=True)
 class SupplierRequestAmountCheck:
     """IP-P02 amount-consistency check result — the single associated
     PURCHASE invoice's gross amount against the Contract gross amount,
@@ -290,9 +354,9 @@ class PurchaseInvoiceContractAssociation:
 @dataclass(frozen=True)
 class SupplierInvoiceRequestDecision:
     """One procurement Contract scope's request-preparation Decision.
-    Carries facts, the IP-P02 expected amount, check results and
-    blockers only — no readiness/eligibility field, no requested
-    quantity, no tax-rate recommendation.
+    Carries facts, the IP-P02 expected amount, check results, blockers
+    and non-blocking advisories only — no readiness/eligibility field,
+    no requested quantity, no tax-rate recommendation.
 
     The existing PURCHASE invoice / item / OUT payment associations are
     the F0 context's own frozen DTO entries, exposed verbatim (one
@@ -316,6 +380,9 @@ class SupplierInvoiceRequestDecision:
     amount_checks: tuple[SupplierRequestAmountCheck, ...] = ()
     item_name_checks: tuple[SupplierRequestItemNameCheck, ...] = ()
     blockers: tuple[SupplierRequestBlocker, ...] = ()
+    # Explicit NON-BLOCKING findings (IP-P01 / IP-P06). Never affect
+    # ``status`` — status is derived from blockers alone.
+    advisories: tuple[SupplierRequestAdvisory, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -588,13 +655,44 @@ def _evaluate_scope(
         )
 
     # F. IP-P01 — OUT payment associations are exposed as context only
-    # (below). They never gate the request and never change the status:
-    # no readiness is derived from payment anywhere above or below.
-    # G. IP-P06 — no tax rate is produced anywhere in this decision; an
-    # actual InvoiceItem's tax_rate is reachable only through the
-    # exposed invoice_item_allocations Facts.
+    # and never gate the request. The advisory channel records the rule
+    # consequence explicitly: a scope carrying OUT payment Facts gets an
+    # OUT_PAYMENT_PRESENT_CONTEXT_ONLY advisory, and the status is
+    # untouched — no readiness is derived from payment anywhere.
+    # G. IP-P06 — no tax rate is produced or inferred anywhere in this
+    # decision. An actual InvoiceItem's tax_rate is displayed only as
+    # the existing Fact it is: reachable through
+    # invoice_item_allocations AND named by an
+    # EXISTING_INVOICE_ITEM_TAX_RATE_FACT advisory (no recommendation).
     # H. IP-P07 — no quantity is calculated anywhere; the quantity basis
     # is an unresolved safe blocker (docs/PHASE2D3-RULE-FREEZE.md).
+
+    advisories: list[SupplierRequestAdvisory] = []
+    if scope.payment_allocations:
+        advisories.append(
+            SupplierRequestAdvisory(
+                code=SupplierRequestAdvisoryCode.OUT_PAYMENT_PRESENT_CONTEXT_ONLY,
+                contract_id=contract.id,
+                note="out payment Fact(s) exposed as context only; payment never gates a request (IP-P01)",
+            )
+        )
+    tax_rate_invoice_item_ids: list[uuid.UUID] = []
+    for entry in scope.invoice_item_allocations:
+        if (
+            entry.invoice_item is not None
+            and entry.invoice_item.tax_rate is not None
+            and entry.invoice_item.id not in tax_rate_invoice_item_ids
+        ):
+            tax_rate_invoice_item_ids.append(entry.invoice_item.id)
+    if tax_rate_invoice_item_ids:
+        advisories.append(
+            SupplierRequestAdvisory(
+                code=SupplierRequestAdvisoryCode.EXISTING_INVOICE_ITEM_TAX_RATE_FACT,
+                contract_id=contract.id,
+                related_invoice_item_ids=tuple(tax_rate_invoice_item_ids),
+                note="existing InvoiceItem tax_rate displayed as the Fact it is; no inference, no recommendation (IP-P06)",
+            )
+        )
 
     # Status precedence: a frozen-rule conflict outranks fact
     # incompleteness, which outranks the clean determinable state. Every
@@ -619,4 +717,5 @@ def _evaluate_scope(
         amount_checks=tuple(amount_checks),
         item_name_checks=tuple(item_name_checks),
         blockers=tuple(blockers),
+        advisories=tuple(advisories),
     )
