@@ -32,7 +32,9 @@ import pytest
 from bel.application.invoice_preparation import (
     InvoicePreparationContext,
     SalesScopeContext,
+    SalesScopeInvoiceAllocation,
     SalesScopeLinkedProcurementContract,
+    SalesScopePaymentAllocation,
     SupplierScopeContext,
 )
 from bel.application.sales_invoice_preparation import (
@@ -50,12 +52,17 @@ from bel.application.procurement_sales_link import add_procurement_sales_link
 from bel.application.sales_contract_facts import create_sales_contract_fact
 from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
+from bel.domain.invoice import Invoice, InvoiceDirection
+from bel.domain.matching import SalesInvoiceAllocation, SalesPaymentAllocation
+from bel.domain.payment import Payment, PaymentDirection
 from bel.domain.procurement_sales_link import ProcurementSalesLink, ProcurementSalesLinkCorrection
 from bel.domain.sales_contract import SalesContract
 from bel.domain.shipment import Shipment
 from bel.infrastructure.persistence.repositories import (
     ContractRepository,
     EvidenceRepository,
+    InvoiceRepository,
+    PaymentRepository,
     ProcurementSalesLinkRepository,
     ShipmentRepository,
 )
@@ -164,6 +171,49 @@ def _invalidate_link(session, link_id, fragment):
             created_at=NOW,
         )
     )
+
+
+def _make_sales_invoice(session, fragment_id, issue_date):
+    invoice = Invoice(
+        id=uuid.uuid4(),
+        direction=InvoiceDirection.SALES,
+        invoice_type=None,
+        invoice_no=None,
+        digital_invoice_no=None,
+        external_invoice_key=f"SINV-{uuid.uuid4().hex[:8]}",
+        issue_date=issue_date,
+        seller="Our Own Entity",
+        buyer="Customer",
+        net_amount=Decimal("100.00"),
+        tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"),
+        invoice_status=None,
+        source_fragment_id=fragment_id,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    InvoiceRepository(session).add(invoice)
+    session.flush()
+    return invoice
+
+
+def _make_in_receipt(session, fragment_id, transaction_date):
+    payment = Payment(
+        id=uuid.uuid4(),
+        transaction_date=transaction_date,
+        direction=PaymentDirection.IN,
+        amount=Decimal("100.00"),
+        counterparty="Customer",
+        business_type=None,
+        bank_reference=f"REF-{uuid.uuid4().hex[:8]}",
+        description=None,
+        running_balance=None,
+        source_fragment_id=fragment_id,
+        created_at=NOW,
+    )
+    PaymentRepository(session).add(payment)
+    session.flush()
+    return payment
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +329,139 @@ def test_shipments_on_unlinked_contract_do_not_satisfy_input(db_session):
     assert shipment_input.present is False
     assert shipment_input.note == "EXPORT_COMPARISON_UNAVAILABLE"
     assert shipment_input.source_fact_ids == ()
+
+
+# ---------------------------------------------------------------------------
+# Receipt chronology — IP-S03: SALES invoice / IN receipt ordering is
+# never a gate, never a finding (Codex Pre-Gate BLOCKER 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "invoice_date,receipt_date",
+    [
+        (date(2031, 1, 10), date(2031, 1, 20)),  # Case A: SALES invoice before IN receipt
+        (date(2031, 1, 20), date(2031, 1, 10)),  # Case B: IN receipt before SALES invoice
+    ],
+)
+def test_sales_invoice_receipt_ordering_never_gates(db_session, invoice_date, receipt_date):
+    """IP-S03 (ACCOUNTANT_CONFIRMED, CONTEXT): a SALES invoice and an IN
+    receipt may appear in either order with NO chronology blocker, NO
+    chronology advisory, and NO status/gate difference caused by the
+    ordering. The dates are EXPLICIT in the fixtures and genuinely
+    REVERSED across the two parameterizations."""
+    assert (invoice_date < receipt_date) or (receipt_date < invoice_date)
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id, "PO-F1A-12")
+    sales_contract = _make_sales_contract(db_session, frag.id, "SC-F1A-12", fields={"customer": "Customer D"})
+    _link(db_session, contract, sales_contract, frag)
+    _make_shipment(db_session, contract, frag.id, "SHIP-F1A-12")
+    # The SALES invoice and IN receipt Facts exist in the ledger with
+    # explicit, genuinely-reversed dates.
+    _make_sales_invoice(db_session, frag.id, issue_date=invoice_date)
+    _make_in_receipt(db_session, frag.id, transaction_date=receipt_date)
+    db_session.commit()
+
+    decision = evaluate_sales_invoice_preparation(db_session).decisions[0]
+    assert decision.status == SalesPreparationDecisionStatus.INPUTS_PRESENT
+    assert decision.blockers == ()
+    assert decision.consistency_checks == ()
+    assert decision.customer == "Customer D"
+
+
+def test_sales_invoice_receipt_in_context_never_changes_decision():
+    """Even when the SALES invoice and IN receipt associations ARE
+    carried in the F0 sales context (via SalesInvoiceAllocation /
+    SalesPaymentAllocation), the sales decision is byte-for-byte
+    identical for both orderings: it never consults them and derives no
+    status, gate, or finding from their presence or dates. (Pure function
+    over the F0 context DTOs.)"""
+    sales_contract_id, contract_id, shipment_id, invoice_id, receipt_id = (uuid.uuid4() for _ in range(5))
+
+    def _context(invoice_date, receipt_date):
+        sales_contract = SalesContract(
+            id=sales_contract_id, our_entity="Our Own Entity", sales_contract_no="SC-CHRONO-1",
+            customer="Customer E", currency="CNY", gross_amount=Decimal("100.00"),
+            contract_date=date(2026, 1, 1), current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+        )
+        contract = Contract(
+            id=contract_id, contract_no="PO-CHRONO-1", contract_type=None, counterparty="Supplier",
+            buyer="Our Own Entity", gross_amount=Decimal("100.00"), currency="CNY", contract_date=date(2026, 1, 1),
+            current_source_fragment_id=uuid.uuid4(), created_at=NOW, updated_at=NOW,
+        )
+        link = ProcurementSalesLink(
+            id=uuid.uuid4(), procurement_contract_id=contract_id, sales_contract_id=sales_contract_id,
+            source_fragment_id=uuid.uuid4(), confirmation_type="AUTO_CONFIRMED", created_at=NOW,
+        )
+        shipment = Shipment(
+            id=shipment_id, contract_id=contract_id, external_reference="SHIP-CHRONO-1",
+            execution_date=date(2031, 2, 1), contract_item_id=None, quantity=Decimal("1"),
+            current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+        )
+        sales_invoice = Invoice(
+            id=invoice_id, direction=InvoiceDirection.SALES, invoice_type=None, invoice_no=None,
+            digital_invoice_no=None, external_invoice_key="SINV-CHRONO-1", issue_date=invoice_date,
+            seller="Our Own Entity", buyer="Customer", net_amount=Decimal("100.00"), tax_amount=Decimal("0"),
+            gross_amount=Decimal("100.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+            created_at=NOW, updated_at=NOW,
+        )
+        in_receipt = Payment(
+            id=receipt_id, transaction_date=receipt_date, direction=PaymentDirection.IN,
+            amount=Decimal("100.00"), counterparty="Customer", business_type=None,
+            bank_reference="REF-CHRONO-1", description=None, running_balance=None,
+            source_fragment_id=uuid.uuid4(), created_at=NOW,
+        )
+        return InvoicePreparationContext(
+            sales_scopes=(
+                SalesScopeContext(
+                    sales_contract=sales_contract,
+                    linked_procurement_contracts=(
+                        SalesScopeLinkedProcurementContract(link=link, contract=contract),
+                    ),
+                    invoice_allocations=(SalesScopeInvoiceAllocation(
+                        allocation=SalesInvoiceAllocation(
+                            id=uuid.uuid4(), invoice_id=invoice_id, sales_contract_id=sales_contract_id,
+                            match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+                            confirmation_type="AUTO_CONFIRMED", created_at=NOW,
+                        ),
+                        invoice=sales_invoice,
+                    ),),
+                    payment_allocations=(SalesScopePaymentAllocation(
+                        allocation=SalesPaymentAllocation(
+                            id=uuid.uuid4(), payment_id=receipt_id, sales_contract_id=sales_contract_id,
+                            match_case_id=uuid.uuid4(), allocated_amount=Decimal("100.00"),
+                            confirmation_type="AUTO_CONFIRMED", created_at=NOW,
+                        ),
+                        payment=in_receipt,
+                    ),),
+                    unresolved_work=(),
+                ),
+            ),
+            supplier_scopes=(
+                SupplierScopeContext(
+                    contract=contract,
+                    items=(),
+                    shipments=(shipment,),
+                    invoice_allocations=(),
+                    invoice_item_allocations=(),
+                    payment_allocations=(),
+                    unresolved_work=(),
+                ),
+            ),
+        )
+
+    case_a = evaluate_sales_invoice_preparation_from_context(
+        _context(invoice_date=date(2031, 1, 10), receipt_date=date(2031, 1, 20))
+    ).decisions[0]
+    case_b = evaluate_sales_invoice_preparation_from_context(
+        _context(invoice_date=date(2031, 1, 20), receipt_date=date(2031, 1, 10))
+    ).decisions[0]
+
+    # Both orderings: same status, zero blockers, no consistency checks —
+    # and byte-for-byte identical decisions.
+    assert case_a.status == case_b.status == SalesPreparationDecisionStatus.INPUTS_PRESENT
+    assert case_a.blockers == () and case_b.blockers == ()
+    assert case_a == case_b
 
 
 # ---------------------------------------------------------------------------

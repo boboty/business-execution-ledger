@@ -173,6 +173,7 @@ def _make_purchase_invoice(
     counterparty="Supplier",
     product_name="Widget Alpha",
     tax_rate=Decimal("0.13"),
+    issue_date=date(2031, 1, 10),
 ):
     """A PURCHASE Invoice Fact with one InvoiceItem Fact. Returns both."""
     invoice = Invoice(
@@ -182,7 +183,7 @@ def _make_purchase_invoice(
         invoice_no=None,
         digital_invoice_no=None,
         external_invoice_key=f"PINV-{uuid.uuid4().hex[:8]}",
-        issue_date=date(2031, 1, 10),
+        issue_date=issue_date,
         seller=counterparty,
         buyer="Our Own Entity",
         net_amount=gross_amount,
@@ -250,10 +251,10 @@ def _make_invoice_item_allocation(session, invoice_item, contract_item):
     return allocation
 
 
-def _make_out_payment(session, fragment_id, amount=Decimal("1000.00")):
+def _make_out_payment(session, fragment_id, amount=Decimal("1000.00"), transaction_date=date(2031, 1, 15)):
     payment = Payment(
         id=uuid.uuid4(),
-        transaction_date=date(2031, 1, 15),
+        transaction_date=transaction_date,
         direction=PaymentDirection.OUT,
         amount=amount,
         counterparty="Supplier",
@@ -759,9 +760,9 @@ def test_amount_deviation_and_missing_name_no_conflict(db_session):
 def test_blocker_and_advisory_coexist_with_genuine_data_blocker():
     """An advisory coexisting with a genuine data blocker leaves the
     blocker's status intact: an unknown Contract gross amount (the sole
-    blocker, INSUFFICIENT_FACTS) together with multiple PURCHASE invoices
-    (an IP-P03 advisory) yields BOTH — the advisory never masks the
-    genuine data incompleteness. (Pure function over the F0 context —
+    blocker, INSUFFICIENT_FACTS) together with TWO confirmed PURCHASE
+    invoices (an IP-P03 advisory) yields BOTH — the advisory never masks
+    the genuine data incompleteness. (Pure function over the F0 context —
     an unknown current amount is unreachable in storage.)"""
     contract = Contract(
         id=uuid.uuid4(),
@@ -776,27 +777,49 @@ def test_blocker_and_advisory_coexist_with_genuine_data_blocker():
         created_at=NOW,
         updated_at=NOW,
     )
-    invoice1_id, invoice2_id = uuid.uuid4(), uuid.uuid4()
+
+    def _confirmed_invoice(amount):
+        return Invoice(
+            id=uuid.uuid4(),
+            direction=InvoiceDirection.PURCHASE,
+            invoice_type=None,
+            invoice_no=None,
+            digital_invoice_no=None,
+            external_invoice_key=f"PINV-{uuid.uuid4().hex[:8]}",
+            issue_date=date(2031, 1, 10),
+            seller="Supplier",
+            buyer="Our Own Entity",
+            net_amount=amount,
+            tax_amount=Decimal("0"),
+            gross_amount=amount,
+            invoice_status=None,
+            source_fragment_id=uuid.uuid4(),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+
+    invoice1 = _confirmed_invoice(Decimal("600.00"))
+    invoice2 = _confirmed_invoice(Decimal("400.00"))
     context = _context_with_scopes((SupplierScopeContext(
         contract=contract, items=(), shipments=(),
         invoice_allocations=(
             SupplierScopeInvoiceAllocation(
                 allocation=InvoiceAllocation(
-                    id=uuid.uuid4(), invoice_id=invoice1_id, contract_id=contract.id, match_case_id=uuid.uuid4(),
+                    id=uuid.uuid4(), invoice_id=invoice1.id, contract_id=contract.id, match_case_id=uuid.uuid4(),
                     allocated_gross_amount=Decimal("600.00"),
                     match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
                     confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
                 ),
-                invoice=None,
+                invoice=invoice1,
             ),
             SupplierScopeInvoiceAllocation(
                 allocation=InvoiceAllocation(
-                    id=uuid.uuid4(), invoice_id=invoice2_id, contract_id=contract.id, match_case_id=uuid.uuid4(),
+                    id=uuid.uuid4(), invoice_id=invoice2.id, contract_id=contract.id, match_case_id=uuid.uuid4(),
                     allocated_gross_amount=Decimal("400.00"),
                     match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
                     confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
                 ),
-                invoice=None,
+                invoice=invoice2,
             ),
         ),
         invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
@@ -851,26 +874,38 @@ def test_out_payment_paid_no_invoice_emits_follow_up_advisory(db_session):
     assert bare.advisories == ()
 
 
-@pytest.mark.parametrize("ordering", ["invoice_first", "payment_first"])
-def test_payment_and_invoice_any_ordering_no_chronology_finding(db_session, ordering):
-    """Once a PURCHASE invoice IS associated, the IP-P09 follow-up
-    disappears on recomputation, and the invoice/payment ordering never
-    produces any finding: whether the invoice predates the payment or the
-    payment predates the invoice, the scope is clean — no chronology
-    finding, no advisory, no blocker (Phase 2D.3-F1d)."""
+@pytest.mark.parametrize(
+    "invoice_date,payment_date",
+    [
+        (date(2031, 1, 10), date(2031, 1, 20)),  # Case A: PURCHASE invoice before OUT payment
+        (date(2031, 1, 20), date(2031, 1, 10)),  # Case B: OUT payment before PURCHASE invoice
+    ],
+)
+def test_payment_and_invoice_any_ordering_no_chronology_finding(db_session, invoice_date, payment_date):
+    """IP-P09 / IP-S03 (no mandatory chronology): whether the PURCHASE
+    invoice predates the OUT payment or the payment predates the invoice,
+    the scope is identical — no chronology blocker, no chronology
+    advisory, the same PREPARATION_AMOUNT_DETERMINABLE status, and no
+    eligibility/readiness behavior derived from ordering. The dates are
+    EXPLICIT in the fixtures and genuinely REVERSED across the two
+    parameterizations (Codex Pre-Gate BLOCKER 2 — the previous fixture
+    used fixed dates and never actually reversed the ordering)."""
+    assert (invoice_date < payment_date) or (payment_date < invoice_date)
     frag = _make_fragment(db_session)
-    contract = _make_contract(db_session, frag.id, f"PO-F1B-14C-{ordering}")
-    invoice, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("1000.00"))
+    contract = _make_contract(db_session, frag.id, "PO-F1B-14C")
+    invoice, _ = _make_purchase_invoice(
+        db_session, frag.id, gross_amount=Decimal("1000.00"), issue_date=invoice_date
+    )
     _make_invoice_allocation(db_session, invoice.id, contract, allocated=Decimal("1000.00"))
-    payment = _make_out_payment(db_session, frag.id, amount=Decimal("1000.00"))
+    payment = _make_out_payment(db_session, frag.id, amount=Decimal("1000.00"), transaction_date=payment_date)
     _make_payment_allocation(db_session, payment, contract)
     db_session.commit()
 
     decision = _decision_for(db_session, contract.id)
     assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
     assert decision.blockers == ()
-    # With the PURCHASE invoice associated, no follow-up advisory is
-    # emitted regardless of invoice/payment ordering.
+    # With the confirmed PURCHASE invoice associated, no follow-up
+    # advisory is emitted regardless of invoice/payment ordering.
     assert decision.advisories == ()
     assert len(decision.payment_allocations) == 1
     assert len(decision.invoice_allocations) == 1

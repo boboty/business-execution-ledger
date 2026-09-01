@@ -370,6 +370,236 @@ def test_follow_up_disappears_when_invoice_associated(db_session):
 
 
 # ---------------------------------------------------------------------------
+# Incomplete-association boundaries — an allocation record is NOT a
+# confirmed Fact (Codex Pre-Gate BLOCKER 1)
+# ---------------------------------------------------------------------------
+
+
+def test_payment_allocation_without_payment_fact_no_p09():
+    """A payment ASSOCIATION whose Payment Fact is missing is NOT a
+    confirmed OUT Payment Fact: even with no PURCHASE invoice, NO
+    SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED advisory is emitted. The
+    dangling allocation remains visible as factual context. (Pure
+    function over the F0 context — dangling associations are unreachable
+    in storage via the payment_allocations.payment_id FK.)"""
+    contract = _pure_contract("PO-F1D-11")
+    context = _context_with_scopes((SupplierScopeContext(
+        contract=contract, items=(), shipments=(),
+        invoice_allocations=(),
+        invoice_item_allocations=(),
+        payment_allocations=(SupplierScopePaymentAllocation(
+            allocation=PaymentAllocation(
+                id=uuid.uuid4(), payment_id=uuid.uuid4(), contract_id=contract.id, match_case_id=uuid.uuid4(),
+                allocated_amount=Decimal("500.00"),
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+            ),
+            payment=None,
+        ),),
+        unresolved_work=(),
+    ),))
+
+    decision = evaluate_supplier_invoice_request_from_context(context).decisions[0]
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+    assert decision.blockers == ()
+    assert decision.advisories == ()
+    # The dangling association stays visible as factual context.
+    assert len(decision.payment_allocations) == 1
+    assert decision.payment_allocations[0].payment is None
+
+
+def test_p09_emitted_when_invoice_fact_missing_but_confirmed_payment_exists():
+    """An invoice ASSOCIATION whose Invoice Fact is missing does NOT count
+    as "invoice already received": with a confirmed OUT Payment Fact and
+    only a dangling invoice association, the
+    SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED advisory IS emitted."""
+    contract = _pure_contract("PO-F1D-12")
+    payment = Payment(
+        id=uuid.uuid4(), transaction_date=date(2031, 1, 15), direction=PaymentDirection.OUT,
+        amount=Decimal("1000.00"), counterparty="Supplier", business_type=None,
+        bank_reference="REF-F1D-12", description=None, running_balance=None,
+        source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    invoice_id = uuid.uuid4()
+    context = _context_with_scopes((SupplierScopeContext(
+        contract=contract, items=(), shipments=(),
+        invoice_allocations=(SupplierScopeInvoiceAllocation(
+            allocation=InvoiceAllocation(
+                id=uuid.uuid4(), invoice_id=invoice_id, contract_id=contract.id, match_case_id=uuid.uuid4(),
+                allocated_gross_amount=Decimal("1000.00"),
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+            ),
+            invoice=None,
+        ),),
+        invoice_item_allocations=(),
+        payment_allocations=(SupplierScopePaymentAllocation(
+            allocation=PaymentAllocation(
+                id=uuid.uuid4(), payment_id=payment.id, contract_id=contract.id, match_case_id=uuid.uuid4(),
+                allocated_amount=Decimal("1000.00"),
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+            ),
+            payment=payment,
+        ),),
+        unresolved_work=(),
+    ),))
+
+    decision = evaluate_supplier_invoice_request_from_context(context).decisions[0]
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+    assert decision.blockers == ()
+    assert [a.code for a in decision.advisories] == [
+        SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED
+    ]
+    # The dangling invoice association surfaces only as a NOT_COMPARABLE
+    # amount check — it never satisfies "invoice already received".
+    assert len(decision.amount_checks) == 1
+    assert decision.amount_checks[0].outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
+
+
+def test_dangling_invoice_allocation_does_not_count_for_p03():
+    """An invoice ASSOCIATION whose Invoice Fact is missing does NOT
+    contribute to the IP-P03 multiple-invoice count: one confirmed PURCHASE
+    invoice plus one dangling association yields NO
+    MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT advisory — only the confirmed
+    Fact is a PURCHASE invoice."""
+    contract = _pure_contract("PO-F1D-13")
+    confirmed_invoice = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="PINV-F1D-13", issue_date=date(2031, 1, 10),
+        seller="Supplier", buyer="Our Own Entity", net_amount=Decimal("1000.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("1000.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW,
+    )
+    dangling_invoice_id = uuid.uuid4()
+    context = _context_with_scopes((SupplierScopeContext(
+        contract=contract, items=(), shipments=(),
+        invoice_allocations=(
+            SupplierScopeInvoiceAllocation(
+                allocation=InvoiceAllocation(
+                    id=uuid.uuid4(), invoice_id=confirmed_invoice.id, contract_id=contract.id,
+                    match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("1000.00"),
+                    match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                    confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                ),
+                invoice=confirmed_invoice,
+            ),
+            SupplierScopeInvoiceAllocation(
+                allocation=InvoiceAllocation(
+                    id=uuid.uuid4(), invoice_id=dangling_invoice_id, contract_id=contract.id,
+                    match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("200.00"),
+                    match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                    confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                ),
+                invoice=None,
+            ),
+        ),
+        invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
+    ),))
+
+    decision = evaluate_supplier_invoice_request_from_context(context).decisions[0]
+    assert decision.blockers == ()
+    assert decision.advisories == ()
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+
+
+def test_dangling_invoice_allocation_does_not_contribute_to_p04():
+    """An invoice ASSOCIATION whose Invoice Fact is missing does NOT
+    contribute to the IP-P04 spanning-contract check: two contracts
+    sharing ONE dangling association (invoice=None) yield NO
+    PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS advisory, and the
+    confirmed report map is empty."""
+    contract_a = _pure_contract("PO-F1D-14A")
+    contract_b = _pure_contract("PO-F1D-14B")
+    dangling_invoice_id = uuid.uuid4()
+
+    def _scope(contract):
+        return SupplierScopeContext(
+            contract=contract, items=(), shipments=(),
+            invoice_allocations=(SupplierScopeInvoiceAllocation(
+                allocation=InvoiceAllocation(
+                    id=uuid.uuid4(), invoice_id=dangling_invoice_id, contract_id=contract.id,
+                    match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("1000.00"),
+                    match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                    confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                ),
+                invoice=None,
+            ),),
+            invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
+        )
+
+    report = evaluate_supplier_invoice_request_from_context(
+        _context_with_scopes((_scope(contract_a), _scope(contract_b)))
+    )
+    # No confirmed PURCHASE invoice exists, so the confirmed map is empty.
+    assert report.purchase_invoice_contract_map == ()
+    for contract in (contract_a, contract_b):
+        decision = next(d for d in report.decisions if d.contract_id == contract.id)
+        assert decision.blockers == ()
+        assert decision.advisories == ()
+        assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+
+
+def test_confirmed_invoices_still_drive_p03_mixed_with_dangling():
+    """Confirmed PURCHASE invoices still drive IP-P03 when a dangling
+    association is also present: two confirmed invoices plus one dangling
+    association yield the MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT advisory
+    naming ONLY the two confirmed invoice Facts — the confirmed-Fact
+    filtering must not over-filter."""
+    contract = _pure_contract("PO-F1D-15")
+
+    def _confirmed_invoice(amount, key):
+        return Invoice(
+            id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+            digital_invoice_no=None, external_invoice_key=key, issue_date=date(2031, 1, 10),
+            seller="Supplier", buyer="Our Own Entity", net_amount=amount, tax_amount=Decimal("0"),
+            gross_amount=amount, invoice_status=None, source_fragment_id=uuid.uuid4(),
+            created_at=NOW, updated_at=NOW,
+        )
+
+    invoice1 = _confirmed_invoice(Decimal("600.00"), "PINV-F1D-15A")
+    invoice2 = _confirmed_invoice(Decimal("400.00"), "PINV-F1D-15B")
+    dangling_invoice_id = uuid.uuid4()
+
+    def _alloc(invoice, amount):
+        return SupplierScopeInvoiceAllocation(
+            allocation=InvoiceAllocation(
+                id=uuid.uuid4(), invoice_id=invoice.id, contract_id=contract.id, match_case_id=uuid.uuid4(),
+                allocated_gross_amount=amount,
+                match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+            ),
+            invoice=invoice,
+        )
+
+    context = _context_with_scopes((SupplierScopeContext(
+        contract=contract, items=(), shipments=(),
+        invoice_allocations=(
+            _alloc(invoice1, Decimal("600.00")),
+            _alloc(invoice2, Decimal("400.00")),
+            SupplierScopeInvoiceAllocation(
+                allocation=InvoiceAllocation(
+                    id=uuid.uuid4(), invoice_id=dangling_invoice_id, contract_id=contract.id,
+                    match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+                    match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                    confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                ),
+                invoice=None,
+            ),
+        ),
+        invoice_item_allocations=(), payment_allocations=(), unresolved_work=(),
+    ),))
+
+    decision = evaluate_supplier_invoice_request_from_context(context).decisions[0]
+    assert decision.blockers == ()
+    assert [a.code for a in decision.advisories] == [
+        SupplierRequestAdvisoryCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT
+    ]
+    assert set(decision.advisories[0].related_invoice_ids) == {invoice1.id, invoice2.id}
+    assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
+
+
+# ---------------------------------------------------------------------------
 # IP-P02 / IP-P05 — deviation advisories (management review, not conflict)
 # ---------------------------------------------------------------------------
 

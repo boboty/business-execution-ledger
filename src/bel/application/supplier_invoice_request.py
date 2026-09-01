@@ -28,9 +28,11 @@ rules implemented here, by ID:
   valid and nothing is a rule conflict.
 - IP-P03 (``ACCOUNTANT_CONFIRMED``): one procurement Contract is not
   expected to be split across multiple PURCHASE invoices. More than one
-  currently-allocated PURCHASE invoice is a management review signal
+  confirmed PURCHASE invoice is a management review signal
   (``MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT`` ADVISORY) — the split is
-  legitimate business state, and every Fact stays preserved.
+  legitimate business state, and every Fact stays preserved. An
+  allocation record whose Invoice Fact is missing (``invoice is None``)
+  is NOT a confirmed PURCHASE invoice and never counts toward this.
 - IP-P04 (``ACCOUNTANT_CONFIRMED``): one supplier PURCHASE invoice must
   not cover multiple procurement Contracts. An M:N association is a
   management review signal (``PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS``
@@ -44,8 +46,11 @@ rules implemented here, by ID:
 - IP-P09 (``ACCOUNTANT_CONFIRMED``): paid but no PURCHASE invoice yet is
   a management follow-up (``SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED``
   ADVISORY; 已付款，尚未收到对应进项发票，建议催供应商开票) — emitted when
-  at least one confirmed OUT payment is allocated and no PURCHASE
-  invoice is associated, and gone on recomputation once one is.
+  at least one confirmed OUT Payment Fact is allocated and NO confirmed
+  PURCHASE Invoice Fact is associated, and gone on recomputation once one
+  is. Only confirmed Facts count: ``payment is None`` never counts as a
+  confirmed OUT payment, and ``invoice is None`` never counts as
+  "invoice already received".
 - IP-P01 (``ACCOUNTANT_CONFIRMED``): OUT payment facts are exposed as
   context only. Payment is CONTEXT — NOT a gate, and no status/advisory
   derives from payment ordering.
@@ -79,7 +84,11 @@ NON-BLOCKING management reminders / review signals (IP-P09 follow-up;
 IP-P02 / IP-P05 deviation; IP-P03 / IP-P04 cardinality); they NEVER
 affect ``status``, so a scope with advisories and no blockers is still
 ``PREPARATION_AMOUNT_DETERMINABLE``, and an advisory coexisting with a
-blocker leaves the blocker's status intact.
+blocker leaves the blocker's status intact. The P03 / P04 / P09
+advisories are computed over CONFIRMED Facts ONLY — an allocation
+record whose ``invoice is None`` / ``payment is None`` is factual
+context (still exposed on the decision) but is never promoted into
+confirmed Invoice/Payment Fact semantics.
 
 Check results (exact, never tolerant): ``MATCH`` / ``DEVIATION`` /
 ``NOT_COMPARABLE_MISSING_FACT``. A DEVIATION means the confirmed Facts
@@ -117,6 +126,8 @@ from bel.application.invoice_preparation import (
     SupplierScopePaymentAllocation,
     get_invoice_preparation_context,
 )
+from bel.domain.invoice import InvoiceDirection
+from bel.domain.payment import PaymentDirection
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -159,14 +170,16 @@ class SupplierRequestAdvisoryCode:
     recomputed from current Facts on every evaluation (a finding
     disappears as soon as the Facts change)."""
 
-    # IP-P03 advisory: more than one PURCHASE invoice is currently
-    # allocated to this procurement Contract. A management review signal,
-    # NOT a violation — the split is legitimate business state and every
-    # Fact stays preserved.
+    # IP-P03 advisory: more than one confirmed PURCHASE invoice is
+    # currently allocated to this procurement Contract (a dangling
+    # allocation whose Invoice Fact is missing never counts). A
+    # management review signal, NOT a violation — the split is legitimate
+    # business state and every Fact stays preserved.
     MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT = "MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT"
-    # IP-P04 advisory: one PURCHASE invoice is currently allocated to more
-    # than one procurement Contract (an M:N association). Not a violation,
-    # and the invoice is never silently apportioned.
+    # IP-P04 advisory: one confirmed PURCHASE invoice is currently
+    # allocated to more than one procurement Contract (an M:N
+    # association). Not a violation, and the invoice is never silently
+    # apportioned.
     PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS = "PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS"
     # IP-P02 deviation: the single associated PURCHASE invoice's gross
     # amount differs from the Contract gross amount (exact Decimal
@@ -177,13 +190,17 @@ class SupplierRequestAdvisoryCode:
     # ContractItem both have confirmed product names and they are not
     # exactly equal. A management review signal, not a violation.
     PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION = "PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION"
-    # IP-P09 follow-up: at least one confirmed OUT payment is currently
-    # allocated but NO PURCHASE Invoice Fact is associated yet — paid, no
-    # invoice, recommend supplier invoice follow-up (已付款，尚未收到对应
-    # 进项发票，建议催供应商开票). Not overdue, not a rule conflict, not a
+    # IP-P09 follow-up: at least one confirmed OUT Payment Fact is
+    # currently allocated but NO confirmed PURCHASE Invoice Fact is
+    # associated — paid, no invoice, recommend supplier invoice follow-up
+    # (已付款，尚未收到对应进项发票，建议催供应商开票). A dangling payment
+    # allocation (payment=None) never counts as a confirmed OUT payment,
+    # and a dangling invoice allocation (invoice=None) never counts as
+    # "invoice already received". Not overdue, not a rule conflict, not a
     # payment-required gate, not a chronology finding. Disappears on
-    # recomputation once a PURCHASE invoice is associated. No Task is
-    # persisted (a later stage may promote this to a Task workflow).
+    # recomputation once a confirmed PURCHASE invoice is associated. No
+    # Task is persisted (a later stage may promote this to a Task
+    # workflow).
     SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED = "SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED"
 
 
@@ -317,11 +334,14 @@ class SupplierRequestItemNameCheck:
 
 @dataclass(frozen=True)
 class PurchaseInvoiceContractAssociation:
-    """One PURCHASE invoice association's current factual footprint —
-    the invoice id and EVERY procurement Contract id it is currently
-    allocated to across the complete F0 context. This is the Fact-level
-    mapping IP-P04 is evaluated over (and the audit trail for each
-    emitted IP-P04 advisory)."""
+    """One confirmed PURCHASE Invoice Fact's current footprint — the
+    invoice id and EVERY procurement Contract id it is currently
+    allocated to across the complete F0 context. Only associations whose
+    Invoice Fact exists (and is PURCHASE) are promoted into this map; a
+    dangling association (``invoice is None``) is never a confirmed
+    invoice and is excluded. This is the Fact-level mapping IP-P04 is
+    evaluated over (and the audit trail for each emitted IP-P04
+    advisory)."""
 
     invoice_id: uuid.UUID
     contract_ids: tuple[uuid.UUID, ...]
@@ -408,16 +428,20 @@ def evaluate_supplier_invoice_request_from_context(
 def _build_invoice_contract_map(
     context: InvoicePreparationContext,
 ) -> dict[uuid.UUID, list[uuid.UUID]]:
-    """The current factual mapping from PURCHASE Invoice allocation id to
-    procurement Contract ids, across the COMPLETE F0 context. Keyed by
-    the allocation's invoice id (the association exists as a Fact even
-    when the Invoice anchor itself is missing). First-seen contract
-    order is deterministic (F0 scopes are ordered); the report re-sorts
-    for full stability."""
+    """The confirmed PURCHASE Invoice -> procurement Contract ids mapping
+    across the COMPLETE F0 context (the IP-P04 input). Only associations
+    whose Invoice Fact EXISTS and is direction PURCHASE are promoted into
+    this confirmed map: an allocation record with ``invoice is None`` is
+    factual context, NOT a confirmed Invoice Fact, so it is excluded here
+    (it stays visible on the decision's ``invoice_allocations``).
+    First-seen contract order is deterministic (F0 scopes are ordered);
+    the report re-sorts for full stability."""
     mapping: dict[uuid.UUID, list[uuid.UUID]] = {}
     for scope in context.supplier_scopes:
         for entry in scope.invoice_allocations:
-            contracts = mapping.setdefault(entry.allocation.invoice_id, [])
+            if entry.invoice is None or entry.invoice.direction != InvoiceDirection.PURCHASE:
+                continue
+            contracts = mapping.setdefault(entry.invoice.id, [])
             if scope.contract.id not in contracts:
                 contracts.append(scope.contract.id)
     return mapping
@@ -450,29 +474,46 @@ def _evaluate_scope(
     # B. IP-P03 — PURCHASE invoice cardinality on this Contract, from the
     # direction-isolated F0 associations. Zero is a factual state only:
     # nothing is claimed to be missing, late, or overdue. More than one
-    # distinct PURCHASE invoice is a management review signal — a split
-    # is legitimate business state, so this is an ADVISORY, never a
-    # conflict, and every Fact stays preserved.
+    # distinct CONFIRMED PURCHASE invoice is a management review signal —
+    # a split is legitimate business state, so this is an ADVISORY, never
+    # a conflict, and every Fact stays preserved. The count is over
+    # confirmed PURCHASE Invoice Facts ONLY: an allocation record whose
+    # Invoice Fact is missing (``invoice is None``) is NOT a confirmed
+    # invoice and never contributes (Codex Pre-Gate BLOCKER 1).
+    #
+    # ``invoice_ids_in_scope`` (raw allocation ids) is kept separately
+    # for the step-D amount check, which must stay NOT_COMPARABLE when a
+    # single association's Invoice Fact is absent.
     invoice_ids_in_scope: list[uuid.UUID] = []
+    confirmed_invoice_ids: list[uuid.UUID] = []
     for entry in scope.invoice_allocations:
         if entry.allocation.invoice_id not in invoice_ids_in_scope:
             invoice_ids_in_scope.append(entry.allocation.invoice_id)
-    if len(invoice_ids_in_scope) > 1:
+        if (
+            entry.invoice is not None
+            and entry.invoice.direction == InvoiceDirection.PURCHASE
+            and entry.invoice.id not in confirmed_invoice_ids
+        ):
+            confirmed_invoice_ids.append(entry.invoice.id)
+    if len(confirmed_invoice_ids) > 1:
         advisories.append(
             SupplierRequestAdvisory(
                 code=SupplierRequestAdvisoryCode.MULTIPLE_PURCHASE_INVOICES_ON_CONTRACT,
                 contract_id=contract.id,
-                related_invoice_ids=tuple(invoice_ids_in_scope),
-                note="multiple PURCHASE invoices on one Contract — management review, not a violation (IP-P03)",
+                related_invoice_ids=tuple(confirmed_invoice_ids),
+                note="multiple confirmed PURCHASE invoices on one Contract — management review, not a violation (IP-P03)",
             )
         )
 
     # C. IP-P04 — one PURCHASE invoice must not cover multiple
-    # procurement Contracts. Judged over the complete-context mapping,
-    # surfaced on every involved scope. An M:N relationship is not a
-    # business error: this is an ADVISORY, and the invoice is never
-    # silently apportioned and no historical Fact is touched.
-    for invoice_id in invoice_ids_in_scope:
+    # procurement Contracts. Judged over the complete-context CONFIRMED
+    # mapping, surfaced on every involved scope. An M:N relationship is
+    # not a business error: this is an ADVISORY, and the invoice is never
+    # silently apportioned and no historical Fact is touched. Only
+    # confirmed PURCHASE Invoice Facts participate — a dangling
+    # association (``invoice is None``) never contributes to the spanning
+    # check (Codex Pre-Gate BLOCKER 1).
+    for invoice_id in confirmed_invoice_ids:
         involved = invoice_contract_map.get(invoice_id, ())
         if len(involved) > 1:
             advisories.append(
@@ -481,7 +522,7 @@ def _evaluate_scope(
                     contract_id=contract.id,
                     related_invoice_ids=(invoice_id,),
                     related_contract_ids=tuple(sorted(involved, key=str)),
-                    note="one PURCHASE invoice spans multiple Contracts — M:N association, never apportioned (IP-P04)",
+                    note="one confirmed PURCHASE invoice spans multiple Contracts — M:N association, never apportioned (IP-P04)",
                 )
             )
 
@@ -613,30 +654,43 @@ def _evaluate_scope(
         )
 
     # F. IP-P09 — paid but no PURCHASE invoice yet is a management
-    # follow-up. At least one confirmed OUT payment currently allocated
-    # AND no PURCHASE invoice associated yet =>
-    # SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED. Not overdue, not a rule
-    # conflict, not payment-required, not an eligibility gate, not a
-    # chronology finding. The advisory disappears on recomputation as
-    # soon as a PURCHASE invoice is associated, and no Task is persisted
+    # follow-up. At least one confirmed OUT Payment Fact currently
+    # allocated AND no confirmed PURCHASE Invoice Fact associated yet =>
+    # SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED. Only confirmed Facts count
+    # (Codex Pre-Gate BLOCKER 1): a dangling payment allocation
+    # (``payment is None``) never counts as a confirmed OUT payment, and
+    # a dangling invoice allocation (``invoice is None``) never counts as
+    # "invoice already received". Not overdue, not a rule conflict, not
+    # payment-required, not an eligibility gate, not a chronology
+    # finding. The advisory disappears on recomputation as soon as a
+    # confirmed PURCHASE invoice is associated, and no Task is persisted
     # (a later stage may promote this to a Task workflow).
     # G. IP-P01 — OUT payment associations are exposed as context only
     # and never gate the request. Payment is CONTEXT: no status/advisory
     # derives from payment ordering, and there is no payment-presence
     # advisory — the only payment-derived finding is the IP-P09 follow-up
-    # above (paid + no invoice), never a payment-state signal.
+    # above (confirmed OUT payment + no confirmed PURCHASE invoice),
+    # never a payment-state signal.
     # H. IP-P06 — no tax rate is produced or inferred anywhere in this
     # decision. An actual InvoiceItem's tax_rate is CONTEXT, displayed
     # only as the existing Fact it is, reachable through
     # invoice_item_allocations — no advisory is emitted for its presence.
     # I. IP-P07 — no quantity is calculated anywhere; the quantity basis
     # is unresolved (docs/PHASE2D3-RULE-FREEZE.md).
-    if scope.payment_allocations and not invoice_ids_in_scope:
+    confirmed_out_payment_ids: list[uuid.UUID] = []
+    for entry in scope.payment_allocations:
+        if (
+            entry.payment is not None
+            and entry.payment.direction == PaymentDirection.OUT
+            and entry.payment.id not in confirmed_out_payment_ids
+        ):
+            confirmed_out_payment_ids.append(entry.payment.id)
+    if confirmed_out_payment_ids and not confirmed_invoice_ids:
         advisories.append(
             SupplierRequestAdvisory(
                 code=SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED,
                 contract_id=contract.id,
-                note="paid, but no PURCHASE invoice associated yet — recommend supplier invoice follow-up "
+                note="paid, but no confirmed PURCHASE invoice associated yet — recommend supplier invoice follow-up "
                 "(已付款，尚未收到对应进项发票，建议催供应商开票) (IP-P09)",
             )
         )
