@@ -420,10 +420,11 @@ def test_multiple_purchase_invoices_emit_ip_p03_advisory(db_session):
 
 
 def test_sales_direction_facts_never_count_as_purchase_cardinality(db_session):
-    """Direction isolation at the rule layer: a SALES invoice associated
-    through the procurement-only InvoiceAllocation is filtered by the F0
-    context and must never count toward IP-P03 cardinality or appear as
-    a PURCHASE invoice fact."""
+    """Confirmed-Fact boundary at the rule layer (Final Gate): a SALES
+    invoice associated through the procurement-only InvoiceAllocation is
+    PRESERVED by F0 as context, but never counts toward IP-P03 cardinality
+    and never participates as a confirmed PURCHASE invoice in the amount
+    comparison."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-F1B-6")
     purchase_invoice, _ = _make_purchase_invoice(db_session, frag.id, gross_amount=Decimal("1000.00"))
@@ -454,7 +455,17 @@ def test_sales_direction_facts_never_count_as_purchase_cardinality(db_session):
     decision = _decision_for(db_session, contract.id)
     assert decision.status == SupplierRequestDecisionStatus.PREPARATION_AMOUNT_DETERMINABLE
     assert decision.blockers == ()
-    assert [e.allocation.invoice_id for e in decision.invoice_allocations] == [purchase_invoice.id]
+    # F0 preserves BOTH associations as context — the wrong-direction one
+    # is never silently dropped.
+    assert {e.allocation.invoice_id for e in decision.invoice_allocations} == {
+        purchase_invoice.id,
+        sales_invoice.id,
+    }
+    # The SALES invoice never counts as a confirmed PURCHASE invoice: P03
+    # cardinality stays 1 (no advisory) and the amount comparison is not
+    # run against the wrong-direction Fact.
+    assert decision.advisories == ()
+    assert decision.amount_checks == ()
 
 
 # ---------------------------------------------------------------------------

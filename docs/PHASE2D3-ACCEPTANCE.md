@@ -54,9 +54,10 @@ bel invoice-preparation export --format csv  --output invoice-preparation.csv
    INPUTS_PRESENT / the advisory and blocker codes) never appear in the
    page.
 4. Confirmed-Fact lists contain only associations whose referenced
-   Invoice/Payment Fact exists with the correct direction. A dangling
-   association appears ONLY under 提醒/待关注 as 关联记录对应的基础事实缺失,
-   never under 已确认发票 / 已确认付款 / 已关联销项发票事实 / 已关联收款事实.
+   Invoice/Payment Fact exists with the correct direction. A dangling or
+   direction-mismatched association appears ONLY under 提醒/待关注 as
+   关联记录未形成可确认业务事实, never under 已确认发票 / 已确认付款 /
+   已关联销项发票事实 / 已关联收款事实 / 已确认明细关联.
 5. Existing unresolved work appears under 提醒/待关注 as 已有待处理事项
    (distinct from 管理提醒, the recomputed F1 advisories such as
    已付款，尚未收到对应进项发票，建议催供应商开票). No Fact is rendered as

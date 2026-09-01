@@ -25,12 +25,12 @@ As new business facts continuously enter BEL, BEL must be able to:
 
 | # | Definition-of-Done capability | Status today |
 |---|---|---|
-| 1 | Reconstruct a contract's current execution state | **Partially implemented** — 合同360° covers a single contract; there is no cross-contract ledger, no export execution, and no sales-side execution state |
-| 2 | Produce a period-close / accrual business judgment at any point in time | **Capability implemented** (Phase 2C.2 read-only preview) — first-stage coverage is not yet cutover-complete (see below) |
-| 3 | Generate a deliverable accrual business data product | **Not implemented** — no export path exists |
-| 4 | Give the business data needed to prepare invoicing in both directions — issuing sales invoices to external customers (向客户开票) and requesting supplier invoices (向供应商要票) | **Not implemented** |
+| 1 | Reconstruct a contract's current execution state | **Partially implemented** — 合同360° covers a single contract; the cross-contract business ledger and its Excel export exist, and the sales-side association exists, but first-stage coverage is not yet cutover-complete |
+| 2 | Produce a period-close / accrual business judgment at any point in time | **Capability implemented** (Phase 2C.2 read-only preview + Phase 2D.2 Data Product) — first-stage coverage is not yet cutover-complete (see below) |
+| 3 | Generate a deliverable accrual business data product | **Implemented** (Phase 2D.2: Period Close Data Product, XLSX + CSV) — first-stage coverage is not yet cutover-complete |
+| 4 | Give the business data needed to prepare invoicing in both directions — issuing sales invoices to external customers (向客户开票) and requesting supplier invoices (向供应商要票) | **Implemented** (Phase 2D.3) as a read-only Workbench + Data Product built from confirmed Facts with deterministic comparison and management advisories — see section 5.1 |
 | 5 | Expose what cannot be determined, lacks evidence, or needs a human | **Partially implemented** — deterministic exceptions and period-close blockers exist; there is no unified center, and some producer rules are not frozen |
-| 6 | Export business results as an Excel / CSV Data Product | **Not implemented** |
+| 6 | Export business results as an Excel / CSV Data Product | **Implemented for Contract Business Ledger (2D.1), Period Close (2D.2), and Invoice Preparation (2D.3); Exception/Task export still pending (2D.4)** |
 
 **On capability 2 specifically:** the technical ability to answer "given
 the facts confirmed so far, what would this period accrue, reverse,
@@ -407,10 +407,12 @@ V1's Definition of Done requires five core work surfaces. 业务驾驶舱
    decision for Phase 2D.2. It continues to produce no accounting
    voucher, debit/credit entry, finance subject code, posting, or
    tax-accounting logic.
-4. **开票与请票工作台 Invoice Preparation Workbench** — **not
-   implemented** (Phase 2D.3-F0 establishes only the rule-neutral
-   factual context — a read-only fact page, no preparation surface
-   yet); see section 5.1.
+4. **开票与请票工作台 Invoice Preparation Workbench** — **implemented**
+   (Phase 2D.3) as a read-only Workbench + Data Product: two directions —
+   SalesContract → 向客户开票, procurement Contract → 向供应商要票 — one
+   read-only Workbench projection of confirmed Facts with deterministic
+   comparison and management attention/advisories, and an XLSX/CSV Data
+   Product. BEL performs no legal invoice issuance; see section 5.1.
 5. **异常与任务中心 Exception & Task Center** — **not implemented** as a
    surface, though real unresolved work already exists; see section 5.2.
 
@@ -418,7 +420,7 @@ Business Fact Maintenance (section 2.1) is the operating capability
 underneath these surfaces, not a sixth page — it is not inflated into a
 standalone large page merely to round out a count.
 
-### 5.1 Invoice Preparation Workbench (product shape; rules not frozen)
+### 5.1 Invoice Preparation Workbench (implemented read-only; rules frozen in PHASE2D3-RULE-FREEZE.md)
 
 Product-scope clarification (frozen): the workbench covers **two
 invoice-preparation directions** —
@@ -430,57 +432,68 @@ invoice-preparation directions** —
    the supplier invoice us?"; primary axis: procurement `Contract`;
    `Contract.buyer` is our own entity, never a customer).
 
-The direction scope above is frozen; the business rules inside those
-directions are not.
-
-Product shape:
+**Implemented (Phase 2D.3), read-only.** The Workbench is a projection of
+confirmed Facts plus deterministic comparison and management advisories —
+an information surface, NOT a workflow approval engine:
 
 ```
-Business Facts
+Confirmed Facts
       ↓
-Deterministic eligibility / preparation (per direction)
+Deterministic comparison / management control
       ↓
-Invoice Preparation Data
+Advisory / attention where appropriate
       ↓
-actual invoicing / requesting happens (outside BEL)
+Invoice Preparation Workbench
       ↓
-Sales Invoice / Purchase Invoice Facts enter BEL
+Invoice Preparation Data Product
       ↓
-business state recomputed
+actual issuing / requesting happens outside BEL
+      ↓
+Sales / Purchase Invoice Facts enter BEL
+      ↓
+projections recompute
 ```
 
-From confirmed facts already in BEL, it must surface: which business has
-met invoicing conditions in the relevant direction; who to bill (sales
-direction) or which supplier to request an invoice from (supplier
-direction); which contract/goods/business it corresponds to; quantity
-and amount; what invoicing information must be prepared; which confirmed
-facts support that judgment; whether a corresponding Sales Invoice Fact
-(sales direction) or Purchase Invoice Fact (supplier direction) already
-exists; which business does not yet qualify, and why it cannot be
-judged.
+Core semantics (superseding any earlier "eligibility / readiness /
+blocked" framing, which was never frozen and has been replaced by the
+accountant/business clarification):
+
+- **Fact is truth.** Confirmed Facts are the only inputs; an
+  association/record is never proof that the referenced Fact exists or
+  has the right business direction.
+- **Comparison is control.** Comparisons are deterministic, currency-safe
+  and cardinality-safe — no FX, no blind sum, no apportionment across the
+  many-to-many ProcurementSalesLink bridge.
+- **Deviation is reminder/review.** Amount/product-name deviations and
+  cardinality signals are ADVISORIES — never `RULE_CONFLICT`.
+- **Comparison unavailable is NOT invoice prohibition.**
+  `NOT_COMPARABLE_MISSING_FACT` / `NOT_COMPARABLE_AMBIGUOUS_SCOPE` mean a
+  management comparison could not be made, not that invoicing is blocked.
+
+In both directions:
+
+- Invoice / payment / receipt have **no mandatory chronology** —
+  invoice-before-receipt is common; no ordering finding is emitted.
+- A missing Shipment or missing ProcurementSalesLink does **not**
+  automatically mean "cannot invoice".
+- An ambiguous M:N scope is `NOT_COMPARABLE_AMBIGUOUS_SCOPE`, never
+  "blocked".
+- A genuinely missing compared Fact may prevent ONE calculation, but it
+  does not create a generic workflow eligibility status.
+
+The frozen rule IDs and their provenance live in
+[PHASE2D3-RULE-FREEZE.md](PHASE2D3-RULE-FREEZE.md). `IP-S02`
+(export-sales amount consistency, three-way equality) remains
+`OWNER_CONFIRMED_PROVISIONAL` — exact three-way equality was
+product-owner confirmed and stays subject to later real-data review;
+nothing here upgrades its provenance. The tax-classification-code rule
+(`IP-P08`) is **frozen / register-only** — its implementation remains
+deferred, and no guessed tax code exists anywhere.
 
 V1 does not connect to the e-tax bureau, tax-control systems, or an
 external invoicing API, and does not perform the legal act of issuing an
 invoice — in either direction. It produces a complete, deterministic,
 traceable **Invoice Preparation Data Product** (section 6).
-
-**Prerequisites, all of which must land first:** the `ContractItem`
-pipeline (2.2), `Shipment / Export` facts (2.3), sales-side association
-(3.1), and an invoicing eligibility / preparation rule freeze.
-
-**No invoicing eligibility or preparation rule (in either direction) is
-frozen by this document, and none may be invented.** Before Phase 2D.3
-the business must confirm what combination of facts means: *not
-eligible*, *ready for invoice preparation*, *already invoiced*, and
-*blocked / unresolved* — per direction. A Sales Invoice Fact existing is
-**not** the same thing as an invoicing eligibility Decision; a
-Shipment/Export fact does not by itself mean invoice eligibility; a
-receipt/payment does not by itself mean invoice eligibility; and no
-amount or quantity is apportioned across the many-to-many
-ProcurementSalesLink bridge in service of any such rule. Supplier
-request calculations and sales invoice calculations are **not
-implemented** until those rules are frozen. Tagged `REQUIRES BUSINESS
-RULE FREEZE`; no numbered rule for it exists in [RULES.md](RULES.md).
 
 ### 5.2 Exception & Task Center (infrastructure now, producers rule-by-rule)
 
@@ -533,18 +546,18 @@ recompute. Extending the type coverage and freezing the lifecycle is a
 
 V1 must support business-data export, which is what makes Excel a Data
 Product rather than the System of Record. Excel/CSV is the default
-first-stage format. **None of these exports exists today** — there is no
-export path anywhere in the codebase. Each is assigned to a phase:
+first-stage format. Current status:
 
-| Data Product | Phase |
+| Data Product | Status |
 |---|---|
-| Contract Business Ledger export | 2D.1-R4 |
-| Period Close / Accrual business data export | 2D.2 |
-| Invoice Preparation Data Product | 2D.3 |
-| Exception / Task export | 2D.4 |
+| Contract Business Ledger export | **Implemented** (Phase 2D.1-R4, CSV + XLSX) |
+| Period Close / Accrual business data export | **Implemented** (Phase 2D.2, CSV + XLSX) |
+| Invoice Preparation Data Product | **Implemented** (Phase 2D.3, CSV + XLSX) |
+| Exception / Task export | **Pending** (Phase 2D.4) |
 
 Exact schemas and the Application-layer export boundary are
-implementation decisions for the phase that builds each one.
+implementation decisions for the phase that builds each one. Excel
+remains a Data Product — not the System of Record.
 
 ### 6.1 Export tax rebate (退税) — canonical facts yes, rebate domain no
 

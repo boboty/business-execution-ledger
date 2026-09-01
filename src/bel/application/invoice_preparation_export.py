@@ -119,7 +119,14 @@ INCOMPLETE_ASSOCIATION_KIND_LABELS = {
     "SALES_RECEIPT": "收款关联",
     "PURCHASE_INVOICE": "采购发票关联",
     "OUT_PAYMENT": "付款关联",
+    "PURCHASE_INVOICE_ITEM": "采购发票明细关联",
 }
+
+# Truthful generic wording for an association that has NOT formed a
+# confirmed business Fact — the referenced Fact may be missing OR present
+# with the wrong business direction; it is never claimed to be necessarily
+# missing.
+INCOMPLETE_ASSOCIATION_MESSAGE = "关联记录未形成可确认业务事实"
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +292,33 @@ def _incomplete_out_payments(scope) -> tuple:
     )
 
 
+def _confirmed_purchase_item_allocations(scope) -> tuple:
+    """A confirmed item-name comparison candidate: the InvoiceItem Fact
+    exists AND its parent Invoice exists AND is PURCHASE (Final Gate 1A)."""
+    return tuple(
+        e
+        for e in scope.invoice_item_allocations
+        if e.invoice is not None
+        and e.invoice.direction == InvoiceDirection.PURCHASE
+        and e.invoice_item is not None
+    )
+
+
+def _incomplete_purchase_item_allocations(scope) -> tuple:
+    """An InvoiceItemAllocation whose InvoiceItem Fact is missing, or whose
+    parent Invoice is missing / not PURCHASE — preserved by F0, never a
+    confirmed 明细关联."""
+    return tuple(
+        e
+        for e in scope.invoice_item_allocations
+        if not (
+            e.invoice is not None
+            and e.invoice.direction == InvoiceDirection.PURCHASE
+            and e.invoice_item is not None
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Row builders — pure projection of the Workbench's context + F1 decisions.
 # ---------------------------------------------------------------------------
@@ -329,6 +363,9 @@ def _incomplete_association_row(
     allocated = getattr(allocation, "allocated_gross_amount", None)
     if allocated is None:
         allocated = getattr(allocation, "allocated_amount", None)
+    if allocated is None:
+        allocated = getattr(allocation, "allocated_net_amount", None)
+    kind_label = INCOMPLETE_ASSOCIATION_KIND_LABELS.get(kind_key, kind_key)
     return InvoicePreparationExportRow(
         record_type=record_type,
         sales_contract_id=scope_id if record_type == RECORD_TYPE_SALES_ATTENTION else None,
@@ -337,7 +374,7 @@ def _incomplete_association_row(
         contract_no=scope_no if record_type == RECORD_TYPE_SUPPLIER_ATTENTION else None,
         attention_category=ATTENTION_CATEGORY_INCOMPLETE_ASSOCIATION,
         attention_code=None,  # no canonical code exists for this context
-        attention_message=INCOMPLETE_ASSOCIATION_KIND_LABELS.get(kind_key, kind_key),
+        attention_message=f"{kind_label} · {INCOMPLETE_ASSOCIATION_MESSAGE}",
         source_id=str(allocation.id),
         allocated_amount=allocated,
     )
@@ -483,6 +520,8 @@ def _supplier_attention_rows(scope, decision) -> tuple[InvoicePreparationExportR
         rows.append(_incomplete_association_row(RECORD_TYPE_SUPPLIER_ATTENTION, "PURCHASE_INVOICE", entry.allocation, scope_id=str(contract.id), scope_no=contract.contract_no))
     for entry in _incomplete_out_payments(scope):
         rows.append(_incomplete_association_row(RECORD_TYPE_SUPPLIER_ATTENTION, "OUT_PAYMENT", entry.allocation, scope_id=str(contract.id), scope_no=contract.contract_no))
+    for entry in _incomplete_purchase_item_allocations(scope):
+        rows.append(_incomplete_association_row(RECORD_TYPE_SUPPLIER_ATTENTION, "PURCHASE_INVOICE_ITEM", entry.allocation, scope_id=str(contract.id), scope_no=contract.contract_no))
     for advisory in decision.advisories:
         rows.append(
             InvoicePreparationExportRow(
@@ -659,20 +698,35 @@ def _fmt_field_value(value: Any) -> str:
     return str(value)
 
 
-def _safe_text(value: Any) -> str:
-    """Formula-injection guard, same convention as
+def _text_guard(text: str) -> str:
+    """Formula-injection guard for TEXT fields, same convention as
     ``period_close_export._safe_text`` / ``contract_ledger_export._safe_text``:
     a leading dangerous character gets a literal-text quote prefix so no
     spreadsheet application ever evaluates exported business text as a
     formula."""
-    text = _fmt_field_value(value)
     if text.startswith(_DANGEROUS_PREFIXES):
         return "'" + text
     return text
 
 
+def _csv_field(value: Any) -> str:
+    """Typed CSV serialization: formula-injection protection applies ONLY
+    to TEXT fields. A Decimal is a numeric amount, not user-controlled
+    formula text — it is serialized canonically with ``format(value, "f")``
+    and NEVER gains an apostrophe merely because it begins with '-'. int/
+    float are plain numeric strings; None is empty. str (and date/datetime
+    rendered as text) pass through the text guard."""
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, (int, float)):
+        return str(value)
+    if value is None:
+        return ""
+    return _text_guard(_fmt_field_value(value))
+
+
 def _row_to_record(row: InvoicePreparationExportRow) -> list[str]:
-    return [_safe_text(getattr(row, col)) for col in CSV_HEADERS]
+    return [_csv_field(getattr(row, col)) for col in CSV_HEADERS]
 
 
 def export_invoice_preparation_csv(product: InvoicePreparationDataProduct) -> bytes:
@@ -688,18 +742,43 @@ def export_invoice_preparation_csv(product: InvoicePreparationDataProduct) -> by
     return ("﻿" + buffer.getvalue()).encode("utf-8")
 
 
-def _xlsx_cell(value: Any) -> Any:
-    """Decimal amounts stay NUMERIC cells (monetary values usable in a
-    spreadsheet); a missing Fact is ``None`` -> blank cell, never 0. Every
-    text value passes through the formula-injection guard."""
-    if isinstance(value, Decimal):
+def _significant_digits(value: Decimal) -> int:
+    """Count of significant decimal digits of the Decimal's coefficient
+    (leading zeros excluded). Used to decide Excel numeric safety."""
+    text = "".join(str(d) for d in value.as_tuple().digits)
+    return len(text.lstrip("0"))
+
+
+def _decimal_xlsx_cell(value: Decimal) -> Any:
+    """Exact-Decimal XLSX policy: ordinary business amounts stay numeric
+    cells (usable in a spreadsheet), while values exceeding Excel's usable
+    numeric precision stay EXACT as text. A Decimal is written numeric ONLY
+    when (a) it has at most 15 significant decimal digits (Excel's usable
+    precision) AND (b) the chosen float representation round-trips to the
+    SAME Decimal (``Decimal(str(float(value))) == value``) — no rounding,
+    no scientific-notation loss, no float-before-safety-check. Otherwise
+    the exact canonical string ``format(value, "f")`` is written as a TEXT
+    cell. The exact-value text fallback is generated from a Decimal Fact
+    (not user-entered formula text), so a negative exact Decimal string
+    does NOT gain a semantic apostrophe merely because it begins with '-'.
+    BEL canonical precision is more important than pretending every cell
+    is numeric."""
+    text = format(value, "f")
+    if _significant_digits(value) <= 15 and Decimal(str(float(value))) == value:
         return float(value)
+    return text
+
+
+def _xlsx_cell(value: Any) -> Any:
+    """Typed XLSX serialization: Decimal amounts follow the exact-Decimal
+    policy (numeric when safely representable, exact text otherwise); a
+    missing Fact is ``None`` -> blank cell, never 0. int/float/bool stay
+    typed. TEXT values pass through the formula-injection guard."""
+    if isinstance(value, Decimal):
+        return _decimal_xlsx_cell(value)
     if value is None or isinstance(value, (int, float, bool)):
         return value
-    text = _fmt_field_value(value)
-    if text.startswith(_DANGEROUS_PREFIXES):
-        return "'" + text
-    return text
+    return _text_guard(_fmt_field_value(value))
 
 
 def _write_header(ws, headers: list[str]) -> None:

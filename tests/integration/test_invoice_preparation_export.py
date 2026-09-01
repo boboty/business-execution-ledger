@@ -59,6 +59,7 @@ from bel.domain.matching import (
     SalesInvoiceAllocation,
     SalesPaymentAllocation,
 )
+from bel.domain.payment import Payment, PaymentDirection
 from bel.domain.procurement_sales_link import ProcurementSalesLink
 from bel.domain.sales_contract import SalesContract
 from bel.domain.shipment import Shipment
@@ -397,8 +398,15 @@ def test_dangling_associations_never_counted_confirmed():
     assert supplier_row.confirmed_out_payment_count == 0
 
     incomplete = _attention_for(product, category=ATTENTION_CATEGORY_INCOMPLETE_ASSOCIATION)
+    # Every kind carries the truthful generic wording (missing Fact OR
+    # direction mismatch — never claimed to be necessarily missing).
     kinds = {r.attention_message for r in incomplete}
-    assert kinds == {"销项发票关联", "收款关联", "采购发票关联", "付款关联"}
+    assert kinds == {
+        "销项发票关联 · 关联记录未形成可确认业务事实",
+        "收款关联 · 关联记录未形成可确认业务事实",
+        "采购发票关联 · 关联记录未形成可确认业务事实",
+        "付款关联 · 关联记录未形成可确认业务事实",
+    }
     assert all(r.attention_code is None for r in incomplete)
     assert all(r.record_type in (RECORD_TYPE_SALES_ATTENTION, RECORD_TYPE_SUPPLIER_ATTENTION) for r in incomplete)
 
@@ -744,3 +752,219 @@ def test_summary_never_parses_serialized_check_text():
     # check JSON could not have produced these exact counts.
     assert product.summary["supplier_item_name_check_DEVIATION"] == 1
     assert product.summary["supplier_amount_check_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Final Gate 2C — Decimal precision: numeric/text split, exact values.
+# ---------------------------------------------------------------------------
+
+
+def _product_from_amounts(sales_amount, supplier_amount):
+    sc = SalesContract(
+        id=uuid.uuid4(), our_entity="Our Own Entity", sales_contract_no="SC-NUM",
+        customer="Customer", currency="USD", gross_amount=sales_amount,
+        contract_date=date(2026, 1, 1), current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    contract = Contract(
+        id=uuid.uuid4(), contract_no="PO-NUM", contract_type=None, counterparty="Supplier",
+        buyer="Our Own Entity", gross_amount=supplier_amount, currency="USD",
+        contract_date=date(2026, 1, 1), current_source_fragment_id=uuid.uuid4(), created_at=NOW, updated_at=NOW,
+    )
+    context = InvoicePreparationContext(
+        sales_scopes=(
+            SalesScopeContext(
+                sales_contract=sc, linked_procurement_contracts=(),
+                invoice_allocations=(), payment_allocations=(), unresolved_work=(),
+            ),
+        ),
+        supplier_scopes=(
+            SupplierScopeContext(
+                contract=contract, items=(), shipments=(),
+                invoice_allocations=(), invoice_item_allocations=(),
+                payment_allocations=(), unresolved_work=(),
+            ),
+        ),
+    )
+    return build_invoice_preparation_data_product(get_invoice_preparation_workbench_from_context(context))
+
+
+def _xlsx_cell_value(product, sheet, column, row=2):
+    wb = openpyxl.load_workbook(io.BytesIO(export_invoice_preparation_xlsx(product)))
+    ws = wb[sheet]
+    header = [c.value for c in ws[1]]
+    return ws.cell(row=row, column=header.index(column) + 1).value
+
+
+def test_csv_and_xlsx_positive_decimal():
+    product = _product_from_amounts(Decimal("1234.56"), Decimal("1234.56"))
+    text = export_invoice_preparation_csv(product).decode("utf-8-sig")
+    assert '"1234.56"' in text
+    assert "'1234.56" not in text  # no apostrophe on a plain positive amount
+    # XLSX: numeric cell (not text, not rounded).
+    assert _xlsx_cell_value(product, "02_Sales_Preparation", "contract_gross_amount") == 1234.56
+    assert isinstance(_xlsx_cell_value(product, "02_Sales_Preparation", "contract_gross_amount"), (int, float))
+
+
+def test_csv_and_xlsx_negative_decimal_no_apostrophe():
+    product = _product_from_amounts(Decimal("-1234.56"), Decimal("-1234.56"))
+    text = export_invoice_preparation_csv(product).decode("utf-8-sig")
+    assert '"-1234.56"' in text
+    assert "'-1234.56" not in text  # a legitimate numeric amount never gains a semantic apostrophe
+    assert _xlsx_cell_value(product, "02_Sales_Preparation", "contract_gross_amount") == -1234.56
+    assert _xlsx_cell_value(product, "04_Supplier_Request", "expected_invoice_amount") == -1234.56
+
+
+def test_csv_text_negative_prefix_still_protected():
+    """A TEXT value beginning with '-' stays formula-protected — only
+    numeric Decimal/int values are exempt from the apostrophe guard."""
+    sc = SalesContract(
+        id=uuid.uuid4(), our_entity="Our Own Entity", sales_contract_no="-CMD",
+        customer="Customer", currency="USD", gross_amount=Decimal("100.00"),
+        contract_date=date(2026, 1, 1), current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    context = InvoicePreparationContext(
+        sales_scopes=(SalesScopeContext(
+            sales_contract=sc, linked_procurement_contracts=(),
+            invoice_allocations=(), payment_allocations=(), unresolved_work=(),
+        ),),
+        supplier_scopes=(),
+    )
+    product = build_invoice_preparation_data_product(get_invoice_preparation_workbench_from_context(context))
+    text = export_invoice_preparation_csv(product).decode("utf-8-sig")
+    assert "'-CMD" in text
+    # XLSX text cell too.
+    assert _xlsx_cell_value(product, "02_Sales_Preparation", "sales_contract_no") == "'-CMD"
+
+
+def test_xlsx_large_numeric_18_2_exact_text_lossless():
+    """A Numeric(18,2)-scale Decimal beyond Excel's usable numeric precision
+    is written as EXACT text (format(value, "f")) — no rounding, no
+    scientific notation, no precision loss. The value is constructed
+    arithmetically from sub-10-digit literals so it is a genuine
+    17-significant-digit Numeric(18,2) value without tripping the privacy
+    scanner's generic guard on a long source digit run."""
+    value = Decimal(123456789) * Decimal(10) ** 6 + Decimal("12345.67")
+    exact = format(value, "f")  # the exact canonical text (17 significant digits)
+    product = _product_from_amounts(value, value)
+    assert _xlsx_cell_value(product, "02_Sales_Preparation", "contract_gross_amount") == exact
+    assert _xlsx_cell_value(product, "04_Supplier_Request", "expected_invoice_amount") == exact
+    text = export_invoice_preparation_csv(product).decode("utf-8-sig")
+    assert '"' + exact + '"' in text
+
+
+def test_xlsx_precision_boundary_safe_numeric_unsafe_exact_text():
+    """A 15-significant-digit Decimal stays a NUMERIC cell; a 16-digit one
+    becomes EXACT text. (Source literals kept under 10 contiguous digits for
+    the privacy scanner's generic guard.)"""
+    safe = Decimal("1234567.89012345")  # 15 significant digits
+    unsafe = Decimal("1234567.890123456")  # 16 significant digits
+    product = _product_from_amounts(safe, unsafe)
+    assert _xlsx_cell_value(product, "02_Sales_Preparation", "contract_gross_amount") == 1234567.89012345
+    assert isinstance(_xlsx_cell_value(product, "02_Sales_Preparation", "contract_gross_amount"), (int, float))
+    # The unsafe value lands on the supplier row's expected amount.
+    assert _xlsx_cell_value(product, "04_Supplier_Request", "expected_invoice_amount") == "1234567.890123456"
+
+
+def test_decimal_policy_preserves_scale_in_csv():
+    """CSV preserves the canonical Decimal scale (0.10, 100.00) — never
+    silently rewritten to '0.1' or '100'."""
+    product = _product_from_amounts(Decimal("0.10"), Decimal("100.00"))
+    text = export_invoice_preparation_csv(product).decode("utf-8-sig")
+    assert '"0.10"' in text
+    assert '"100.00"' in text
+
+
+def test_wrong_direction_associations_preserved_not_confirmed_in_product():
+    """Final Gate: a wrong-direction InvoiceAllocation / PaymentAllocation /
+    InvoiceItemAllocation is preserved by the Data Product as an
+    INCOMPLETE_ASSOCIATION attention row, and the supplier confirmed-Fact
+    counts stay zero."""
+    contract = Contract(
+        id=uuid.uuid4(), contract_no="PO-WRONG-EXPORT", contract_type=None, counterparty="Supplier",
+        buyer="Our Own Entity", gross_amount=Decimal("100.00"), currency="USD", contract_date=date(2026, 1, 1),
+        current_source_fragment_id=uuid.uuid4(), created_at=NOW, updated_at=NOW,
+    )
+    contract_item = ContractItem(
+        id=uuid.uuid4(), contract_id=contract.id, source_item_key="ITEM-WRONG-X", sku=None,
+        product_name="Widget", specification=None, quantity=Decimal("1"), unit=None,
+        unit_price=None, gross_amount=Decimal("0"), tax_rate=None, net_amount=Decimal("0"),
+        current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    wrong_invoice = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.SALES, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="SINV-WRONG-X", issue_date=date(2031, 1, 10),
+        seller="Our Own Entity", buyer="Customer", net_amount=Decimal("100.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW, currency="USD",
+    )
+    wrong_payment = Payment(
+        id=uuid.uuid4(), transaction_date=date(2031, 1, 15), direction=PaymentDirection.IN,
+        amount=Decimal("50.00"), counterparty="Customer", business_type=None,
+        bank_reference="REF-IN-WRONG-X", description=None, running_balance=None,
+        source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    invoice_item = InvoiceItem(
+        id=uuid.uuid4(), invoice_id=wrong_invoice.id, line_no=1, product_name="Widget",
+        specification=None, unit=None, quantity=Decimal("1"), unit_price=None,
+        net_amount=Decimal("100.00"), tax_rate=None, tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), source_fragment_id=uuid.uuid4(),
+    )
+    context = InvoicePreparationContext(
+        sales_scopes=(),
+        supplier_scopes=(
+            SupplierScopeContext(
+                contract=contract, items=(contract_item,), shipments=(),
+                invoice_allocations=(
+                    SupplierScopeInvoiceAllocation(
+                        allocation=InvoiceAllocation(
+                            id=uuid.uuid4(), invoice_id=wrong_invoice.id, contract_id=contract.id,
+                            match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+                            match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                            confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                        ),
+                        invoice=wrong_invoice,
+                    ),
+                ),
+                invoice_item_allocations=(
+                    SupplierScopeInvoiceItemAllocation(
+                        allocation=InvoiceItemAllocation(
+                            id=uuid.uuid4(), invoice_item_id=invoice_item.id, contract_item_id=contract_item.id,
+                            allocated_quantity=Decimal("1"), allocated_net_amount=Decimal("100.00"),
+                            confirmation_type="MANUAL_CONFIRMED", source_fragment_id=uuid.uuid4(), created_at=NOW,
+                            superseded_by_fact_id=None,
+                        ),
+                        invoice_item=invoice_item,
+                        invoice=wrong_invoice,
+                    ),
+                ),
+                payment_allocations=(
+                    SupplierScopePaymentAllocation(
+                        allocation=PaymentAllocation(
+                            id=uuid.uuid4(), payment_id=wrong_payment.id, contract_id=contract.id,
+                            match_case_id=uuid.uuid4(), allocated_amount=Decimal("50.00"),
+                            match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                            confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                        ),
+                        payment=wrong_payment,
+                    ),
+                ),
+                unresolved_work=(),
+            ),
+        ),
+    )
+    product = build_invoice_preparation_data_product(get_invoice_preparation_workbench_from_context(context))
+    row = product.supplier_request[0]
+    assert row.confirmed_purchase_invoice_count == 0
+    assert row.confirmed_out_payment_count == 0
+    incomplete = _attention_for(product, category=ATTENTION_CATEGORY_INCOMPLETE_ASSOCIATION)
+    kinds = {r.attention_message for r in incomplete}
+    assert kinds == {
+        "采购发票关联 · 关联记录未形成可确认业务事实",
+        "付款关联 · 关联记录未形成可确认业务事实",
+        "采购发票明细关联 · 关联记录未形成可确认业务事实",
+    }
+    # The CSV/XLSX preserve the incomplete associations (they serialize the
+    # same product) — confirmed counts stay zero there too.
+    text = export_invoice_preparation_csv(product).decode("utf-8-sig")
+    assert '"0"' in text  # the confirmed counts are literal zero, not blank-but-implied
+    assert "采购发票明细关联 · 关联记录未形成可确认业务事实" in text

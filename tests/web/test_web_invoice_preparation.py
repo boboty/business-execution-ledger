@@ -36,6 +36,7 @@ from bel.application.invoice_preparation import (
     SalesScopePaymentAllocation,
     SupplierScopeContext,
     SupplierScopeInvoiceAllocation,
+    SupplierScopeInvoiceItemAllocation,
     SupplierScopePaymentAllocation,
     get_invoice_preparation_context,
 )
@@ -1096,3 +1097,98 @@ def test_f2b_web_exports_are_zero_write(workbench_ctx):
     client.get("/invoice-preparation/export.xlsx")
     client.get("/invoice-preparation/export.csv")
     assert _db_counts(app.state.session_factory) == before
+
+
+def test_f2a_wrong_direction_associations_only_under_attention():
+    """Final Gate: a wrong-direction InvoiceAllocation / PaymentAllocation /
+    InvoiceItemAllocation (referenced Fact present but not the right
+    business direction) is preserved as context but is NEVER a confirmed
+    Fact: the confirmed 已确认采购发票 / 已确认付款 / 已确认明细关联 lists stay
+    empty, and the association surfaces ONLY under the incomplete-
+    association attention (never under a confirmed-Fact heading)."""
+    contract = Contract(
+        id=uuid.uuid4(), contract_no="PO-WRONG-DIR", contract_type=None, counterparty="Supplier",
+        buyer="Our Own Entity", gross_amount=Decimal("100.00"), currency="USD", contract_date=date(2026, 1, 1),
+        current_source_fragment_id=uuid.uuid4(), created_at=NOW, updated_at=NOW,
+    )
+    contract_item = ContractItem(
+        id=uuid.uuid4(), contract_id=contract.id, source_item_key="ITEM-WRONG", sku=None,
+        product_name="Widget", specification=None, quantity=Decimal("1"), unit=None,
+        unit_price=None, gross_amount=Decimal("0"), tax_rate=None, net_amount=Decimal("0"),
+        current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    wrong_invoice = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.SALES, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="SINV-WRONG-DIR", issue_date=date(2031, 1, 10),
+        seller="Our Own Entity", buyer="Customer", net_amount=Decimal("100.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW, currency="USD",
+    )
+    wrong_payment = Payment(
+        id=uuid.uuid4(), transaction_date=date(2031, 1, 15), direction=PaymentDirection.IN,
+        amount=Decimal("50.00"), counterparty="Customer", business_type=None,
+        bank_reference="REF-IN-WRONG-DIR", description=None, running_balance=None,
+        source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    invoice_item = InvoiceItem(
+        id=uuid.uuid4(), invoice_id=wrong_invoice.id, line_no=1, product_name="Widget",
+        specification=None, unit=None, quantity=Decimal("1"), unit_price=None,
+        net_amount=Decimal("100.00"), tax_rate=None, tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), source_fragment_id=uuid.uuid4(),
+    )
+    context = InvoicePreparationContext(
+        sales_scopes=(),
+        supplier_scopes=(
+            SupplierScopeContext(
+                contract=contract, items=(contract_item,), shipments=(),
+                invoice_allocations=(
+                    SupplierScopeInvoiceAllocation(
+                        allocation=InvoiceAllocation(
+                            id=uuid.uuid4(), invoice_id=wrong_invoice.id, contract_id=contract.id,
+                            match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+                            match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                            confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                        ),
+                        invoice=wrong_invoice,
+                    ),
+                ),
+                invoice_item_allocations=(
+                    SupplierScopeInvoiceItemAllocation(
+                        allocation=InvoiceItemAllocation(
+                            id=uuid.uuid4(), invoice_item_id=invoice_item.id, contract_item_id=contract_item.id,
+                            allocated_quantity=Decimal("1"), allocated_net_amount=Decimal("100.00"),
+                            confirmation_type="MANUAL_CONFIRMED", source_fragment_id=uuid.uuid4(), created_at=NOW,
+                            superseded_by_fact_id=None,
+                        ),
+                        invoice_item=invoice_item,
+                        invoice=wrong_invoice,
+                    ),
+                ),
+                payment_allocations=(
+                    SupplierScopePaymentAllocation(
+                        allocation=PaymentAllocation(
+                            id=uuid.uuid4(), payment_id=wrong_payment.id, contract_id=contract.id,
+                            match_case_id=uuid.uuid4(), allocated_amount=Decimal("50.00"),
+                            match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                            confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                        ),
+                        payment=wrong_payment,
+                    ),
+                ),
+                unresolved_work=(),
+            ),
+        ),
+    )
+    vm = InvoicePreparationVM(get_invoice_preparation_workbench_from_context(context))
+    scope = vm.supplier_scopes[0]
+    # Confirmed-Fact lists require the referenced Fact to exist AND have the
+    # right direction — a wrong-direction Fact is never confirmed.
+    assert scope.confirmed_invoice_allocations == []
+    assert scope.confirmed_payment_allocations == []
+    assert scope.confirmed_invoice_item_allocations == []
+    # The wrong-direction associations are PRESERVED and surface ONLY under
+    # the incomplete-association attention.
+    kinds = {a.kind_label for a in scope.incomplete_allocations}
+    assert kinds == {"采购发票关联", "付款关联", "采购发票明细关联"}
+    assert scope.has_incomplete_allocations is True
+    assert scope.has_advisories is False

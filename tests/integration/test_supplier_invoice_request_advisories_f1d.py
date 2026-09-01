@@ -912,3 +912,158 @@ def test_advisory_presence_never_derives_status():
         SupplierRequestAdvisoryCode.PURCHASE_INVOICE_AMOUNT_DEVIATION
     ]
     assert clean.advisories == ()
+
+
+# ---------------------------------------------------------------------------
+# Final Gate — F0 preserves direction-invalid associations; the rule layer
+# never treats a wrong-direction Fact as a confirmed comparison candidate.
+# ---------------------------------------------------------------------------
+
+
+def test_wrong_direction_invoice_and_payment_never_confirmed_no_false_positive():
+    """A SALES-direction invoice through the procurement-only
+    InvoiceAllocation and an IN-direction payment through PaymentAllocation
+    are PRESERVED as context but are NEVER confirmed PURCHASE invoice / OUT
+    payment: no P03/P04/P09 false positive arises from them, and the amount
+    comparison never uses a wrong-direction invoice as a confirmed
+    candidate."""
+    contract = _pure_contract("PO-FG-WRONG")
+    confirmed_invoice = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="PINV-CONFIRMED", issue_date=date(2031, 1, 10),
+        seller="Supplier", buyer="Our Own Entity", net_amount=Decimal("100.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW, currency="CNY",
+    )
+    wrong_invoice = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.SALES, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="SINV-WRONG", issue_date=date(2031, 1, 10),
+        seller="Our Own Entity", buyer="Customer", net_amount=Decimal("100.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW, currency="CNY",
+    )
+    confirmed_payment = Payment(
+        id=uuid.uuid4(), transaction_date=date(2031, 1, 15), direction=PaymentDirection.OUT,
+        amount=Decimal("50.00"), counterparty="Supplier", business_type=None, bank_reference="REF-OUT-OK",
+        description=None, running_balance=None, source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    wrong_payment = Payment(
+        id=uuid.uuid4(), transaction_date=date(2031, 1, 15), direction=PaymentDirection.IN,
+        amount=Decimal("50.00"), counterparty="Customer", business_type=None, bank_reference="REF-IN-WRONG",
+        description=None, running_balance=None, source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    scope = SupplierScopeContext(
+        contract=contract, items=(), shipments=(),
+        invoice_allocations=(
+            SupplierScopeInvoiceAllocation(
+                allocation=InvoiceAllocation(
+                    id=uuid.uuid4(), invoice_id=confirmed_invoice.id, contract_id=contract.id,
+                    match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+                    match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                    confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                ),
+                invoice=confirmed_invoice,
+            ),
+            SupplierScopeInvoiceAllocation(
+                allocation=InvoiceAllocation(
+                    id=uuid.uuid4(), invoice_id=wrong_invoice.id, contract_id=contract.id,
+                    match_case_id=uuid.uuid4(), allocated_gross_amount=Decimal("100.00"),
+                    match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                    confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                ),
+                invoice=wrong_invoice,
+            ),
+        ),
+        invoice_item_allocations=(),
+        payment_allocations=(
+            SupplierScopePaymentAllocation(
+                allocation=PaymentAllocation(
+                    id=uuid.uuid4(), payment_id=confirmed_payment.id, contract_id=contract.id,
+                    match_case_id=uuid.uuid4(), allocated_amount=Decimal("50.00"),
+                    match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                    confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                ),
+                payment=confirmed_payment,
+            ),
+            SupplierScopePaymentAllocation(
+                allocation=PaymentAllocation(
+                    id=uuid.uuid4(), payment_id=wrong_payment.id, contract_id=contract.id,
+                    match_case_id=uuid.uuid4(), allocated_amount=Decimal("50.00"),
+                    match_method=AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE,
+                    confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+                ),
+                payment=wrong_payment,
+            ),
+        ),
+        unresolved_work=(),
+    )
+    decision = evaluate_supplier_invoice_request_from_context(_context_with_scopes((scope,))).decisions[0]
+    # F0 preserves BOTH associations as visible context.
+    assert {e.allocation.invoice_id for e in decision.invoice_allocations} == {
+        confirmed_invoice.id,
+        wrong_invoice.id,
+    }
+    assert {e.allocation.payment_id for e in decision.payment_allocations} == {
+        confirmed_payment.id,
+        wrong_payment.id,
+    }
+    # No false positives: one confirmed PURCHASE invoice (no P03), no span
+    # (no P04), and a confirmed invoice present (no P09).
+    assert decision.advisories == ()
+    # The amount comparison never uses the wrong-direction invoice as a
+    # confirmed candidate (the raw scope is 2 -> no single-candidate check).
+    assert decision.amount_checks == ()
+
+
+def test_wrong_direction_item_allocation_never_confirmed_comparison():
+    """Final Gate 1A: an InvoiceItemAllocation whose parent Invoice is not
+    PURCHASE is PRESERVED as context but is NEVER a confirmed item-name
+    comparison candidate — the P05 check is NOT_COMPARABLE_MISSING_FACT,
+    never a MATCH/DEVIATION against a wrong-direction parent, and no
+    product-deviation advisory is emitted."""
+    contract = _pure_contract("PO-FG-ITEM")
+    contract_item = ContractItem(
+        id=uuid.uuid4(), contract_id=contract.id, source_item_key="ITEM-FG", sku=None,
+        product_name="Widget", specification=None, quantity=Decimal("1"), unit=None,
+        unit_price=None, gross_amount=Decimal("0"), tax_rate=None, net_amount=Decimal("0"),
+        current_source_fragment_id=uuid.uuid4(), created_at=NOW,
+    )
+    wrong_invoice = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.SALES, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="SINV-ITEM", issue_date=date(2031, 1, 10),
+        seller="Our Own Entity", buyer="Customer", net_amount=Decimal("100.00"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), invoice_status=None, source_fragment_id=uuid.uuid4(),
+        created_at=NOW, updated_at=NOW, currency="CNY",
+    )
+    invoice_item = InvoiceItem(
+        id=uuid.uuid4(), invoice_id=wrong_invoice.id, line_no=1, product_name="Widget X",
+        specification=None, unit=None, quantity=Decimal("1"), unit_price=None,
+        net_amount=Decimal("100.00"), tax_rate=None, tax_amount=Decimal("0"),
+        gross_amount=Decimal("100.00"), source_fragment_id=uuid.uuid4(),
+    )
+    scope = SupplierScopeContext(
+        contract=contract, items=(contract_item,), shipments=(),
+        invoice_allocations=(),
+        invoice_item_allocations=(
+            SupplierScopeInvoiceItemAllocation(
+                allocation=InvoiceItemAllocation(
+                    id=uuid.uuid4(), invoice_item_id=invoice_item.id, contract_item_id=contract_item.id,
+                    allocated_quantity=Decimal("1"), allocated_net_amount=Decimal("100.00"),
+                    confirmation_type="MANUAL_CONFIRMED", source_fragment_id=uuid.uuid4(), created_at=NOW,
+                    superseded_by_fact_id=None,
+                ),
+                invoice_item=invoice_item,
+                invoice=wrong_invoice,
+            ),
+        ),
+        payment_allocations=(),
+        unresolved_work=(),
+    )
+    decision = evaluate_supplier_invoice_request_from_context(_context_with_scopes((scope,))).decisions[0]
+    # The association stays visible as context.
+    assert len(decision.invoice_item_allocations) == 1
+    assert decision.invoice_item_allocations[0].invoice.direction == InvoiceDirection.SALES
+    # Never a confirmed comparison candidate, never a deviation advisory.
+    assert len(decision.item_name_checks) == 1
+    assert decision.item_name_checks[0].outcome == SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
+    assert decision.advisories == ()

@@ -10,9 +10,12 @@ data:
 - Only CURRENT ProcurementSalesLinks are enumerated; the many-to-many
   bridge is enumerated, never apportioned or summed.
 - SALES invoices appear only through ``SalesInvoiceAllocation``; IN
-  receipts only through ``SalesPaymentAllocation``; PURCHASE invoices /
-  OUT payments only on procurement context (with the same defensive
-  direction re-check the Contract Business Ledger uses).
+  receipts only through ``SalesPaymentAllocation``. On the supplier side
+  F0 PRESERVES every current ``InvoiceAllocation`` / ``PaymentAllocation``
+  with its resolved Invoice/Payment Fact — missing or wrong-direction
+  Facts stay visible as context; whether one is a CONFIRMED PURCHASE
+  invoice / OUT payment is decided downstream, never by erasing the
+  association here.
 - ContractItems / Shipments / InvoiceItemAllocations + InvoiceItem facts
   are exposed as facts only; unknown/None stays unknown.
 - No readiness/eligibility/status concept exists anywhere in the DTO
@@ -550,12 +553,13 @@ def test_purchase_invoice_and_out_payment_only_on_procurement_context(db_session
     assert all(s.payment_allocations == () for s in ctx.sales_scopes)
 
 
-def test_direction_guard_wrong_direction_subjects_excluded(db_session):
-    """InvoiceAllocation/PaymentAllocation are procurement-only
-    structurally, but the repository itself enforces no direction rule —
-    the context re-checks the subject's own direction, exactly like the
-    Contract Business Ledger, so a raw wrong-direction row can never be
-    presented as a procurement invoice/payment."""
+def test_wrong_direction_subjects_preserved_as_context_never_confirmed(db_session):
+    """Final Gate: F0 preserves the association even when the referenced
+    Fact is present with the wrong business direction. A SALES invoice
+    through the procurement-only InvoiceAllocation, and an IN payment
+    through PaymentAllocation, stay visible on the supplier scope with
+    their resolved Facts — the confirmed-Fact decision (PURCHASE / OUT) is
+    made downstream, never by erasing the association here."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-012")
     sales_invoice = _make_invoice(db_session, frag.id, InvoiceDirection.SALES)
@@ -565,8 +569,12 @@ def test_direction_guard_wrong_direction_subjects_excluded(db_session):
     db_session.commit()
 
     supplier = get_invoice_preparation_context(db_session).supplier_scopes[0]
-    assert supplier.invoice_allocations == ()
-    assert supplier.payment_allocations == ()
+    # Both associations are PRESERVED (never silently dropped), with their
+    # resolved Facts.
+    assert [e.allocation.invoice_id for e in supplier.invoice_allocations] == [sales_invoice.id]
+    assert supplier.invoice_allocations[0].invoice.direction == InvoiceDirection.SALES
+    assert [e.allocation.payment_id for e in supplier.payment_allocations] == [in_payment.id]
+    assert supplier.payment_allocations[0].payment.direction == PaymentDirection.IN
 
 
 # ---------------------------------------------------------------------------
@@ -654,14 +662,15 @@ def test_superseded_item_allocation_not_presented(db_session):
 
 
 @pytest.mark.parametrize("leaked_direction", [InvoiceDirection.SALES, InvoiceDirection.UNKNOWN])
-def test_sales_or_unknown_invoice_item_allocation_never_in_supplier_context(db_session, leaked_direction):
-    """Pre-Gate attack: a SALES (or UNKNOWN) Invoice -> InvoiceItem ->
-    InvoiceItemAllocation -> PROCUREMENT ContractItem chain must never
-    appear in SupplierScopeContext.invoice_item_allocations.
-    InvoiceItemAllocation itself carries no direction and no sales-side
-    analogue, so ContractItem membership alone cannot tell the sides
-    apart — the supplier context must resolve the parent Invoice and
-    require PURCHASE. The PURCHASE case is covered by
+def test_sales_or_unknown_invoice_item_allocation_preserved_as_context(db_session, leaked_direction):
+    """Final Gate (1A): a SALES (or UNKNOWN) Invoice -> InvoiceItem ->
+    InvoiceItemAllocation -> PROCUREMENT ContractItem chain is PRESERVED
+    in SupplierScopeContext.invoice_item_allocations as the association it
+    is, with its resolved parent Invoice. InvoiceItemAllocation itself
+    carries no direction, so the parent Invoice is resolved and carried
+    as-is; whether it is a CONFIRMED item-name comparison candidate
+    (parent PURCHASE) is decided downstream, never by erasing the
+    association here. The PURCHASE case is covered by
     test_contract_items_shipments_and_item_allocations_exposed_as_facts."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-016")
@@ -693,18 +702,24 @@ def test_sales_or_unknown_invoice_item_allocation_never_in_supplier_context(db_s
 
     ctx = get_invoice_preparation_context(db_session)
     supplier = ctx.supplier_scopes[0]
-    assert supplier.invoice_item_allocations == ()
-    # The ContractItem itself is untouched — only the misdirected item
-    # allocation is excluded.
+    # The misdirected item allocation is PRESERVED with its resolved parent
+    # Invoice (never silently dropped) — its direction is a downstream
+    # confirmed-Fact decision, not an F0 erasure.
+    assert [e.allocation.id for e in supplier.invoice_item_allocations]
+    assert supplier.invoice_item_allocations[0].invoice.direction == leaked_direction
+    assert supplier.invoice_item_allocations[0].invoice_item is not None
+    # The ContractItem itself is untouched.
     assert [i.id for i in supplier.items] == [item.id]
-    # And the leaked invoice appears on neither axis anywhere.
-    present_invoice_ids: set[uuid.UUID] = set()
-    for scope in ctx.sales_scopes:
-        present_invoice_ids |= {e.invoice.id for e in scope.invoice_allocations if e.invoice}
-    for scope in ctx.supplier_scopes:
-        present_invoice_ids |= {e.invoice.id for e in scope.invoice_allocations if e.invoice}
-        present_invoice_ids |= {e.invoice.id for e in scope.invoice_item_allocations if e.invoice}
-    assert leaked_invoice.id not in present_invoice_ids
+    # The leaked invoice is now VISIBLE as context through the preserved
+    # item allocation (never silently dropped) — confirming it was not
+    # erased, only that it is not a confirmed PURCHASE parent.
+    supplier_invoice_ids = {
+        e.invoice.id
+        for scope in ctx.supplier_scopes
+        for e in scope.invoice_item_allocations
+        if e.invoice
+    }
+    assert leaked_invoice.id in supplier_invoice_ids
 
 
 # ---------------------------------------------------------------------------

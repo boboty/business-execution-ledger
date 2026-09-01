@@ -521,13 +521,15 @@ def _evaluate_scope(
         expected_currency = contract.currency
 
     # B. IP-P03 — PURCHASE invoice cardinality on this Contract, from the
-    # direction-isolated F0 associations. Zero is a factual state only:
+    # F0 associations (which preserve every association, missing or
+    # wrong-direction, as context). Zero is a factual state only:
     # nothing is claimed to be missing, late, or overdue. More than one
     # distinct CONFIRMED PURCHASE invoice is a management review signal —
     # a split is legitimate business state, so this is an ADVISORY, never
     # a conflict, and every Fact stays preserved. The count is over
     # confirmed PURCHASE Invoice Facts ONLY: an allocation record whose
-    # Invoice Fact is missing (``invoice is None``) is NOT a confirmed
+    # Invoice Fact is missing (``invoice is None``) — or present with a
+    # direction that is not PURCHASE — is NOT a confirmed
     # invoice and never contributes (Codex Pre-Gate BLOCKER 1).
     #
     # ``invoice_ids_in_scope`` (raw allocation ids) is kept separately
@@ -612,15 +614,23 @@ def _evaluate_scope(
             (entry.invoice for entry in scope.invoice_allocations if entry.allocation.invoice_id == invoice_id),
             None,
         )
-        if invoice_fact is None:
+        if invoice_fact is None or invoice_fact.direction != InvoiceDirection.PURCHASE:
+            # The single association's Invoice Fact is missing OR present
+            # with a direction that is not PURCHASE — neither is a
+            # CONFIRMED PURCHASE invoice for this surface, so the amount
+            # comparison stays NOT_COMPARABLE_MISSING_FACT (Final Gate: an
+            # association existing is NOT proof of a confirmed Fact; a
+            # wrong-direction Fact never participates as a confirmed
+            # comparison candidate). The association itself remains visible
+            # as context on the decision.
             amount_checks.append(
                 SupplierRequestAmountCheck(
                     check_name=AMOUNT_CONSISTENCY_CHECK_NAME,
                     contract_id=contract.id,
                     invoice_id=invoice_id,
-                    compared_invoice_gross_amount=None,
+                    compared_invoice_gross_amount=invoice_fact.gross_amount if invoice_fact else None,
                     contract_gross_amount=contract.gross_amount,
-                    compared_invoice_currency=None,
+                    compared_invoice_currency=invoice_fact.currency if invoice_fact else None,
                     contract_currency=contract.currency,
                     outcome=SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT,
                 )
@@ -715,11 +725,13 @@ def _evaluate_scope(
                 )
 
     # E. IP-P05 item-name consistency — for every current item
-    # association on this Contract's ContractItems (the F0 context
-    # direction-isolates these to PURCHASE parents). EXACT equality of
-    # the two confirmed product names. No fuzzy match, no normalization
-    # beyond the Domain's frozen one (counterparty only), no
-    # HS/tax-classification inference.
+    # association on this Contract's ContractItems. A confirmed comparison
+    # candidate requires the InvoiceItem Fact AND a parent PURCHASE Invoice
+    # (F0 preserves missing/wrong-direction associations; they are
+    # NOT_COMPARABLE_MISSING_FACT here, never a MATCH/DEVIATION against a
+    # wrong-direction Fact). EXACT equality of the two confirmed product
+    # names. No fuzzy match, no normalization beyond the Domain's frozen
+    # one (counterparty only), no HS/tax-classification inference.
     #
     # A DEVIATION is a management-review ADVISORY per conflicting
     # invoice (the invoice Fact stays valid — never a rule conflict). A
@@ -733,8 +745,20 @@ def _evaluate_scope(
     for entry in scope.invoice_item_allocations:
         contract_item = item_by_id.get(entry.allocation.contract_item_id)
         contract_name = contract_item.product_name if contract_item is not None else None
-        invoice_name = entry.invoice_item.product_name if entry.invoice_item is not None else None
-        if contract_name is None or invoice_name is None:
+        # Final Gate: the item-name comparison candidate is CONFIRMED only
+        # when the InvoiceItem Fact exists AND its parent Invoice is a
+        # confirmed PURCHASE invoice. A missing InvoiceItem, a missing
+        # parent Invoice, or a parent Invoice whose direction is not
+        # PURCHASE is an incomplete association (NOT_COMPARABLE_MISSING_FACT)
+        # — never a MATCH/DEVIATION against a wrong-direction Fact, and
+        # never a blocker. The association itself stays visible as context.
+        confirmed_candidate = (
+            entry.invoice is not None
+            and entry.invoice.direction == InvoiceDirection.PURCHASE
+            and entry.invoice_item is not None
+        )
+        invoice_name = entry.invoice_item.product_name if confirmed_candidate else None
+        if not confirmed_candidate or contract_name is None or invoice_name is None:
             outcome = SupplierRequestCheckOutcome.NOT_COMPARABLE_MISSING_FACT
         else:
             outcome = (

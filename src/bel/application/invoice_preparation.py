@@ -27,9 +27,12 @@ Hard boundaries mirrored from the frozen Domain (none re-derived here):
 - SALES invoices associate to a SalesContract ONLY through
   ``SalesInvoiceAllocation``; IN receipts ONLY through
   ``SalesPaymentAllocation``.
-- ``InvoiceAllocation`` stays PURCHASE-only and ``PaymentAllocation``
-  OUT-only — both appear only on supplier scopes, with the same
-  defensive direction re-check ``get_contract_business_ledger`` uses.
+- ``InvoiceAllocation`` / ``PaymentAllocation`` are procurement-side
+  associations. F0 PRESERVES every current association on the supplier
+  scope with its resolved Invoice/Payment Fact — even when the Fact is
+  missing or present with the wrong business direction. Whether it is a
+  CONFIRMED PURCHASE invoice / OUT payment for this surface is decided
+  downstream (confirmed-Fact boundary); F0 never erases an association.
 - Absence of a Fact is factual absence, never a negative business
   assertion: a scope with no sales invoice allocation says nothing about
   whether anything "should" be invoiced.
@@ -54,14 +57,14 @@ from bel.application.contract_business_ledger import (
 )
 from bel.domain.accrual import InvoiceItemAllocation
 from bel.domain.contract import Contract, ContractItem
-from bel.domain.invoice import Invoice, InvoiceDirection, InvoiceItem
+from bel.domain.invoice import Invoice, InvoiceItem
 from bel.domain.matching import (
     InvoiceAllocation,
     PaymentAllocation,
     SalesInvoiceAllocation,
     SalesPaymentAllocation,
 )
-from bel.domain.payment import Payment, PaymentDirection
+from bel.domain.payment import Payment
 from bel.domain.procurement_sales_link import ProcurementSalesLink
 from bel.domain.sales_contract import SalesContract
 from bel.domain.shipment import Shipment
@@ -143,12 +146,13 @@ class SupplierScopeInvoiceAllocation:
 class SupplierScopeInvoiceItemAllocation:
     """One current InvoiceItemAllocation reachable from THIS contract's
     ContractItems, with its InvoiceItem Fact and that item's parent
-    Invoice Fact. Direction-isolated like every other supplier-side
-    entry: the parent Invoice must exist and be PURCHASE — a SALES or
-    UNKNOWN parent invoice's item allocation must never read as
-    已确认明细关联 here, even though ContractItem membership alone
-    cannot tell the directions apart (InvoiceItemAllocation itself
-    carries no direction and no sales-side analogue)."""
+    Invoice Fact (both may be None when the referenced Fact is missing).
+    F0 preserves the ASSOCIATION regardless of direction: ContractItem
+    membership alone cannot tell which side an allocation's invoice
+    belongs to, so the parent Invoice is resolved and carried as-is.
+    Whether the association is a CONFIRMED item-name comparison candidate
+    (InvoiceItem exists AND parent Invoice exists AND is PURCHASE) is
+    decided downstream — never by erasing the association here."""
 
     allocation: InvoiceItemAllocation
     invoice_item: InvoiceItem | None
@@ -326,39 +330,36 @@ def _build_supplier_scopes(
             sorted(shipment_repo.list_for_contract(contract.id), key=lambda s: (s.created_at, str(s.id)))
         )
 
-        # Same defensive direction guard as the Contract Business Ledger:
-        # InvoiceAllocation/PaymentAllocation are procurement-only
-        # (PURCHASE invoice / OUT payment); the subject's own direction is
-        # re-checked before it can appear under this scope.
+        # F0 is the factual/context projection: EVERY current association
+        # is preserved here, regardless of whether the referenced Fact is
+        # missing OR present with the wrong business direction. An
+        # association existing is NOT proof that the referenced object is a
+        # confirmed Fact for this surface. The referenced Invoice/Payment
+        # Facts are resolved (None when missing) and the association stays
+        # visible; whether it is a CONFIRMED PURCHASE invoice / OUT payment
+        # is decided downstream (F1/F2a), never by dropping it here.
         procurement_invoices = tuple(
-            SupplierScopeInvoiceAllocation(allocation=a, invoice=invoice)
-            for a, invoice in (
-                (a, invoice_repo.get(a.invoice_id))
-                for a in sorted(
-                    invoice_alloc_repo.list_for_contract(contract.id), key=lambda a: (a.created_at, str(a.id))
-                )
+            SupplierScopeInvoiceAllocation(allocation=a, invoice=invoice_repo.get(a.invoice_id))
+            for a in sorted(
+                invoice_alloc_repo.list_for_contract(contract.id), key=lambda a: (a.created_at, str(a.id))
             )
-            if invoice is None or invoice.direction == InvoiceDirection.PURCHASE
         )
         outgoing_payments = tuple(
-            SupplierScopePaymentAllocation(allocation=a, payment=payment)
-            for a, payment in (
-                (a, payment_repo.get(a.payment_id))
-                for a in sorted(
-                    payment_alloc_repo.list_for_contract(contract.id), key=lambda a: (a.created_at, str(a.id))
-                )
+            SupplierScopePaymentAllocation(allocation=a, payment=payment_repo.get(a.payment_id))
+            for a in sorted(
+                payment_alloc_repo.list_for_contract(contract.id), key=lambda a: (a.created_at, str(a.id))
             )
-            if payment is None or payment.direction == PaymentDirection.OUT
         )
 
         # Current InvoiceItemAllocations on THIS contract's items, with
         # their InvoiceItem Facts and the parent Invoice Fact. Facts only —
-        # no remaining-quantity or remaining-amount concept. Direction
-        # isolation (pre-Gate repair): ContractItem membership alone cannot
-        # tell which side an allocation's invoice belongs to, so the parent
-        # Invoice is resolved and must exist and be PURCHASE — a SALES or
-        # UNKNOWN parent invoice's item allocation never appears in this
-        # supplier context.
+        # no remaining-quantity or remaining-amount concept. The same
+        # boundary applies: an association is preserved even when its
+        # InvoiceItem Fact is missing, its parent Invoice is missing, or the
+        # parent Invoice direction is not PURCHASE. Whether it is a
+        # CONFIRMED item-name comparison candidate is decided downstream
+        # (confirmed Facts + parent PURCHASE direction only); it is never
+        # silently erased here.
         item_allocations = tuple(
             SupplierScopeInvoiceItemAllocation(
                 allocation=allocation, invoice_item=invoice_item, invoice=parent_invoice
@@ -373,7 +374,6 @@ def _build_supplier_scopes(
                     )
                 )
             )
-            if parent_invoice is not None and parent_invoice.direction == InvoiceDirection.PURCHASE
         )
 
         scopes.append(

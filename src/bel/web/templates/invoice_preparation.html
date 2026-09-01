@@ -99,7 +99,7 @@
       </ul>
       {% endif %}
       {% if scope.has_incomplete_allocations %}
-      <p class="wb-sub">关联记录对应的基础事实缺失</p>
+      <p class="wb-sub">关联记录未形成可确认业务事实</p>
       <ul class="ledger-nested-list">
         {% for a in scope.incomplete_allocations %}
         <li>{{ a.kind_label }}{% if a.allocated_gross_amount != '—' %} · 关联金额 {{ a.allocated_gross_amount }}{% elif a.allocated_amount != '—' %} · 关联金额 {{ a.allocated_amount }}{% endif %}</li>
@@ -178,9 +178,9 @@
       {% endif %}
 
       <p class="wb-sub">已确认明细关联</p>
-      {% if scope.invoice_item_allocations %}
+      {% if scope.confirmed_invoice_item_allocations %}
       <ul class="ledger-nested-list">
-        {% for a in scope.invoice_item_allocations %}
+        {% for a in scope.confirmed_invoice_item_allocations %}
         <li>{{ a.invoice_no }} 第 {{ a.line_no }} 行 · 关联数量 {{ a.allocated_quantity }} · 关联未税金额 {{ a.allocated_net_amount }}</li>
         {% endfor %}
       </ul>
@@ -239,7 +239,7 @@
       </ul>
       {% endif %}
       {% if scope.has_incomplete_allocations %}
-      <p class="wb-sub">关联记录对应的基础事实缺失</p>
+      <p class="wb-sub">关联记录未形成可确认业务事实</p>
       <ul class="ledger-nested-list">
         {% for a in scope.incomplete_allocations %}
         <li>{{ a.kind_label }}{% if a.allocated_gross_amount != '—' %} · 关联金额 {{ a.allocated_gross_amount }}{% elif a.allocated_amount != '—' %} · 关联金额 {{ a.allocated_amount }}{% endif %}</li>

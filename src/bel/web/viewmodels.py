@@ -991,12 +991,14 @@ class SupplierRequestAdvisoryVM:
 
 
 class InvoicePrepIncompleteAllocationVM:
-    """One association whose referenced base Fact is missing (or not the
-    expected direction) — an allocation record is NOT proof that the
-    referenced Invoice/Payment Fact exists. Shown separately under
-    attention/context wording (关联记录对应的基础事实缺失), never under a
-    confirmed-Fact heading. The allocation record itself stays raw
-    context: kind + allocated amount only, never a fabricated Fact."""
+    """One association that has NOT formed a confirmed business Fact — the
+    referenced Invoice/Payment/InvoiceItem Fact may be missing OR present
+    with the wrong business direction. An allocation record is never proof
+    that the referenced Fact exists or that it is a confirmed Fact for this
+    surface. Shown separately under attention/context wording
+    (关联记录未形成可确认业务事实), never under a confirmed-Fact heading.
+    The allocation record itself stays raw context: kind + allocated amount
+    only, never a fabricated Fact."""
 
     def __init__(self, entry, kind_label: str) -> None:
         self.kind_label = kind_label
@@ -1148,9 +1150,29 @@ class InvoicePrepSupplierScopeVM:
             InvoicePrepIncompleteAllocationVM(e, "付款关联")
             for e in scope.payment_allocations
             if not (e.payment is not None and e.payment.direction == PaymentDirection.OUT)
+        ] + [
+            # Final Gate (1A): an InvoiceItemAllocation whose InvoiceItem
+            # Fact is missing, or whose parent Invoice is missing / not
+            # PURCHASE, is an incomplete association — preserved by F0,
+            # surfaced under attention, never a confirmed 明细关联.
+            InvoicePrepIncompleteAllocationVM(e, "采购发票明细关联")
+            for e in scope.invoice_item_allocations
+            if not (
+                e.invoice is not None
+                and e.invoice.direction == InvoiceDirection.PURCHASE
+                and e.invoice_item is not None
+            )
         ]
         self.has_incomplete_allocations = bool(self.incomplete_allocations)
-        self.invoice_item_allocations = [InvoicePrepItemAllocationVM(e) for e in scope.invoice_item_allocations]
+        # Confirmed item-name associations only — the referenced InvoiceItem
+        # AND parent PURCHASE Invoice must both exist.
+        self.confirmed_invoice_item_allocations = [
+            InvoicePrepItemAllocationVM(e)
+            for e in scope.invoice_item_allocations
+            if e.invoice is not None
+            and e.invoice.direction == InvoiceDirection.PURCHASE
+            and e.invoice_item is not None
+        ]
         self.unresolved_work = [InvoicePrepUnresolvedWorkVM(w) for w in scope.unresolved_work]
         self.has_unresolved_work = bool(self.unresolved_work)
         # F2a — the F1 decision's reference amount, management-control
