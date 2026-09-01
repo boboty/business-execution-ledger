@@ -95,32 +95,53 @@ asserted only with Evidence, never inferred, never FX-converted, and
 never defaulted to CNY/USD. An amount known without its currency remains
 a representable incomplete Fact.
 
-**Finding level: `CONTEXT`** — the rule is registered but no comparison
-is emitted today. When a frozen same-scope comparison is later
-implemented, its outcome vocabulary is `MATCH` / `DEVIATION` /
-`NOT_COMPARABLE_MISSING_FACT` and its enforcement is ADVISORY / review —
-never a `RULE_CONFLICT`, never a preparation blocker.
+**Finding level: `ADVISORY` (management control)** — the three-way
+comparison is IMPLEMENTED for the unambiguous scope (Phase 2D.3-F1f). It
+is evaluated as a MANAGEMENT control, NEVER a workflow gate, NEVER a
+`RULE_CONFLICT`, and never a preparation blocker. Only the unambiguous
+1:1:1 comparison scope is compared: exactly ONE confirmed SALES Invoice
+Fact (a `SalesInvoiceAllocation` whose Invoice Fact is missing or not
+direction SALES is NOT a confirmed Invoice Fact), exactly ONE current
+`ProcurementSalesLink`, and exactly ONE current Shipment on the linked
+Contract. Outcome vocabulary:
 
-**Remaining limitation (recorded structurally, not worked around):**
-IP-S02 is FROZEN AS A RULE but its full three-way consistency
-evaluation is still PENDING. The canonical currency Fact gap on the
-Invoice is now closed (Phase 2D.3-F1e: `Invoice.currency`, Evidence-
-derived, never defaulted/inferred/FX-converted, nullable), so canonical
-currency support now exists on all three legs — `SalesContract.currency`,
-Shipment `declared_currency` (F1c), and `Invoice.currency` (F1e). F1e
-closes the currency FACT gap only; the full three-way comparison is NOT
-implemented because its scope/cardinality semantics are not yet handled
-safely: multiple SALES invoices may exist, multiple linked procurement
-Contracts may exist, and multiple Shipment/Export Facts may exist. The
-rule must not sum, apportion, or pick an arbitrary one of any of these
-before the comparison semantics are frozen, so no downstream three-way
-comparison is emitted, and none may introduce an implicit currency
-assumption merely to make the rule appear complete — any future
-comparison must refuse cross-currency comparison. No code path may
+- `MATCH` — all three currencies explicit and equal, all three amounts
+  exactly equal;
+- `DEVIATION` (amount) — same explicit currency, amounts not all equal ->
+  `SALES_INVOICE_AMOUNT_DEVIATION` ADVISORY;
+- `NOT_COMPARABLE_CURRENCY_MISMATCH` — the relevant explicit currencies
+  are not all equal -> `SALES_INVOICE_CURRENCY_DEVIATION` ADVISORY; no
+  amount comparison is attempted, no FX;
+- `NOT_COMPARABLE_MISSING_FACT` — any compared amount/currency Fact
+  absent (including a scope with no confirmed SALES Invoice Fact or no
+  Shipment/Export Fact); a check result ONLY, never a blocker;
+- `NOT_COMPARABLE_AMBIGUOUS_SCOPE` — invoice/declaration scope ambiguous
+  by cardinality (multiple confirmed SALES invoices, multiple current
+  links, or multiple Shipment/Export declaration candidates): no sum, no
+  apportionment, no arbitrary selection — cardinality ambiguity takes
+  precedence over selecting arbitrary facts.
+
+The comparison is currency-safe by construction: amounts are compared
+ONLY when all three amounts AND all three currencies exist and the three
+currencies are explicitly equal — no FX, no default currency, no
+implicit same-currency assumption. The comparison never blocks invoice
+preparation, never changes the decision `status`, and receipt chronology
+never affects it.
+
+**Remaining limitation (recorded structurally, not worked around):** the
+comparison is implemented ONLY for the unambiguous 1:1:1 scope. Any scope
+with multiple confirmed SALES invoices, multiple current links, or
+multiple Shipment/Export declaration candidates is
+`NOT_COMPARABLE_AMBIGUOUS_SCOPE` — never summed, never apportioned, never
+compared against an arbitrarily chosen candidate. No code path may
 substitute `SalesContract.gross_amount` or an invoice amount for the
 declaration amount, and no legacy sales amount is backfilled as a
 customs-declaration amount: real declaration Evidence or an explicit
-human-confirmed Fact is required.
+human-confirmed Fact is required. Canonical currency support on all
+three legs — `SalesContract.currency`, Shipment `declared_currency`
+(F1c), and `Invoice.currency` (F1e) — is what makes the equal-currency
+comparison safe; a missing currency is never defaulted or inferred to
+make the rule appear complete.
 
 ### IP-S03 — Receipt is not a hard prerequisite
 
@@ -322,13 +343,16 @@ FX conversion, and no implicit currency is introduced.
 
 **Finding level: `ADVISORY` when a frozen same-scope comparison detects
 deviation; otherwise `CONTEXT`.** The declared Facts are exposed on the
-Shipment today (F1c); no comparison emits the advisory yet (the
-IP-S02 three-way check is still pending, and the supplier-side amount
-comparison uses `Contract.gross_amount`).
+Shipment (F1c) and are the declaration leg of the FIRST executable
+SALES-side comparison using this anchor — the IP-S02 three-way check
+(Phase 2D.3-F1f, unambiguous 1:1:1 scope). The supplier-side amount
+comparison uses `Contract.gross_amount` as its reference. IP-X01 is a
+cross-direction MANAGEMENT anchor, NOT a universal cross-leg equality
+rule: F1f introduces no PURCHASE-vs-customs equality rule.
 
 ---
 
-## Implementation status map (as of Phase 2D.3-F1d re-leveling)
+## Implementation status map (as of Phase 2D.3-F1f)
 
 The F1d PRE-GATE REPAIR re-levels every implemented rule into a
 **finding level** — the outcome class its findings produce — with
@@ -352,13 +376,19 @@ provenance and enforcement as INDEPENDENT dimensions:
   this rule today.
 - `NO-FINDING` — the rule emits nothing yet (guard-only or pending).
 
-Check-result vocabulary (Phase 2D.3-F1e adds one member):
-`MATCH` / `DEVIATION` / `NOT_COMPARABLE_MISSING_FACT` /
-`NOT_COMPARABLE_CURRENCY_MISMATCH`. The last is emitted when both
-compared currencies are explicit but different: no amount comparison is
+Check-result vocabulary (Phase 2D.3-F1e adds `NOT_COMPARABLE_CURRENCY_MISMATCH`;
+Phase 2D.3-F1f adds `NOT_COMPARABLE_AMBIGUOUS_SCOPE`): `MATCH` /
+`DEVIATION` / `NOT_COMPARABLE_MISSING_FACT` /
+`NOT_COMPARABLE_CURRENCY_MISMATCH` / `NOT_COMPARABLE_AMBIGUOUS_SCOPE`.
+`NOT_COMPARABLE_CURRENCY_MISMATCH` is emitted when the compared explicit
+currencies are present but not all equal: no amount comparison is
 attempted and no amount deviation is implied — the IP-P02 comparison is
 currency-safe by construction (explicit comparable currency required;
-no FX, no default, no inference).
+no FX, no default, no inference). `NOT_COMPARABLE_AMBIGUOUS_SCOPE` is
+the SALES-side (IP-S02) outcome for a scope whose invoice/declaration
+cardinality is ambiguous (multiple confirmed SALES invoices, multiple
+current links, or multiple Shipment/Export declaration candidates): no
+sum, no apportionment, no arbitrary selection.
 
 The F1b conflict semantics they supersede: the old amount / product-name
 `MISMATCH` blockers (`PURCHASE_INVOICE_AMOUNT_MISMATCH`,
@@ -374,7 +404,7 @@ reclassified outcomes appear in the table below.
 | Rule | Provenance | Finding level | Implementation |
 | --- | --- | --- | --- |
 | IP-S01 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Re-leveled (F1a/F1d): three inputs report fact completeness / comparison availability only — link = management linkage, shipment = export-management anchor, no eligibility blocker; `INSUFFICIENT_FACTS` reserved for genuinely-required sales-scope data (unreachable by construction) |
-| IP-S02 | `OWNER_CONFIRMED_PROVISIONAL` | `CONTEXT` (future comparison → `MATCH`/`DEVIATION`/`NOT_COMPARABLE_MISSING_FACT`, ADVISORY, never conflict) | Frozen as a rule; canonical currency supported on all three legs — Shipment `declared_amount`/`declared_currency` (F1c) and `Invoice.currency` (F1e) — but full three-way consistency evaluation still pending (comparison scope/cardinality semantics — multiple sales invoices / linked contracts / Shipment Facts — not yet handled safely; never sum/apportion/choose one) — no finding emitted |
+| IP-S02 | `OWNER_CONFIRMED_PROVISIONAL` | `ADVISORY` (management control; implemented for the unambiguous 1:1:1 scope in Phase 2D.3-F1f — `MATCH`/`DEVIATION`/`NOT_COMPARABLE_MISSING_FACT`/`NOT_COMPARABLE_CURRENCY_MISMATCH`/`NOT_COMPARABLE_AMBIGUOUS_SCOPE`; never conflict, never a preparation blocker) | Canonical currency on all three legs — Shipment `declared_amount`/`declared_currency` (F1c) and `Invoice.currency` (F1e). Three-way comparison implemented for the unambiguous scope (F1f): exactly one confirmed SALES Invoice Fact (a dangling allocation is NOT a confirmed Fact), exactly one current link, exactly one current Shipment; amounts compared only with all three amounts + currencies explicit and equal (no FX, no default, no inference); same-currency inequality → `SALES_INVOICE_AMOUNT_DEVIATION`, explicit currency mismatch → `SALES_INVOICE_CURRENCY_DEVIATION`; multiple invoices / links / declaration candidates → `NOT_COMPARABLE_AMBIGUOUS_SCOPE` — never sum/apportion/choose one; the comparison never blocks preparation |
 | IP-S03 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Respected by F1a/F1d (receipts never consulted, no chronology finding); invoice-before-receipt is common |
 | IP-S04 | `UNRESOLVED` | `CONTEXT` (unresolved comparison, never a blocker) | Shipment input recorded `NOT_JUDGED_UNDER_MN_UNRESOLVED` (F1a boundary, re-leveled F1d); M:N facts stay visible; future comparison → `NOT_COMPARABLE` / `UNRESOLVED`; never blocks invoice preparation |
 | IP-P01 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Payment exposed as context only (F1b); no status/advisory from payment ordering (F1d removed the `OUT_PAYMENT_PRESENT_CONTEXT_ONLY` advisory) |

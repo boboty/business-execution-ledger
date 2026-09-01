@@ -40,6 +40,7 @@ from bel.application.invoice_preparation import (
 from bel.application.sales_invoice_preparation import (
     REQUIRED_INPUT_ORDER,
     SALES_INVOICE_CONSISTENCY_CHECK_NAMES,
+    SalesInvoiceAmountCheck,
     SalesInvoicePreparationDecision,
     SalesPreparationBlocker,
     SalesPreparationBlockerCode,
@@ -558,6 +559,9 @@ def test_status_and_dto_vocabulary_carry_no_eligibility_concept():
     }
     assert statuses == {"INPUTS_PRESENT", "INSUFFICIENT_FACTS"}
 
+    # Eligibility / business-judgment tokens apply to EVERY DTO — no
+    # decision, blocker, advisory, or comparison carries an eligibility or
+    # judgment concept, and nothing is ever apportioned.
     banned_tokens = (
         "eligib",
         "ready",
@@ -565,11 +569,15 @@ def test_status_and_dto_vocabulary_carry_no_eligibility_concept():
         "should",
         "owed",
         "outstanding",
-        "amount",
-        "quantity",
-        "ratio",
         "apportion",
     )
+    # The "should-invoice amount/quantity/ratio" concept is banned on the
+    # rule-vocabulary DTOs (decision, blocker, required-input, advisory) —
+    # but NOT on the IP-S02 comparison DTO (Phase 2D.3-F1f), whose whole
+    # job is to expose the three compared amount/currency Facts explicitly.
+    # The DECISION DTO itself still carries no amount field.
+    compared_amount_tokens = ("amount", "quantity", "ratio")
+    compared_amount_dtos = {"SalesInvoiceAmountCheck"}
     import bel.application.sales_invoice_preparation as module
 
     dto_types = [
@@ -582,6 +590,35 @@ def test_status_and_dto_vocabulary_carry_no_eligibility_concept():
         for f in dataclasses.fields(dto_type):
             for token in banned_tokens:
                 assert token not in f.name.lower(), f"{dto_type.__name__}.{f.name} carries banned concept {token!r}"
+            if dto_type.__name__ in compared_amount_dtos:
+                # The comparison DTO exposes compared Facts by design (F1f).
+                continue
+            # The decision DTO references the comparison via `amount_check`
+            # (a reference to the check DTO, never a should-invoice value);
+            # every other field stays free of the amount/quantity/ratio
+            # concept.
+            if dto_type.__name__ == "SalesInvoicePreparationDecision" and f.name == "amount_check":
+                continue
+            for token in compared_amount_tokens:
+                assert token not in f.name.lower(), (
+                    f"{dto_type.__name__}.{f.name} carries banned should-invoice concept {token!r}"
+                )
+
+    # F1f locks in the comparison DTO's explicit monetary scope: the three
+    # compared Facts and their currencies are individually inspectable,
+    # and the resolved candidate ids are present — no hidden assumption.
+    amount_check_fields = {f.name for f in dataclasses.fields(SalesInvoiceAmountCheck)}
+    assert {
+        "sales_contract_amount",
+        "sales_contract_currency",
+        "declared_amount",
+        "declared_currency",
+        "shipment_id",
+        "sales_invoice_amount",
+        "sales_invoice_currency",
+        "sales_invoice_id",
+        "outcome",
+    } <= amount_check_fields
 
 
 def test_only_genuinely_required_sales_scope_data_would_be_insufficient():
