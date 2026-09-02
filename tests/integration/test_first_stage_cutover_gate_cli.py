@@ -99,3 +99,26 @@ def test_cutover_gate_missing_period_dir_is_a_clean_fail(tmp_path):
     assert result.stdout.strip() == "FIRST_STAGE_CUTOVER_GATE: FAIL"
     assert "Traceback" not in result.stdout
     assert "Traceback" not in result.stderr
+
+
+def test_cutover_gate_non_canonical_uninstalled_driver_is_clean_fail(tmp_path):
+    """G0 repair, Blocker 3: a non-canonical PostgreSQL driver that is not
+    installed (psycopg2 here) means the engine cannot even be built, so
+    the Gate cannot be reached — the CLI must emit the safe FAIL verdict
+    with no traceback and no database URL/credential in stdout."""
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    url = "postgresql+psycopg2://user:SUPERSECRETGATEPASSWORD@localhost:5432/bel"
+    result = subprocess.run(
+        [sys.executable, "-m", "bel.cli", "--database-url", url, "cutover", "gate", "--period", "2026-01"],
+        cwd=REPO_ROOT,
+        env={**os.environ, "BEL_PRIVATE_DATA_ROOT": str(private_root)},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert result.stdout.strip() == "FIRST_STAGE_CUTOVER_GATE: FAIL"
+    combined = result.stdout + result.stderr
+    assert "SUPERSECRETGATEPASSWORD" not in combined
+    assert "postgresql" not in combined
+    assert "Traceback" not in combined

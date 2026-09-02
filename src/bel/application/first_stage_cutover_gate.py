@@ -17,10 +17,16 @@ FIRST-STAGE CUTOVER GATE -> PASS -> human decision to declare SoR).
 Seven mandatory dimensions, each PASS/FAIL, no weighted score, no
 "mostly ready":
 
-    runtime_schema     effective dialect is PostgreSQL and schema revision
-                       == Alembic head (no startup migration, no auto-upgrade)
+    runtime_schema     effective runtime is the canonical BEL PostgreSQL
+                       dialect postgresql+psycopg:// (psycopg3) and schema
+                       revision == Alembic head (no startup migration, no
+                       auto-upgrade; sqlite and every non-psycopg driver
+                       rejected)
     cutover_inputs     backfill-plan.json + expected/cutover-baseline.json
-                       present for the period (never synthesized)
+                       present AND contained for the period (never
+                       synthesized; read only through the hardened private
+                       input boundary, so a nested/final symlink escape is
+                       rejected before any outside-root file is parsed)
     reconciliation     canonical bel.application.cutover_reconciliation
                        passes: ``passed`` and ``unresolved_count == 0``
     work_surfaces      the five first-stage Application projections execute
@@ -90,7 +96,10 @@ from bel.infrastructure.persistence.models import Base
 from bel.infrastructure.persistence.repositories import ContractRepository
 from bel.infrastructure.persistence.schema_gate import SchemaNotAtHeadError, assert_schema_at_head
 from bel.infrastructure.private_paths import (
+    REASON_INPUT_ESCAPE,
+    REASON_INPUT_MISSING,
     PrivateRootError,
+    read_private_file,
     resolve_period_dir,
     resolve_private_root,
     write_private_report,
@@ -123,9 +132,11 @@ FAIL = "FAIL"
 
 # Machine-readable failure reason codes (written only to the private report).
 REASON_NON_POSTGRESQL = "NON_POSTGRESQL_DIALECT"
+REASON_NON_CANONICAL_DATABASE_DRIVER = "NON_CANONICAL_DATABASE_DRIVER"
 REASON_SCHEMA_NOT_AT_HEAD = "SCHEMA_NOT_AT_HEAD"
 REASON_BACKFILL_PLAN_MISSING = "BACKFILL_PLAN_MISSING"
 REASON_BASELINE_MISSING = "BASELINE_MISSING"
+REASON_PRIVATE_INPUT_ESCAPE = "PRIVATE_INPUT_ESCAPE"
 REASON_BASELINE_PARSE = "BASELINE_PARSE_ERROR"
 REASON_RECONCILIATION_UNRESOLVED = "RECONCILIATION_UNRESOLVED"
 REASON_RECONCILIATION_ERROR = "RECONCILIATION_ERROR"
@@ -153,12 +164,17 @@ EXPORT_FORMATS = ("csv", "xlsx")
 
 @dataclass(frozen=True)
 class RuntimeCheck:
-    """Result of probing the target runtime: dialect is PostgreSQL and
-    schema revision == Alembic head. ``*_reason`` are diagnostic strings
-    for the private report only."""
+    """Result of probing the target runtime: the effective SQLAlchemy
+    runtime is the canonical BEL PostgreSQL dialect (``postgresql+psycopg``)
+    AND the schema revision equals Alembic head. ``*_reason_code`` is the
+    stable machine-readable failure reason (used on the result's
+    ``reason_codes``); ``*_reason`` is a diagnostic string for the private
+    report only."""
 
     dialect_ok: bool
     schema_ok: bool
+    dialect_reason_code: str | None = None
+    schema_reason_code: str | None = None
     dialect_reason: str | None = None
     schema_reason: str | None = None
 
@@ -202,27 +218,65 @@ class FirstStageCutoverGateResult:
 # ---------------------------------------------------------------------------
 
 
+def canonical_postgresql_runtime(engine) -> tuple[bool, str | None]:
+    """True iff the effective SQLAlchemy runtime is exactly the canonical
+    BEL production runtime: the psycopg3 PostgreSQL dialect
+    (``postgresql+psycopg://``).
+
+    Verified from engine metadata (never the URL's credentials): the
+    drivername is ``postgresql+psycopg`` AND ``dialect.name == "postgresql"``
+    AND ``dialect.driver == "psycopg"``. The bare ``postgresql://`` form
+    (defaults to psycopg2), ``postgresql+psycopg2://``,
+    ``postgresql+asyncpg://``, and SQLite are all rejected — the URL is
+    never rewritten and no driver fallback is attempted.
+
+    Returns ``(ok, None)`` or ``(False, reason_code)`` where the reason
+    code is ``REASON_NON_CANONICAL_DATABASE_DRIVER`` for a PostgreSQL
+    dialect on a non-canonical driver, and ``REASON_NON_POSTGRESQL`` for
+    any other dialect (e.g. SQLite)."""
+    drivername = getattr(engine.url, "drivername", None)
+    dialect_name = getattr(getattr(engine, "dialect", None), "name", None)
+    dialect_driver = getattr(getattr(engine, "dialect", None), "driver", None)
+    if (
+        drivername == "postgresql+psycopg"
+        and dialect_name == "postgresql"
+        and dialect_driver == "psycopg"
+    ):
+        return True, None
+    if dialect_name == "postgresql":
+        return False, REASON_NON_CANONICAL_DATABASE_DRIVER
+    return False, REASON_NON_POSTGRESQL
+
+
 def default_runtime_check(session: Session) -> RuntimeCheck:
-    """The production runtime probe: the effective dialect must be
-    PostgreSQL and the schema revision must equal the single Alembic
-    head. No startup migration and no auto-upgrade are ever performed —
-    a mismatch is a FAIL, never an automatic fix. SQLite (test-only
-    convenience) is rejected for the real Gate."""
+    """The production runtime probe: the effective runtime must be exactly
+    the canonical ``postgresql+psycopg`` PostgreSQL dialect AND the schema
+    revision must equal the single Alembic head. No startup migration and
+    no auto-upgrade are ever performed — a mismatch is a FAIL, never an
+    automatic fix. SQLite (test-only convenience) and every non-psycopg
+    PostgreSQL driver are rejected for the real Gate."""
     engine = session.get_bind()
-    dialect = getattr(engine.dialect, "name", None)
-    if dialect != "postgresql":
+    dialect_ok, dialect_reason_code = canonical_postgresql_runtime(engine)
+    if not dialect_ok:
+        drivername = getattr(engine.url, "drivername", None)
         return RuntimeCheck(
             dialect_ok=False,
             schema_ok=False,
+            dialect_reason_code=dialect_reason_code,
             dialect_reason=(
-                f"unsupported database dialect {dialect!r} — the FIRST-STAGE CUTOVER GATE "
-                "requires a PostgreSQL runtime (sqlite is test-only convenience)"
+                f"unsupported database runtime {drivername!r} — the FIRST-STAGE CUTOVER GATE "
+                "requires exactly postgresql+psycopg:// (PostgreSQL, psycopg3 driver)"
             ),
         )
     try:
         assert_schema_at_head(engine)
     except SchemaNotAtHeadError as exc:
-        return RuntimeCheck(dialect_ok=True, schema_ok=False, schema_reason=str(exc))
+        return RuntimeCheck(
+            dialect_ok=True,
+            schema_ok=False,
+            schema_reason_code=REASON_SCHEMA_NOT_AT_HEAD,
+            schema_reason=str(exc),
+        )
     return RuntimeCheck(dialect_ok=True, schema_ok=True)
 
 
@@ -489,21 +543,26 @@ def _run_gate_impl(
             reasons.append(exc.reason_code)
             diagnostics["period_error"] = str(exc)
 
-    # ---- 2. Runtime / schema (PostgreSQL only, schema == Alembic head). ----
+    # ---- 2. Runtime / schema (canonical postgresql+psycopg, == head). ----
     probe = runtime_check(session)
+    engine_bind = session.get_bind()
     diagnostics["runtime"] = {
-        "dialect": getattr(session.get_bind().dialect, "name", None),
+        "dialect": getattr(engine_bind.dialect, "name", None),
+        "dialect_driver": getattr(getattr(engine_bind, "dialect", None), "driver", None),
+        "drivername": getattr(engine_bind.url, "drivername", None),
         "dialect_ok": probe.dialect_ok,
         "schema_ok": probe.schema_ok,
+        "dialect_reason_code": probe.dialect_reason_code,
+        "schema_reason_code": probe.schema_reason_code,
         "dialect_reason": probe.dialect_reason,
         "schema_reason": probe.schema_reason,
     }
     if not probe.dialect_ok:
         dims[DIM_RUNTIME_SCHEMA] = FAIL
-        reasons.append(REASON_NON_POSTGRESQL)
+        reasons.append(probe.dialect_reason_code or REASON_NON_POSTGRESQL)
     elif not probe.schema_ok:
         dims[DIM_RUNTIME_SCHEMA] = FAIL
-        reasons.append(REASON_SCHEMA_NOT_AT_HEAD)
+        reasons.append(probe.schema_reason_code or REASON_SCHEMA_NOT_AT_HEAD)
 
     # ---- 3. DB-dependent dimensions. ----
     db_ok = dims[DIM_RUNTIME_SCHEMA] == PASS and dims[DIM_PRIVACY_BOUNDARY] == PASS and period_dir is not None
@@ -524,22 +583,39 @@ def _run_gate_impl(
     else:
         fingerprint_before = _schema_fingerprint(session)
 
-        # 3a. Required cutover inputs — never synthesized, never inferred.
-        plan_path = period_dir / "backfill-plan.json"
-        baseline_path = period_dir / "expected" / "cutover-baseline.json"
+        # 3a. Required cutover inputs — never synthesized, never inferred,
+        # and read ONLY through the hardened private-input boundary. A
+        # symlinked ``expected/`` directory, a symlinked plan/baseline
+        # file, or any nested path resolving outside the private root is
+        # rejected BEFORE its content could be parsed.
+        period_prefix = period_dir.relative_to(root).as_posix()
         cutover_inputs_diag: dict[str, Any] = {}
-        if plan_path.is_file():
+        baseline_bytes: bytes | None = None
+
+        try:
+            read_private_file(root, f"{period_prefix}/backfill-plan.json")
+        except PrivateRootError as exc:
+            cutover_inputs_diag["backfill_plan"] = "missing" if exc.reason_code == REASON_INPUT_MISSING else "escape"
+            dims[DIM_CUTOVER_INPUTS] = FAIL
+            reasons.append(
+                REASON_BACKFILL_PLAN_MISSING if exc.reason_code == REASON_INPUT_MISSING else REASON_PRIVATE_INPUT_ESCAPE
+            )
+        else:
             cutover_inputs_diag["backfill_plan"] = "present"
-        else:
-            cutover_inputs_diag["backfill_plan"] = "missing"
+
+        try:
+            baseline_bytes = read_private_file(root, f"{period_prefix}/expected/cutover-baseline.json")
+        except PrivateRootError as exc:
+            cutover_inputs_diag["cutover_baseline"] = (
+                "missing" if exc.reason_code == REASON_INPUT_MISSING else "escape"
+            )
             dims[DIM_CUTOVER_INPUTS] = FAIL
-            reasons.append(REASON_BACKFILL_PLAN_MISSING)
-        if baseline_path.is_file():
+            reasons.append(
+                REASON_BASELINE_MISSING if exc.reason_code == REASON_INPUT_MISSING else REASON_PRIVATE_INPUT_ESCAPE
+            )
+        else:
             cutover_inputs_diag["cutover_baseline"] = "present"
-        else:
-            cutover_inputs_diag["cutover_baseline"] = "missing"
-            dims[DIM_CUTOVER_INPUTS] = FAIL
-            reasons.append(REASON_BASELINE_MISSING)
+
         diagnostics["cutover_inputs"] = cutover_inputs_diag
 
         if dims[DIM_CUTOVER_INPUTS] == FAIL:
@@ -554,9 +630,12 @@ def _run_gate_impl(
             # implementation, never a second one. UNRESOLVED == 0 required.
             # OPEN backfill-produced Tasks already surface as unconditional
             # UNRESOLVED inside ``reconcile``, so no duplicate check exists.
+            # ``baseline_bytes`` came from the hardened input boundary, so
+            # parsing it immediately is safe.
+            assert baseline_bytes is not None  # inputs PASS means both read
             try:
-                baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as exc:
+                baseline = json.loads(baseline_bytes.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 dims[DIM_RECONCILIATION] = FAIL
                 reasons.append(REASON_BASELINE_PARSE)
                 diagnostics["reconciliation_error"] = str(exc)
@@ -612,6 +691,10 @@ def _run_gate_impl(
             dims[DIM_READ_ONLY] = FAIL
             reasons.append(REASON_BUSINESS_STATE_MUTATED)
 
+    # Reason codes are reported once each (two escaping inputs share the
+    # same PRIVATE_INPUT_ESCAPE code rather than stacking duplicates).
+    reason_codes = tuple(dict.fromkeys(reasons))
+
     result = FirstStageCutoverGateResult(
         period=period,
         runtime_schema=dims[DIM_RUNTIME_SCHEMA],
@@ -621,7 +704,7 @@ def _run_gate_impl(
         data_products=dims[DIM_DATA_PRODUCTS],
         privacy_boundary=dims[DIM_PRIVACY_BOUNDARY],
         read_only=dims[DIM_READ_ONLY],
-        reason_codes=tuple(reasons),
+        reason_codes=reason_codes,
         passed=all(value == PASS for value in dims.values()),
         report_written=False,
         diagnostics=diagnostics,

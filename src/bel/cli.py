@@ -153,19 +153,33 @@ def cli(ctx: click.Context, database_url: str) -> None:
     """
     ctx.ensure_object(dict)
     ctx.obj["database_url"] = database_url
-    # `cutover gate` is the exception to the global startup schema gate: it
-    # is strictly read-only, so running it against a schema-not-at-head
-    # database is safe, and its whole purpose is to REPORT that mismatch as
-    # a FAIL dimension (with the private diagnostic report) rather than be
-    # blocked before it can judge. The Gate performs its OWN dialect +
-    # schema-at-head verification (docs/FIRST-STAGE-CUTOVER-GATE.md section
-    # 2) and can never PASS a mismatched schema. Every other command keeps
-    # the hard startup gate.
-    if ctx.invoked_subcommand != "gate":
-        try:
-            assert_schema_at_head(make_engine(database_url))
-        except SchemaNotAtHeadError as exc:
-            raise click.ClickException(str(exc)) from exc
+    # The startup schema gate is TWO-level Click-aware (docs/
+    # FIRST-STAGE-CUTOVER-GATE.md section 3):
+    #   - the ROOT group enforces it for every top-level command EXCEPT the
+    #     `cutover` group (whose own callback enforces it for its
+    #     subcommands), and
+    #   - the `cutover` group enforces it for every subcommand EXCEPT
+    #     `cutover gate`.
+    # ``ctx.invoked_subcommand`` at this level is the FIRST-level command
+    # name ("cutover" for the whole cutover group), never the nested
+    # "gate" — so the nested bypass lives in the cutover group callback,
+    # not here. Every other command (including cutover backfill/reconcile)
+    # keeps the hard startup gate.
+    if ctx.invoked_subcommand != "cutover":
+        _assert_cli_schema_at_head(database_url)
+
+
+def _assert_cli_schema_at_head(database_url: str) -> None:
+    """Shared CLI startup schema gate: a PostgreSQL runtime must be at
+    Alembic head before a normal command runs (no startup migration and
+    no auto-upgrade). No-ops on SQLite (test-only convenience, no active
+    Alembic chain). Raises a clean ClickException on drift. `cutover gate`
+    is excluded by its callers because the Gate reports schema drift
+    itself as a FAIL dimension with the private diagnostic report."""
+    try:
+        assert_schema_at_head(make_engine(database_url))
+    except SchemaNotAtHeadError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli.command("import-contract-ledger")
@@ -2062,12 +2076,22 @@ def _write_cutover_report(period_dir: Path, filename: str, diagnostic: dict) -> 
 
 
 @cli.group("cutover")
-def cutover_group() -> None:
+@click.pass_context
+def cutover_group(ctx: click.Context) -> None:
     """Phase 2D.1-R5 cutover infrastructure/rehearsal — backfill,
     reconciliation, and the FIRST-STAGE CUTOVER GATE (see
     docs/FIRST-STAGE-CUTOVER-GATE.md). Never a final-cutover switch:
     passing reconciliation, or even a Gate PASS, does not itself declare
-    BEL the System of Record."""
+    BEL the System of Record.
+
+    Second level of the two-level startup schema gate: every cutover
+    subcommand except ``gate`` keeps the hard schema-at-head check (this
+    is where ``ctx.invoked_subcommand`` is the nested command name).
+    ``cutover gate`` performs its OWN runtime/schema verification so a
+    schema-drift database is reported by the Gate (FIRST_STAGE_CUTOVER_GATE:
+    FAIL + private diagnostic) rather than blocked before it can judge."""
+    if ctx.invoked_subcommand != "gate":
+        _assert_cli_schema_at_head(ctx.obj["database_url"])
 
 
 @cutover_group.command("backfill")
@@ -2169,13 +2193,22 @@ def cutover_gate_cmd(ctx: click.Context, period: str) -> None:
     """
     from bel.application.first_stage_cutover_gate import candidate_sha, run_first_stage_cutover_gate
 
-    session_factory = _session_factory(ctx.obj["database_url"])
-    with session_factory() as session:
-        result = run_first_stage_cutover_gate(
-            session,
-            period=period,
-            candidate_sha=candidate_sha(),
-        )
+    try:
+        session_factory = _session_factory(ctx.obj["database_url"])
+        with session_factory() as session:
+            result = run_first_stage_cutover_gate(
+                session,
+                period=period,
+                candidate_sha=candidate_sha(),
+            )
+    except (ValueError, ModuleNotFoundError, ImportError) as exc:
+        # A URL whose engine cannot even be constructed (an unsupported
+        # dialect, or a non-canonical driver that is not installed — e.g.
+        # postgresql+psycopg2:// with no psycopg2) can never reach the
+        # Gate's own canonical-runtime probe. Emit the same safe FAIL
+        # verdict, never a traceback that could expose the URL.
+        click.echo("FIRST_STAGE_CUTOVER_GATE: FAIL")
+        raise SystemExit(1) from exc
     click.echo(f"FIRST_STAGE_CUTOVER_GATE: {'PASS' if result.passed else 'FAIL'}")
     raise SystemExit(0 if result.passed else 1)
 

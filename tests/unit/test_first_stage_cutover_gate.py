@@ -33,12 +33,15 @@ from bel.application.first_stage_cutover_gate import (
     REASON_BASELINE_MISSING,
     REASON_EXPORT_ERROR,
     REASON_EXPORT_NONDETERMINISM,
+    REASON_NON_CANONICAL_DATABASE_DRIVER,
     REASON_NON_POSTGRESQL,
+    REASON_PRIVATE_INPUT_ESCAPE,
     REASON_RECONCILIATION_UNRESOLVED,
     REASON_SCHEMA_NOT_AT_HEAD,
     REASON_SURFACE_ERROR,
     RuntimeCheck,
     _schema_fingerprint,
+    canonical_postgresql_runtime,
     default_runtime_check,
     run_first_stage_cutover_gate,
 )
@@ -165,6 +168,19 @@ def _run(session: Session, root: Path, period: str = "2026-01", runtime=None, **
     )
 
 
+def _stub_engine(drivername: str, dialect_name: str, driver: str):
+    """A minimal engine stand-in exposing only the metadata the canonical
+    runtime classification inspects (``url.drivername`` and
+    ``dialect.name``/``dialect.driver``) — lets the driver matrix be
+    tested without the drivers installed."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        url=SimpleNamespace(drivername=drivername),
+        dialect=SimpleNamespace(name=dialect_name, driver=driver),
+    )
+
+
 def _make_open_task(
     session: Session, exception_type: str, *, contract_id: str | None = None, identity_key: str | None = None
 ) -> None:
@@ -254,6 +270,7 @@ def test_default_runtime_check_rejects_sqlite(db_session):
     probe = default_runtime_check(db_session)
     assert probe.dialect_ok is False
     assert probe.schema_ok is False
+    assert probe.dialect_reason_code == REASON_NON_POSTGRESQL
 
 
 def test_fail_schema_not_at_head(db_session, gate_root):
@@ -609,3 +626,210 @@ def test_period_close_blocker_visible_but_not_a_cutover_discrepancy(db_session, 
     assert result.reconciliation == PASS
     assert result.diagnostics["reconciliation"]["unresolved_count"] == 0
     assert result.diagnostics["surfaces"]["exception_task_center"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# G0 repair, Blocker 2 — hardened private INPUT boundary at the Gate level.
+# A symlinked expected/ dir, plan or baseline file, or any nested path
+# resolving outside the private root must FAIL the Gate BEFORE its content
+# could be parsed; the verdict and the private report location stay safe.
+# ---------------------------------------------------------------------------
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _prepare_contract_and_real_inputs(db_session, gate_root):
+    contract = _make_contract(db_session)
+    _write_baseline(gate_root / "2026-01", _contract_entries(contract))
+    db_session.commit()
+    return contract
+
+
+def test_input_real_files_inside_period_are_accepted(db_session, gate_root):
+    """Task test 1: a normal real plan/baseline file inside the period is
+    accepted (the PASS case already proves the full happy path)."""
+    contract = _prepare_contract_and_real_inputs(db_session, gate_root)
+    result = _run(db_session, gate_root)
+    assert result.passed
+    assert result.diagnostics["cutover_inputs"] == {
+        "backfill_plan": "present", "cutover_baseline": "present",
+    }
+
+
+def test_input_expected_dir_symlink_outside_root_gate_fails(db_session, gate_root, tmp_path):
+    """Task test 2: <period>/expected is a symlink to a directory OUTSIDE
+    BEL_PRIVATE_DATA_ROOT -> FAIL (PRIVATE_INPUT_ESCAPE), never parsed."""
+    contract = _prepare_contract_and_real_inputs(db_session, gate_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "cutover-baseline.json").write_text(json.dumps({"entries": _contract_entries(contract)}))
+    shutil.rmtree(gate_root / "2026-01" / "expected")
+    os.symlink(outside, gate_root / "2026-01" / "expected")
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert result.cutover_inputs == FAIL
+    assert REASON_PRIVATE_INPUT_ESCAPE in result.reason_codes
+    assert result.diagnostics["cutover_inputs"]["cutover_baseline"] == "escape"
+    assert result.diagnostics["cutover_inputs"]["backfill_plan"] == "present"
+
+
+def test_input_plan_symlink_outside_root_gate_fails(db_session, gate_root, tmp_path):
+    """Task test 3: backfill-plan.json symlinks OUTSIDE the root -> FAIL."""
+    _prepare_contract_and_real_inputs(db_session, gate_root)
+    outside = tmp_path / "outside-plan.json"
+    outside.write_text(json.dumps({"version": 1}))
+    os.remove(gate_root / "2026-01" / "backfill-plan.json")
+    os.symlink(outside, gate_root / "2026-01" / "backfill-plan.json")
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert result.cutover_inputs == FAIL
+    assert REASON_PRIVATE_INPUT_ESCAPE in result.reason_codes
+    assert result.diagnostics["cutover_inputs"]["backfill_plan"] == "escape"
+    assert result.diagnostics["cutover_inputs"]["cutover_baseline"] == "present"
+
+
+def test_input_baseline_symlink_outside_root_gate_fails(db_session, gate_root, tmp_path):
+    """Task test 4: cutover-baseline.json symlinks OUTSIDE the root ->
+    FAIL, and the external content is never treated as valid input."""
+    contract = _prepare_contract_and_real_inputs(db_session, gate_root)
+    outside = tmp_path / "outside-baseline.json"
+    outside.write_text(json.dumps({"entries": _contract_entries(contract)}))
+    os.remove(gate_root / "2026-01" / "expected" / "cutover-baseline.json")
+    os.symlink(outside, gate_root / "2026-01" / "expected" / "cutover-baseline.json")
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert result.cutover_inputs == FAIL
+    assert REASON_PRIVATE_INPUT_ESCAPE in result.reason_codes
+    assert result.diagnostics["cutover_inputs"]["cutover_baseline"] == "escape"
+
+
+def test_input_file_symlink_into_repository_gate_fails(db_session, gate_root):
+    """Task test 5: a required FILE symlinking to an EXISTING repository
+    file resolves inside the repo (outside the private root) -> ESCAPE —
+    no repository content is ever treated as Gate input."""
+    _prepare_contract_and_real_inputs(db_session, gate_root)
+    os.remove(gate_root / "2026-01" / "expected" / "cutover-baseline.json")
+    os.symlink(_repo_root() / "pyproject.toml", gate_root / "2026-01" / "expected" / "cutover-baseline.json")
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert result.cutover_inputs == FAIL
+    assert REASON_PRIVATE_INPUT_ESCAPE in result.reason_codes
+    assert "reconciliation" not in result.diagnostics  # never parsed
+
+
+def test_input_dir_symlink_into_repository_never_parsed(db_session, gate_root):
+    """A directory component symlinking into the repository FAILs the Gate
+    (MISSING when the repo dir has no matching file, ESCAPE when it does)
+    — either way no outside content is parsed and no reconciliation runs."""
+    _prepare_contract_and_real_inputs(db_session, gate_root)
+    shutil.rmtree(gate_root / "2026-01" / "expected")
+    os.symlink(_repo_root() / "docs", gate_root / "2026-01" / "expected")
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert result.cutover_inputs == FAIL
+    assert "reconciliation" not in result.diagnostics
+    assert result.reconciliation == FAIL
+
+
+def test_input_missing_remains_missing_fail(db_session, gate_root):
+    """Task test 6: a genuinely missing file stays an ordinary
+    missing-input FAIL (BACKFILL_PLAN_MISSING / BASELINE_MISSING), never
+    confused with an escape."""
+    contract = _make_contract(db_session)
+    db_session.commit()
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert result.cutover_inputs == FAIL
+    assert REASON_BASELINE_MISSING in result.reason_codes
+    assert REASON_PRIVATE_INPUT_ESCAPE not in result.reason_codes
+
+
+def test_rejected_external_baseline_is_never_parsed_or_reconciled(db_session, gate_root, tmp_path):
+    """Task test 7: an escaping baseline whose content WOULD reconcile if
+    read is still rejected at the boundary — it is never parsed and never
+    reconciled (no reconciliation diagnostic, dimension unevaluated FAIL)."""
+    contract = _prepare_contract_and_real_inputs(db_session, gate_root)
+    outside = tmp_path / "evil-baseline.json"
+    outside.write_text(json.dumps({"entries": _contract_entries(contract)}))
+    os.remove(gate_root / "2026-01" / "expected" / "cutover-baseline.json")
+    os.symlink(outside, gate_root / "2026-01" / "expected" / "cutover-baseline.json")
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert REASON_PRIVATE_INPUT_ESCAPE in result.reason_codes
+    assert "reconciliation" not in result.diagnostics
+    assert result.reconciliation == FAIL  # unevaluated is never PASS
+
+
+def test_input_escape_keeps_report_inside_private_root(db_session, gate_root, tmp_path):
+    """Task tests 8+9: the private report is still written ONLY under
+    BEL_PRIVATE_DATA_ROOT (never outside) even when an input escapes, and
+    its content records the escape."""
+    contract = _prepare_contract_and_real_inputs(db_session, gate_root)
+    outside = tmp_path / "outside-baseline.json"
+    outside.write_text(json.dumps({"entries": _contract_entries(contract)}))
+    os.remove(gate_root / "2026-01" / "expected" / "cutover-baseline.json")
+    os.symlink(outside, gate_root / "2026-01" / "expected" / "cutover-baseline.json")
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert result.report_written
+    report = gate_root / "reports" / "first-stage-cutover-gate-2026-01.json"
+    assert report.exists()
+    assert not (tmp_path / "reports").exists()
+    body = json.loads(report.read_text(encoding="utf-8"))
+    assert body["passed"] is False
+    assert REASON_PRIVATE_INPUT_ESCAPE in body["reason_codes"]
+
+
+# ---------------------------------------------------------------------------
+# G0 repair, Blocker 3 — canonical postgresql+psycopg runtime contract.
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_psycopg_runtime_identity_passes():
+    """postgresql+psycopg:// (psycopg3) is the accepted canonical runtime
+    — verified from engine metadata alone, no connection needed."""
+    engine = make_engine("postgresql+psycopg://user:pass@localhost:5432/db")
+    ok, reason = canonical_postgresql_runtime(engine)
+    assert ok is True
+    assert reason is None
+
+
+def test_non_canonical_postgresql_drivers_rejected():
+    """PostgreSQL dialect on any non-psycopg driver — psycopg2, asyncpg,
+    and the bare postgresql:// default — is rejected with
+    NON_CANONICAL_DATABASE_DRIVER. (Stub engines: the drivers need not be
+    installed for the classification check.)"""
+    for drivername, driver in (
+        ("postgresql+psycopg2", "psycopg2"),
+        ("postgresql+asyncpg", "asyncpg"),
+        ("postgresql", "psycopg2"),  # bare postgresql:// defaults to psycopg2
+    ):
+        ok, reason = canonical_postgresql_runtime(_stub_engine(drivername, "postgresql", driver))
+        assert ok is False, drivername
+        assert reason == REASON_NON_CANONICAL_DATABASE_DRIVER, drivername
+
+
+def test_sqlite_runtime_rejected_as_non_postgresql():
+    engine = make_engine("sqlite://")
+    ok, reason = canonical_postgresql_runtime(engine)
+    assert ok is False
+    assert reason == REASON_NON_POSTGRESQL
+
+
+def test_gate_reports_non_canonical_driver_reason(db_session, gate_root):
+    """A postgresql-dialect-but-not-psycopg runtime fails the Gate's
+    runtime_schema dimension with NON_CANONICAL_DATABASE_DRIVER."""
+    contract = _make_contract(db_session)
+    _write_baseline(gate_root / "2026-01", _contract_entries(contract))
+    db_session.commit()
+    result = _run(
+        db_session, gate_root,
+        runtime=lambda s: RuntimeCheck(
+            dialect_ok=False, schema_ok=False, dialect_reason_code=REASON_NON_CANONICAL_DATABASE_DRIVER,
+        ),
+    )
+    assert not result.passed
+    assert result.runtime_schema == FAIL
+    assert REASON_NON_CANONICAL_DATABASE_DRIVER in result.reason_codes

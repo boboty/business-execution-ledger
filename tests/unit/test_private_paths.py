@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from bel.infrastructure.private_paths import (
+    REASON_INPUT_ESCAPE,
+    REASON_INPUT_MISSING,
     REASON_INVALID_PERIOD,
     REASON_PERIOD_ESCAPE,
     REASON_PERIOD_NOT_FOUND,
@@ -24,6 +26,7 @@ from bel.infrastructure.private_paths import (
     REASON_ROOT_NOT_DIR,
     REASON_ROOT_NOT_SET,
     PrivateRootError,
+    read_private_file,
     resolve_period_dir,
     resolve_private_root,
     write_private_report,
@@ -183,3 +186,97 @@ def test_report_refuses_existing_report_symlink_into_repo(tmp_path):
 def test_report_refuses_root_inside_repo():
     ok = write_private_report(_repo_root(), "first-stage-cutover-gate-2026-07.json", {"x": 1})
     assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# read_private_file — hardened private INPUT boundary (G0 repair, Blocker 2)
+# ---------------------------------------------------------------------------
+
+
+def _input_root(tmp_path) -> Path:
+    root = tmp_path / "private"
+    period_dir = root / "2026-01"
+    (period_dir / "expected").mkdir(parents=True)
+    return root
+
+
+def test_private_input_reads_real_file_inside_root(tmp_path):
+    root = _input_root(tmp_path)
+    (root / "2026-01" / "expected" / "cutover-baseline.json").write_text('{"entries": []}')
+    assert read_private_file(root, "2026-01/expected/cutover-baseline.json") == b'{"entries": []}'
+
+
+def test_private_input_missing_file_is_missing_not_escape(tmp_path):
+    root = _input_root(tmp_path)
+    with pytest.raises(PrivateRootError) as excinfo:
+        read_private_file(root, "2026-01/expected/cutover-baseline.json")
+    assert excinfo.value.reason_code == REASON_INPUT_MISSING
+
+
+def test_private_input_directory_named_as_file_is_missing(tmp_path):
+    root = _input_root(tmp_path)
+    # ``expected`` exists but as a directory; a plan named after a dir is
+    # not a regular file -> MISSING, never a guessed read.
+    with pytest.raises(PrivateRootError) as excinfo:
+        read_private_file(root, "2026-01/backfill-plan.json")
+    assert excinfo.value.reason_code == REASON_INPUT_MISSING
+
+
+def test_private_input_rejects_arbitrary_paths(tmp_path):
+    root = _input_root(tmp_path)
+    for bad in ("/etc/passwd", "~/x", "../escape.json", "2026-01/../../etc/passwd", "2026-01//x", ""):
+        with pytest.raises(PrivateRootError) as excinfo:
+            read_private_file(root, bad)
+        assert excinfo.value.reason_code == REASON_INPUT_ESCAPE, bad
+
+
+def test_private_input_rejects_expected_dir_symlink_outside_root(tmp_path):
+    root = _input_root(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "cutover-baseline.json").write_text("outside")
+    os.rmdir(root / "2026-01" / "expected")  # the fixture-created empty dir
+    os.symlink(outside, root / "2026-01" / "expected")
+    with pytest.raises(PrivateRootError) as excinfo:
+        read_private_file(root, "2026-01/expected/cutover-baseline.json")
+    assert excinfo.value.reason_code == REASON_INPUT_ESCAPE
+
+
+def test_private_input_rejects_plan_file_symlink_outside_root(tmp_path):
+    root = _input_root(tmp_path)
+    outside = tmp_path / "outside-file.json"
+    outside.write_text("outside plan")
+    os.symlink(outside, root / "2026-01" / "backfill-plan.json")
+    with pytest.raises(PrivateRootError) as excinfo:
+        read_private_file(root, "2026-01/backfill-plan.json")
+    assert excinfo.value.reason_code == REASON_INPUT_ESCAPE
+
+
+def test_private_input_rejects_baseline_file_symlink_outside_root(tmp_path):
+    root = _input_root(tmp_path)
+    outside = tmp_path / "outside-baseline.json"
+    outside.write_text("outside baseline")
+    os.symlink(outside, root / "2026-01" / "expected" / "cutover-baseline.json")
+    with pytest.raises(PrivateRootError) as excinfo:
+        read_private_file(root, "2026-01/expected/cutover-baseline.json")
+    assert excinfo.value.reason_code == REASON_INPUT_ESCAPE
+
+
+def test_private_input_rejects_nested_escape_into_repository(tmp_path):
+    root = _input_root(tmp_path)
+    # ``expected`` symlinks into the repository (a dir outside the root).
+    os.rmdir(root / "2026-01" / "expected")
+    os.symlink(_repo_root() / "docs", root / "2026-01" / "expected")
+    with pytest.raises(PrivateRootError) as excinfo:
+        read_private_file(root, "2026-01/expected/ARCHITECTURE.md")
+    assert excinfo.value.reason_code == REASON_INPUT_ESCAPE
+
+
+def test_private_input_accepts_symlink_that_stays_inside_root(tmp_path):
+    root = _input_root(tmp_path)
+    real = root / "2026-01" / "real-baseline.json"
+    real.write_text('{"entries": [1]}')
+    os.symlink(real, root / "2026-01" / "expected" / "cutover-baseline.json")
+    # Resolves strictly inside the root and is a regular file — accepted,
+    # exactly like resolve_period_dir's containment discipline.
+    assert read_private_file(root, "2026-01/expected/cutover-baseline.json") == b'{"entries": [1]}'

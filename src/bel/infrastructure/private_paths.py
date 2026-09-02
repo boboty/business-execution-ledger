@@ -14,6 +14,15 @@ paths, and is deliberately reusable by any private-rooted command:
   string: ``..``, an absolute path, and a same-looking symlinked period
   directory resolving outside the root are all rejected by the regex
   first and then re-checked AFTER symlink resolution.
+- Required private INPUT files (``read_private_file``) are resolved with
+  the same containment discipline as the period directory itself: every
+  nested path component is resolved and required to remain inside the
+  resolved root, outside the repository, and to be a regular file — a
+  symlinked ``expected/`` directory, a symlinked plan/baseline file, or
+  any path escaping the root is rejected before its content could be
+  parsed. The read itself happens through an ``O_NOFOLLOW`` descriptor
+  chain against the resolved parent, never by re-opening the original
+  potentially-symlinked path.
 - Reports are written ONLY under ``$BEL_PRIVATE_DATA_ROOT/reports/`` via
   a checked directory descriptor (``O_DIRECTORY`` + ``O_NOFOLLOW``) and a
   ``O_NOFOLLOW`` final component — a reports-directory or report-file
@@ -26,6 +35,7 @@ interprets business values.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -42,6 +52,8 @@ REASON_ROOT_NOT_DIR = "PRIVATE_DATA_ROOT_NOT_DIR"
 REASON_INVALID_PERIOD = "INVALID_PERIOD"
 REASON_PERIOD_NOT_FOUND = "PERIOD_DIR_NOT_FOUND"
 REASON_PERIOD_ESCAPE = "PERIOD_ESCAPE"
+REASON_INPUT_MISSING = "PRIVATE_INPUT_MISSING"
+REASON_INPUT_ESCAPE = "PRIVATE_INPUT_ESCAPE"
 
 _REPORTS_DIR_NAME = "reports"
 
@@ -128,6 +140,103 @@ def resolve_period_dir(root: Path, period: str) -> Path:
     if not candidate.is_dir() or not is_within(candidate, resolved_root):
         raise PrivateRootError(REASON_PERIOD_ESCAPE, f"period {period!r} does not resolve inside BEL_PRIVATE_DATA_ROOT")
     return candidate
+
+
+def _split_relative(relative: str) -> list[str]:
+    """Lexical validation of a root-relative input path. Returns the
+    non-empty '/' components, rejecting an absolute path, ``~``, ``..``,
+    ``.``, or any empty segment — an arbitrary path must never reach the
+    filesystem."""
+    if not isinstance(relative, str) or not relative:
+        raise PrivateRootError(REASON_INPUT_ESCAPE, "private input path must be a non-empty string")
+    if relative.startswith("/") or relative.startswith("~"):
+        raise PrivateRootError(REASON_INPUT_ESCAPE, f"private input path must be relative, got {relative!r}")
+    raw_parts = relative.split("/")
+    if "" in raw_parts:
+        # A leading/trailing or doubled '/' is not a canonical relative
+        # path — rejected rather than silently normalized.
+        raise PrivateRootError(REASON_INPUT_ESCAPE, f"private input path is not canonical, got {relative!r}")
+    if any(part in ("..", ".") for part in raw_parts):
+        raise PrivateRootError(REASON_INPUT_ESCAPE, f"private input path must not contain '..', got {relative!r}")
+    return raw_parts
+
+
+def read_private_file(root: Path, relative: str) -> bytes:
+    """Read one regular file strictly inside the resolved private root.
+
+    ``root`` must already be validated (see ``resolve_private_root``).
+    ``relative`` is a root-relative '/'-separated path (e.g.
+    ``2026-01/expected/cutover-baseline.json``), never absolute and never
+    containing ``..``.
+
+    Hardened containment — every path component is resolved (symlinks
+    followed) and the RESULT must remain inside the resolved root, must
+    not be inside the repository, and must be a regular file. A symlinked
+    directory component, a symlinked final file, or any path resolving
+    outside the root is rejected BEFORE any outside content is read.
+
+    The bytes are then read through descriptors opened against the
+    RESOLVED parent directory (``O_DIRECTORY`` + ``O_NOFOLLOW``) with an
+    ``O_NOFOLLOW`` final component — the reader never re-opens the
+    original, potentially-symlinked path after validation (the same
+    check/write-gap discipline as ``write_private_report``).
+
+    Raises ``PrivateRootError`` with ``REASON_INPUT_MISSING`` when the
+    file does not exist / is not a regular file, and
+    ``REASON_INPUT_ESCAPE`` when it (or any component) resolves outside
+    the private root or is a symlink the descriptor discipline refuses.
+    """
+    resolved_root = root.resolve(strict=True)
+    if not resolved_root.is_dir() or is_within(resolved_root, repo_root()):
+        raise PrivateRootError(REASON_ROOT_INSIDE_REPO, "private root must not be inside the repository")
+    parts = _split_relative(relative)
+
+    try:
+        candidate = resolved_root.joinpath(*parts).resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise PrivateRootError(
+            REASON_INPUT_MISSING, f"private input {relative!r} not found under BEL_PRIVATE_DATA_ROOT"
+        ) from exc
+    except OSError as exc:
+        # A symlink loop or other resolution failure is never a usable
+        # input and never points at valid private content.
+        raise PrivateRootError(REASON_INPUT_ESCAPE, f"private input {relative!r} could not be resolved") from exc
+
+    if not is_within(candidate, resolved_root) or is_within(candidate, repo_root()):
+        raise PrivateRootError(
+            REASON_INPUT_ESCAPE, f"private input {relative!r} resolves outside BEL_PRIVATE_DATA_ROOT"
+        )
+    if not candidate.is_file():
+        raise PrivateRootError(
+            REASON_INPUT_MISSING, f"private input {relative!r} is not a regular file"
+        )
+
+    # Read through a descriptor chain relative to the fully-resolved
+    # parent (which contains no symlink at resolve time), O_NOFOLLOW on
+    # both the directory and the final component.
+    try:
+        parent_fd = os.open(
+            candidate.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise PrivateRootError(
+            REASON_INPUT_ESCAPE, f"private input {relative!r} could not be opened safely"
+        ) from exc
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(candidate.name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+                raise PrivateRootError(
+                    REASON_INPUT_ESCAPE, f"private input {relative!r} is a symlink/not a file"
+                ) from exc
+            raise
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read()
+    finally:
+        os.close(parent_fd)
 
 
 def _jsonable(value: Any) -> Any:

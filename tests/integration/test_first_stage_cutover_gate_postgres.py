@@ -163,3 +163,79 @@ def test_first_stage_cutover_gate_postgres(postgres_url: str, tmp_path: Path):
     assert proc.stdout.strip() == "FIRST_STAGE_CUTOVER_GATE: PASS"
     assert "Traceback" not in proc.stdout
     assert "Traceback" not in proc.stderr
+
+
+def _run_cli(postgres_url: str, private_root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "bel.cli", *args],
+        cwd=REPO_ROOT,
+        env={**os.environ, "BEL_DATABASE_URL": postgres_url, "BEL_PRIVATE_DATA_ROOT": str(private_root)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+@pytest.mark.postgres
+def test_schema_drift_cli_dispatch(postgres_url: str, tmp_path: Path):
+    """G0 repair, Blocker 1/3: against a schema-DRIFTED real PostgreSQL
+    database (fresh schema, never migrated), the two-level Click schema
+    gate fires for ordinary commands and for cutover backfill, while
+    `cutover gate` BYPASSES both and reports the drift itself as
+    FIRST_STAGE_CUTOVER_GATE: FAIL with a private report carrying the
+    schema failure reason."""
+    _reset_schema(postgres_url)  # deliberately NOT migrated -> not at head
+    root, period_dir = _make_period_root(tmp_path)
+    _write_baseline(period_dir, [{"entries": []}])
+
+    # Ordinary command: the ROOT schema gate still rejects drift. (Click's
+    # "Error: ..." is written to stderr.)
+    ordinary = _run_cli(postgres_url, root, "period-close", "preview", "2026-01")
+    assert ordinary.returncode == 1
+    assert "Error:" in ordinary.stdout + ordinary.stderr
+    assert "Alembic head" in ordinary.stdout + ordinary.stderr
+
+    # cutover backfill: the CUTOVER-group schema gate still rejects drift.
+    backfill = _run_cli(postgres_url, root, "cutover", "backfill", "--period", "2026-01")
+    assert backfill.returncode == 1
+    assert "Error:" in backfill.stdout + backfill.stderr
+    assert "Alembic head" in backfill.stdout + backfill.stderr
+
+    # cutover gate: bypasses the generic schema gates, reaches the Gate's
+    # own runtime_schema dimension, FAILs, and writes the private report.
+    gate = _run_cli(postgres_url, root, "cutover", "gate", "--period", "2026-01")
+    assert gate.returncode == 1
+    assert gate.stdout.strip() == "FIRST_STAGE_CUTOVER_GATE: FAIL"
+    assert "Traceback" not in gate.stdout
+    assert "Traceback" not in gate.stderr
+    # No root/CUTOVER-group interception: the generic "Error: ... Alembic
+    # head" startup rejection never appears anywhere.
+    assert "Error:" not in gate.stdout + gate.stderr
+    assert "Alembic head" not in gate.stdout + gate.stderr
+
+    report = root / "reports" / "first-stage-cutover-gate-2026-01.json"
+    assert report.exists()
+    body = json.loads(report.read_text(encoding="utf-8"))
+    assert body["dimensions"]["runtime_schema"] == "FAIL"
+    assert "SCHEMA_NOT_AT_HEAD" in body["reason_codes"]
+    assert body["runtime"]["schema_ok"] is False
+    assert body["runtime"]["drivername"] == "postgresql+psycopg"
+
+
+@pytest.mark.postgres
+def test_schema_drift_gate_report_never_leaks_database_credentials(postgres_url: str, tmp_path: Path):
+    """Blocker 3 requirement: no database URL / credential ever appears in
+    the Gate's stdout or public error — only the safe verdict line."""
+    _reset_schema(postgres_url)
+    root, period_dir = _make_period_root(tmp_path)
+    _write_baseline(period_dir, [{"entries": []}])
+
+    secret = "SUPERSECRETGATEPASSWORD"
+    url_with_password = postgres_url.replace("//postgres@", f"//postgres:{secret}@")
+    proc = _run_cli(url_with_password, root, "cutover", "gate", "--period", "2026-01")
+    assert proc.returncode == 1
+    assert proc.stdout.strip() == "FIRST_STAGE_CUTOVER_GATE: FAIL"
+    combined = proc.stdout + proc.stderr
+    assert secret not in combined
+    assert "postgresql" not in combined
+    assert "Traceback" not in combined

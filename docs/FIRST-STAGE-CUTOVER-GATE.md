@@ -35,7 +35,7 @@ mandatory dimension.
 
 | Dimension | Meaning | PASS requires |
 |---|---|---|
-| **A. `runtime_schema`** | Runtime / schema | Effective DB dialect is **PostgreSQL**; schema current revision **== Alembic head**. No startup migration, no auto-upgrade. **SQLite → FAIL. Schema mismatch → FAIL.** |
+| **A. `runtime_schema`** | Runtime / schema | Effective runtime is the canonical **`postgresql+psycopg://`** (PostgreSQL, psycopg3); schema current revision **== Alembic head**. No startup migration, no auto-upgrade. **SQLite → FAIL. Non-canonical PostgreSQL driver (`postgresql://`, `+psycopg2`, `+asyncpg`) → FAIL. Schema mismatch → FAIL.** |
 | **B. `cutover_inputs`** | Backfill / baseline readiness | `<period>/backfill-plan.json` **and** `<period>/expected/cutover-baseline.json` are both present. The Cutover Baseline is business-confirmed acceptance material — **never** synthesized, **never** inferred from current BEL data, **never** inferred from raw Excel. Missing → FAIL (`BACKFILL_PLAN_MISSING` / `BASELINE_MISSING`). No silent substitution of another period. |
 | **C. `reconciliation`** | Private reconciliation | The canonical `bel.application.cutover_reconciliation.reconcile` against current target PostgreSQL state **and** the business-confirmed `cutover-baseline.json` passes: `reconciliation.passed == True` **and** `unresolved_count == 0`. Any `UNRESOLVED` → FAIL. `MATCH` and `BEL_CORRECTED_LEGACY` are both legitimate final outcomes. Raw legacy Excel equality is **not** required. |
 | **D. `work_surfaces`** | Required first-stage surfaces | All five Application projections execute successfully on the same target DB: Contract Business Ledger, Contract 360 (existing canonical path), Period Close Workbench (selected period), Invoice Preparation Workbench, Exception & Task Center (selected period). Canonical traceability retained; no business-state write. A nonzero row is **not** required — empty is truthful. |
@@ -43,22 +43,28 @@ mandatory dimension.
 | **F. `privacy_boundary`** | Privacy | `BEL_PRIVATE_DATA_ROOT` set and resolving to a real directory **outside the repository**; period is strict `YYYY-MM`; the period directory resolves **inside** the private root with no symlink/path escape. |
 | **G. `read_only`** | Read-only judgment | Zero business-state writes: a full-schema fingerprint taken before and after Gate execution is unchanged (no new Fact, TaskException, status/MatchCase transition, allocation, accrual, correction, relationship, or blocker snapshot). The only file writes are the private diagnostic reports under `$BEL_PRIVATE_DATA_ROOT/reports/`. |
 
-## 2. PostgreSQL only
+## 2. PostgreSQL only — canonical `postgresql+psycopg://` runtime
 
-The real first-stage Gate **must** run against the PostgreSQL runtime
-database — the canonical `BEL_DATABASE_URL`. SQLite is rejected for the
-real Gate (SQLite remains a test-only convenience for the historical
-`tests/private_acceptance/runner.py`, which is left untouched and is **not**
-the final SoR cutover gate).
+The real first-stage Gate **must** run against the canonical BEL runtime
+URL: `postgresql+psycopg://` (PostgreSQL with the psycopg3 driver) under
+`BEL_DATABASE_URL`. SQLite is rejected for the real Gate (SQLite remains a
+test-only convenience for the historical `tests/private_acceptance/runner.py`,
+which is left untouched and is **not** the final SoR cutover gate).
 
-The Gate verifies itself:
+The Gate verifies its runtime from engine metadata (never the URL's
+credentials — no rewrite, no driver fallback):
 
-- effective DB dialect == PostgreSQL
+- effective drivername == `postgresql+psycopg` AND
+  `dialect.name == "postgresql"` AND `dialect.driver == "psycopg"`
 - schema current revision == Alembic head
 
+The bare `postgresql://` form (defaults to psycopg2),
+`postgresql+psycopg2://`, `postgresql+asyncpg://`, and SQLite are all
+rejected (`NON_CANONICAL_DATABASE_DRIVER` / `NON_POSTGRESQL_DIALECT`).
+
 No startup migration and no auto-upgrade: **schema mismatch → FAIL** and
-**SQLite → FAIL**, each reported as a `runtime_schema` failure with a
-private diagnostic — never silently fixed.
+**every non-canonical runtime → FAIL**, each reported as a `runtime_schema`
+failure with a private diagnostic — never silently fixed.
 
 ## 3. Application seam / CLI
 
@@ -87,11 +93,24 @@ discrepancies, or paths to sensitive files is ever printed. Full
 diagnostics — which may contain private-derived values — are written only
 under `$BEL_PRIVATE_DATA_ROOT/reports/`.
 
-The `gate` subcommand is the one command that bypasses the global CLI
-startup schema gate: it is strictly read-only, and its whole purpose is to
-REPORT a schema mismatch as a FAIL dimension (with the private diagnostic)
-rather than being blocked before it can judge. It performs its **own**
-dialect + schema-at-head verification and can never PASS a mismatched
+`cutover gate` is the one command that bypasses the generic CLI startup
+schema rejection. The bypass is **two-level Click-aware**, not a global
+disable:
+
+- the ROOT `cli` group enforces the startup schema gate for every
+  top-level command **except** the `cutover` group (at the root,
+  `ctx.invoked_subcommand` is the first-level command name — `"cutover"`
+  — never the nested `"gate"`); and
+- the `cutover` group enforces the startup schema gate for every cutover
+  subcommand **except** `gate` (there, `ctx.invoked_subcommand` is the
+  nested command name).
+
+So an ordinary command and `cutover backfill`/`cutover reconcile` keep the
+hard startup schema rejection, while `cutover gate` is never intercepted:
+it is strictly read-only, and its whole purpose is to REPORT a schema
+mismatch as a FAIL dimension (with the private diagnostic) rather than
+being blocked before it can judge. It performs its **own** canonical
+runtime + schema-at-head verification and can never PASS a mismatched
 schema.
 
 ## 4. Private root / period boundary
@@ -106,6 +125,16 @@ discipline `tests/private_acceptance/runner.py` enforces):
   string. `..`, an absolute path, and a same-looking symlinked period
   directory resolving outside the root are all rejected (regex first, then
   re-checked **after** symlink resolution).
+- Required private **input** files are subject to the SAME containment
+  discipline as the period directory itself: `read_private_file` (shared
+  helper module `bel.infrastructure.private_paths`) fully resolves every
+  path component and requires the result to stay inside the resolved
+  root, outside the repository, and to be a regular file, then reads
+  through an `O_NOFOLLOW` descriptor chain against the resolved parent —
+  so a symlinked `expected/` directory, a symlinked plan/baseline file,
+  or any nested path escaping the root is rejected (`PRIVATE_INPUT_ESCAPE`)
+  BEFORE its content could be parsed. A missing file is a plain
+  missing-input FAIL, never confused with an escape.
 - Reports are written only under `$BEL_PRIVATE_DATA_ROOT/reports/` through
   a checked `O_DIRECTORY` + `O_NOFOLLOW` descriptor and a `O_NOFOLLOW`
   final component, so a reports-directory or report-file symlink swap can
@@ -124,8 +153,11 @@ The **Cutover Baseline** is business-confirmed acceptance material. It is
 NOT a Fact input, NOT an Evidence source, and NOT something BEL may
 generate from its own output. If the baseline is missing → FAIL
 (`BASELINE_MISSING`); if the backfill plan is missing → FAIL
-(`BACKFILL_PLAN_MISSING`). Neither is synthesized or inferred. The Gate
-never silently substitutes another period.
+(`BACKFILL_PLAN_MISSING`); if either file (or any component on its path)
+resolves outside the private root or inside the repository → FAIL
+(`PRIVATE_INPUT_ESCAPE`). Neither is synthesized or inferred, and the
+external content of an escaping file is never parsed. The Gate never
+silently substitutes another period.
 
 ## 6. The Gate does not run backfill
 
