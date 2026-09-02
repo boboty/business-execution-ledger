@@ -404,3 +404,14 @@ def test_no_advisory_or_missing_contract_gross_amount_codes():
     codes = {r["code"] for r in records}
     assert "MISSING_CONTRACT_GROSS_AMOUNT" not in codes
     assert not (codes & {"SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED", "SALES_INVOICE_AMOUNT_DEVIATION"})
+
+
+def test_xlsx_package_metadata_fully_pinned():
+    """G0 repair #2 (Blocker B): the produced XLSX ZIP must carry NO
+    wall-clock metadata — every entry date_time and both core.xml
+    timestamps are fixed (structural guarantee behind the wall-clock byte
+    test above)."""
+    from tests.xlsx_assertions import assert_xlsx_package_metadata_fixed
+
+    product = _mixed_product()
+    assert_xlsx_package_metadata_fixed(export_exception_task_xlsx(product))

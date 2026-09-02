@@ -324,3 +324,19 @@ def test_empty_database_produces_empty_but_valid_product(db_session):
     assert wb.sheetnames == EXPECTED_SHEETS
     for sheet_name in EXPECTED_SHEETS[1:]:
         assert wb[sheet_name].max_row == 1  # header only
+
+
+def test_xlsx_byte_identical_across_wall_clock_boundary_and_metadata_pinned(
+    db_session, phase2b_ledger_path, phase2b_invoices_path, phase2b_close_facts_path
+):
+    """G0 repair #2 (Blocker B): Period Close XLSX must be byte-identical
+    across a REAL wall-clock/ZIP-timestamp boundary, not just back-to-back,
+    and its package metadata (ZIP date_time + core.xml created/modified)
+    must be fully pinned — previously this exporter did a raw openpyxl save
+    carrying wall-clock metadata."""
+    from tests.xlsx_assertions import assert_xlsx_exporter_deterministic
+
+    _seed_full_fixture(db_session, phase2b_ledger_path, phase2b_invoices_path, phase2b_close_facts_path)
+    workbench = get_period_close_workbench(db_session, CLOSE_PERIOD)
+    product = build_period_close_data_product(workbench)
+    assert_xlsx_exporter_deterministic(export_period_close_xlsx, product)

@@ -37,6 +37,7 @@ from bel.application.period_close_workbench import (
     WorkbenchDifference,
     WorkbenchReversal,
 )
+from bel.infrastructure.deterministic_xlsx import deterministic_xlsx_bytes, set_fixed_workbook_properties
 
 RECORD_TYPE_ACCRUAL_REQUIRED = "ACCRUAL_REQUIRED"
 RECORD_TYPE_PRIOR_ACCRUAL_REVERSAL = "PRIOR_ACCRUAL_REVERSAL"
@@ -443,8 +444,13 @@ def _write_rows_sheet(ws, headers: list[str], rows: tuple[PeriodCloseExportRow, 
 def export_period_close_xlsx(product: PeriodCloseDataProduct) -> bytes:
     """Exactly six logical sheets, frozen order (docs/PHASE2D2-DECISIONS.md
     section 4). Every sheet reads only ``PeriodCloseExportRow`` fields —
-    no independent business computation, no raw repository access."""
+    no independent business computation, no raw repository access.
+
+    Byte-stable across identical state and wall-clock time: package
+    metadata (ZIP entry timestamps, docProps/core.xml created/modified)
+    is pinned through the canonical deterministic-XLSX normalizer."""
     wb = Workbook()
+    set_fixed_workbook_properties(wb)
     _write_summary_sheet(wb.active, product)
     wb.active.title = "01_Summary"
     _write_rows_sheet(wb.create_sheet("02_Accrual_Required"), _ACCRUAL_REQUIRED_COLUMNS, product.accrual_required)
@@ -461,4 +467,4 @@ def export_period_close_xlsx(product: PeriodCloseDataProduct) -> bytes:
 
     buffer = io.BytesIO()
     wb.save(buffer)
-    return buffer.getvalue()
+    return deterministic_xlsx_bytes(buffer.getvalue())

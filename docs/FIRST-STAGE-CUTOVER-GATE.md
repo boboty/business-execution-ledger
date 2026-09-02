@@ -123,18 +123,24 @@ discipline `tests/private_acceptance/runner.py` enforces):
 - The root must resolve to a real directory **outside the repository**.
 - The period is a strict `YYYY-MM` identifier — never an arbitrary path
   string. `..`, an absolute path, and a same-looking symlinked period
-  directory resolving outside the root are all rejected (regex first, then
-  re-checked **after** symlink resolution).
-- Required private **input** files are subject to the SAME containment
-  discipline as the period directory itself: `read_private_file` (shared
-  helper module `bel.infrastructure.private_paths`) fully resolves every
-  path component and requires the result to stay inside the resolved
-  root, outside the repository, and to be a regular file, then reads
-  through an `O_NOFOLLOW` descriptor chain against the resolved parent —
-  so a symlinked `expected/` directory, a symlinked plan/baseline file,
-  or any nested path escaping the root is rejected (`PRIVATE_INPUT_ESCAPE`)
-  BEFORE its content could be parsed. A missing file is a plain
-  missing-input FAIL, never confused with an escape.
+  directory resolving outside the root are all rejected.
+- Required private **input** files are read through a
+  **descriptor-anchored** walk (`PrivatePeriodReader` in the shared helper
+  module `bel.infrastructure.private_paths`), NOT by pathname reopen:
+  once the private root is accepted it is opened ONCE as a directory
+  descriptor and the period directory is opened relative to it; every
+  input component is opened only relative to an already-open descriptor
+  via `dir_fd` with `O_NOFOLLOW`. NO symlink is allowed in ANY component
+  (the period directory, an `expected/` directory, or a control file) —
+  even one resolving back inside the root — and NO path is reopened by
+  name after validation. A `resolve`-then-reopen TOCTOU (an intermediate
+  directory renamed/replaced with a symlink or redirected tree) cannot
+  redirect the read: the descriptor chain is the authority. Each final
+  file must be a **regular file** (`fstat` `S_ISREG`; a FIFO/socket/device
+  is rejected by type, never blocked on) under a defensive size ceiling.
+  Failures map to `PRIVATE_INPUT_ESCAPE` (symlink / escape),
+  `PRIVATE_INPUT_MISSING`, `PRIVATE_INPUT_UNSAFE_TYPE`, and
+  `PRIVATE_INPUT_TOO_LARGE`.
 - Reports are written only under `$BEL_PRIVATE_DATA_ROOT/reports/` through
   a checked `O_DIRECTORY` + `O_NOFOLLOW` descriptor and a `O_NOFOLLOW`
   final component, so a reports-directory or report-file symlink swap can
@@ -153,10 +159,13 @@ The **Cutover Baseline** is business-confirmed acceptance material. It is
 NOT a Fact input, NOT an Evidence source, and NOT something BEL may
 generate from its own output. If the baseline is missing → FAIL
 (`BASELINE_MISSING`); if the backfill plan is missing → FAIL
-(`BACKFILL_PLAN_MISSING`); if either file (or any component on its path)
-resolves outside the private root or inside the repository → FAIL
-(`PRIVATE_INPUT_ESCAPE`). Neither is synthesized or inferred, and the
-external content of an escaping file is never parsed. The Gate never
+(`BACKFILL_PLAN_MISSING`); if either file is a symlink, or any component
+on its path is a symlink or resolves outside the private root / inside
+the repository → FAIL (`PRIVATE_INPUT_ESCAPE`); a non-regular input type
+or an oversized file is likewise FAIL (`PRIVATE_INPUT_UNSAFE_TYPE` /
+`PRIVATE_INPUT_TOO_LARGE`). Neither input is synthesized or inferred, and
+the external content of an escaping file is never parsed (the baseline
+JSON is decoded only from the descriptor-anchored bytes). The Gate never
 silently substitutes another period.
 
 ## 6. The Gate does not run backfill
@@ -228,10 +237,15 @@ Products can be generated, CSV **and** XLSX:
 
 Existing canonical builders/serializers are used — no new export
 implementation. For each format, the product is generated **twice from the
-same state/filter** and the result must be **byte-identical**. Artifacts
-are never saved into the repository (temporary memory, or the private
-reports location when persistence is needed); the Gate result does not
-archive every exported byte.
+same state/filter** and the result must be **byte-identical**. For XLSX,
+byte identity includes the **package metadata**, not just cell values: all
+four first-stage XLSX serializers share one canonical deterministic-XLSX
+normalizer (`bel.infrastructure.deterministic_xlsx`) that pins every ZIP
+entry `date_time` and both `docProps/core.xml` created/modified fields —
+two exports of identical state are byte-identical across any wall-clock /
+ZIP-timestamp boundary. Artifacts are never saved into the repository
+(temporary memory, or the private reports location when persistence is
+needed); the Gate result does not archive every exported byte.
 
 ## 11. Read-only Gate
 

@@ -41,8 +41,6 @@ from __future__ import annotations
 import csv
 import io
 import json
-import re
-import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -53,6 +51,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 
 from bel.application.invoice_preparation_workbench import InvoicePreparationWorkbench
+from bel.infrastructure.deterministic_xlsx import deterministic_xlsx_bytes, set_fixed_workbook_properties
 from bel.domain.invoice import InvoiceDirection
 from bel.domain.payment import PaymentDirection
 
@@ -70,11 +69,6 @@ ATTENTION_CATEGORY_INCOMPLETE_ASSOCIATION = "INCOMPLETE_ASSOCIATION"
 ATTENTION_CATEGORY_MANAGEMENT_ADVISORY = "MANAGEMENT_ADVISORY"
 
 _DANGEROUS_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
-
-# Fixed XLSX created/modified timestamp so repeated exports of identical
-# state are byte-identical regardless of wall-clock time (openpyxl would
-# otherwise stamp the current time into docProps/core.xml).
-_FIXED_XLSX_DATETIME = datetime(1980, 1, 1, 0, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -865,52 +859,17 @@ def _write_summary_sheet(ws, product: InvoicePreparationDataProduct) -> None:
         ws.append([_xlsx_cell(key), _xlsx_cell(value)])
 
 
-# openpyxl's save_workbook ALWAYS overwrites properties.modified with the
-# current time (writer/excel.py), so the docProps/core.xml dcterms:modified
-# must be pinned here — the fixed created property survives, modified does
-# not. Both are pinned to the same fixed timestamp.
-_MODIFIED_TIMESTAMP_RE = re.compile(r"(<dcterms:modified[^>]*>)[^<]*(</dcterms:modified>)")
-_FIXED_XLSX_TIMESTAMP_ISO = "1980-01-01T00:00:00Z"
-
-
-def _deterministic_xlsx_bytes(content: bytes) -> bytes:
-    """openpyxl stamps every zip entry with the CURRENT time and pins
-    docProps/core.xml dcterms:modified to the current time at save, so two
-    identical exports would differ in raw bytes across a second boundary.
-    Rewrite the XLSX zip with fixed entry timestamps AND a fixed core.xml
-    modified timestamp so byte identity is reproducible (Phase 2D.3-F2b
-    reproducibility requirement). The workbook content is otherwise
-    untouched."""
-    out = io.BytesIO()
-    with zipfile.ZipFile(io.BytesIO(content), "r") as src, zipfile.ZipFile(
-        out, "w", compression=zipfile.ZIP_DEFLATED
-    ) as dst:
-        for info in src.infolist():
-            data = src.read(info.filename)
-            if info.filename == "docProps/core.xml":
-                text = data.decode("utf-8")
-                text = _MODIFIED_TIMESTAMP_RE.sub(
-                    lambda m: m.group(1) + _FIXED_XLSX_TIMESTAMP_ISO + m.group(2), text
-                )
-                data = text.encode("utf-8")
-            info.date_time = (1980, 1, 1, 0, 0, 0)
-            dst.writestr(info, data)
-    return out.getvalue()
-
-
 def export_invoice_preparation_xlsx(product: InvoicePreparationDataProduct) -> bytes:
     """Exactly five sheets, frozen order. Every sheet reads only
     ``InvoicePreparationExportRow`` fields — no independent business
     computation, no raw repository access. Decimal amounts are numeric
-    cells; missing Facts are blank. Byte-stable across identical inputs."""
+    cells; missing Facts are blank.
+
+    Byte-stable across identical state and wall-clock time: package
+    metadata (ZIP entry timestamps, docProps/core.xml created/modified)
+    is pinned through the canonical deterministic-XLSX normalizer."""
     wb = Workbook()
-    # Deterministic workbook properties: openpyxl otherwise stamps the
-    # CURRENT time into docProps/core.xml (created/modified), which would
-    # break byte identity across a real time boundary. Fixed values here
-    # (plus the deterministic zip-entry normalization below) make repeated
-    # exports of identical state byte-identical.
-    wb.properties.created = _FIXED_XLSX_DATETIME
-    wb.properties.modified = _FIXED_XLSX_DATETIME
+    set_fixed_workbook_properties(wb)
     _write_summary_sheet(wb.active, product)
     wb.active.title = "01_Summary"
     _write_rows_sheet(wb.create_sheet("02_Sales_Preparation"), _SALES_PREPARATION_COLUMNS, product.sales_preparation)
@@ -920,4 +879,4 @@ def export_invoice_preparation_xlsx(product: InvoicePreparationDataProduct) -> b
 
     buffer = io.BytesIO()
     wb.save(buffer)
-    return _deterministic_xlsx_bytes(buffer.getvalue())
+    return deterministic_xlsx_bytes(buffer.getvalue())

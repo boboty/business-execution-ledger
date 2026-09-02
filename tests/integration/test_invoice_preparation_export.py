@@ -1015,3 +1015,13 @@ def test_p02_confirmed_comparison_survives_incomplete_associations_in_product():
     # The dangling association is attention, never a confirmed Fact.
     incomplete = _attention_for(product, category=ATTENTION_CATEGORY_INCOMPLETE_ASSOCIATION)
     assert any("采购发票关联" in r.attention_message for r in incomplete)
+
+
+def test_xlsx_package_metadata_fully_pinned(export_product):
+    """G0 repair #2 (Blocker B): the produced Invoice Preparation XLSX ZIP
+    carries NO wall-clock metadata — every entry date_time and both core.xml
+    timestamps are fixed (structural guarantee behind the wall-clock byte
+    test above)."""
+    from tests.xlsx_assertions import assert_xlsx_package_metadata_fixed
+
+    assert_xlsx_package_metadata_fixed(export_invoice_preparation_xlsx(export_product))

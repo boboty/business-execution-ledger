@@ -762,6 +762,112 @@ def test_rejected_external_baseline_is_never_parsed_or_reconciled(db_session, ga
     assert result.reconciliation == FAIL  # unevaluated is never PASS
 
 
+def test_gate_toctou_period_replacement_cannot_pass_from_external_material(
+    db_session, gate_root, tmp_path, monkeypatch
+):
+    """G0 repair #2 (Blocker A, A7): deterministically reproduce the TOCTOU
+    — the period directory is renamed/replaced with a symlink to an OUTSIDE
+    tree (whose baseline WOULD reconcile PASS) AFTER the descriptor-anchored
+    reader has already opened it. The Gate must still read the ORIGINAL
+    anchored baseline (which deliberately does NOT match -> FAIL), so the
+    escaped bytes are never read, the escaped baseline is never parsed, and
+    the Gate cannot PASS from external material."""
+    import bel.infrastructure.private_paths as pp
+
+    contract = _make_contract(db_session)
+    # Real baseline deliberately NON-matching: if the Gate reads it,
+    # reconciliation FAILs.
+    real_entries = _contract_entries(contract)
+    real_entries[0]["expected"]["gross_amount"] = "999999.00"
+    _write_baseline(gate_root / "2026-01", real_entries)
+    db_session.commit()
+
+    # The outside replacement carries a MATCHING baseline — reading it would
+    # make reconciliation (and the whole Gate) PASS.
+    outside = tmp_path / "outside"
+    (outside / "expected").mkdir(parents=True)
+    _write_baseline(outside, _contract_entries(contract))
+
+    swapped = {"n": 0}
+
+    def _swap():
+        swapped["n"] += 1
+        if swapped["n"] > 1:
+            return  # only the first read exercises the replacement
+        os.rename(gate_root / "2026-01", gate_root / "2026-01.original")
+        os.symlink(outside, gate_root / "2026-01")
+
+    monkeypatch.setattr(pp, "_input_read_test_hook", _swap)
+    try:
+        result = _run(db_session, gate_root)
+    finally:
+        monkeypatch.setattr(pp, "_input_read_test_hook", None)
+
+    assert swapped["n"] == 2  # both reads (plan + baseline) passed the seam
+    assert not result.passed
+    assert result.reconciliation == FAIL
+    # Reconciliation ran against the ORIGINAL (anchored, non-matching)
+    # baseline — the escaped matching baseline was never parsed.
+    assert result.diagnostics["reconciliation"]["unresolved_count"] >= 1
+    assert result.diagnostics["reconciliation"]["passed"] is False
+
+
+def test_gate_toctou_expected_dir_replacement_is_rejected(db_session, gate_root, tmp_path, monkeypatch):
+    """G0 repair #2 (Blocker A, A7): replace the ``expected/`` directory
+    with a symlink to an OUTSIDE matching baseline after the period dir is
+    anchored but before the baseline read — the descriptor walk must open
+    ``expected`` with O_NOFOLLOW and REJECT it (PRIVATE_INPUT_ESCAPE),
+    never parse the outside material."""
+    import bel.infrastructure.private_paths as pp
+
+    contract = _make_contract(db_session)
+    _write_baseline(gate_root / "2026-01", _contract_entries(contract))
+    db_session.commit()
+
+    outside = tmp_path / "outside"
+    (outside / "expected").mkdir(parents=True)
+    _write_baseline(outside, _contract_entries(contract))
+
+    calls = {"n": 0}
+
+    def _swap_expected():
+        calls["n"] += 1
+        if calls["n"] != 2:
+            return  # fire on the baseline read (after the plan read)
+        shutil.rmtree(gate_root / "2026-01" / "expected")
+        os.symlink(outside / "expected", gate_root / "2026-01" / "expected")
+
+    monkeypatch.setattr(pp, "_input_read_test_hook", _swap_expected)
+    try:
+        result = _run(db_session, gate_root)
+    finally:
+        monkeypatch.setattr(pp, "_input_read_test_hook", None)
+
+    assert calls["n"] == 2
+    assert not result.passed
+    assert result.cutover_inputs == FAIL
+    assert REASON_PRIVATE_INPUT_ESCAPE in result.reason_codes
+    assert result.diagnostics["cutover_inputs"]["cutover_baseline"] == "escape"
+    # The outside matching baseline was never parsed/reconciled.
+    assert "reconciliation" not in result.diagnostics
+    assert result.reconciliation == FAIL
+
+
+def test_gate_export_verification_20_runs_no_nondeterminism(db_session, gate_root):
+    """G0 repair #2 (Blocker B, B6): the Gate's own export verification
+    (each Data Product generated twice, byte-identical) must hold across 20
+    repeated runs with no EXPORT_NONDETERMINISM."""
+    from bel.application.first_stage_cutover_gate import _verify_exports
+
+    contract = _make_contract(db_session)
+    _write_baseline(gate_root / "2026-01", _contract_entries(contract))
+    db_session.commit()
+    for _ in range(20):
+        ok, any_error, _results = _verify_exports(db_session, "2026-01")
+        assert ok is True
+        assert any_error is False
+
+
 def test_input_escape_keeps_report_inside_private_root(db_session, gate_root, tmp_path):
     """Task tests 8+9: the private report is still written ONLY under
     BEL_PRIVATE_DATA_ROOT (never outside) even when an input escapes, and

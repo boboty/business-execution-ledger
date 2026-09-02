@@ -98,9 +98,10 @@ from bel.infrastructure.persistence.schema_gate import SchemaNotAtHeadError, ass
 from bel.infrastructure.private_paths import (
     REASON_INPUT_ESCAPE,
     REASON_INPUT_MISSING,
+    REASON_INPUT_TOO_LARGE,
+    REASON_INPUT_UNSAFE_TYPE,
+    PrivatePeriodReader,
     PrivateRootError,
-    read_private_file,
-    resolve_period_dir,
     resolve_private_root,
     write_private_report,
 )
@@ -136,7 +137,11 @@ REASON_NON_CANONICAL_DATABASE_DRIVER = "NON_CANONICAL_DATABASE_DRIVER"
 REASON_SCHEMA_NOT_AT_HEAD = "SCHEMA_NOT_AT_HEAD"
 REASON_BACKFILL_PLAN_MISSING = "BACKFILL_PLAN_MISSING"
 REASON_BASELINE_MISSING = "BASELINE_MISSING"
-REASON_PRIVATE_INPUT_ESCAPE = "PRIVATE_INPUT_ESCAPE"
+# Private-boundary input reason codes surfaced on the result (aliased to the
+# shared codes in bel.infrastructure.private_paths so they can never drift).
+REASON_PRIVATE_INPUT_ESCAPE = REASON_INPUT_ESCAPE
+REASON_PRIVATE_INPUT_UNSAFE_TYPE = REASON_INPUT_UNSAFE_TYPE
+REASON_PRIVATE_INPUT_TOO_LARGE = REASON_INPUT_TOO_LARGE
 REASON_BASELINE_PARSE = "BASELINE_PARSE_ERROR"
 REASON_RECONCILIATION_UNRESOLVED = "RECONCILIATION_UNRESOLVED"
 REASON_RECONCILIATION_ERROR = "RECONCILIATION_ERROR"
@@ -524,175 +529,205 @@ def _run_gate_impl(
     dims: dict[str, str] = {name: PASS for name in MANDATORY_DIMENSIONS}
     reasons: list[str] = []
     diagnostics: dict[str, Any] = {}
-
-    # ---- 1. Privacy boundary (private root + strict YYYY-MM period). ----
     root: Path | None = None
-    period_dir: Path | None = None
+
+    def _classify_input(exc: PrivateRootError) -> str:
+        """Map a PrivatePeriodReader failure onto a diagnostic label."""
+        if exc.reason_code == REASON_INPUT_MISSING:
+            return "missing"
+        if exc.reason_code == REASON_INPUT_ESCAPE:
+            return "escape"
+        if exc.reason_code == REASON_INPUT_UNSAFE_TYPE:
+            return "unsafe_type"
+        if exc.reason_code == REASON_INPUT_TOO_LARGE:
+            return "too_large"
+        return "escape"
+
+    def _input_reason(exc: PrivateRootError, missing_reason: str) -> str:
+        """A missing required file keeps its file-specific reason; any
+        other private-boundary rejection surfaces its own precise code
+        (PRIVATE_INPUT_ESCAPE / PRIVATE_INPUT_UNSAFE_TYPE /
+        PRIVATE_INPUT_TOO_LARGE)."""
+        return missing_reason if exc.reason_code == REASON_INPUT_MISSING else exc.reason_code
+
+    # The descriptor-anchored period reader is opened once (privacy phase)
+    # and closed in the finally below — whether or not the DB-dependent
+    # dimensions ever run — so no anchored fd ever outlives the Gate.
+    reader: PrivatePeriodReader | None = None
     try:
-        root = resolve_private_root(private_root)
-    except PrivateRootError as exc:
-        dims[DIM_PRIVACY_BOUNDARY] = FAIL
-        reasons.append(exc.reason_code)
-        diagnostics["privacy_error"] = str(exc)
-    if root is not None:
-        diagnostics["private_root"] = str(root)
+        # ---- 1. Privacy boundary (private root + strict YYYY-MM period). ----
         try:
-            period_dir = resolve_period_dir(root, period)
+            root = resolve_private_root(private_root)
         except PrivateRootError as exc:
             dims[DIM_PRIVACY_BOUNDARY] = FAIL
             reasons.append(exc.reason_code)
-            diagnostics["period_error"] = str(exc)
-
-    # ---- 2. Runtime / schema (canonical postgresql+psycopg, == head). ----
-    probe = runtime_check(session)
-    engine_bind = session.get_bind()
-    diagnostics["runtime"] = {
-        "dialect": getattr(engine_bind.dialect, "name", None),
-        "dialect_driver": getattr(getattr(engine_bind, "dialect", None), "driver", None),
-        "drivername": getattr(engine_bind.url, "drivername", None),
-        "dialect_ok": probe.dialect_ok,
-        "schema_ok": probe.schema_ok,
-        "dialect_reason_code": probe.dialect_reason_code,
-        "schema_reason_code": probe.schema_reason_code,
-        "dialect_reason": probe.dialect_reason,
-        "schema_reason": probe.schema_reason,
-    }
-    if not probe.dialect_ok:
-        dims[DIM_RUNTIME_SCHEMA] = FAIL
-        reasons.append(probe.dialect_reason_code or REASON_NON_POSTGRESQL)
-    elif not probe.schema_ok:
-        dims[DIM_RUNTIME_SCHEMA] = FAIL
-        reasons.append(probe.schema_reason_code or REASON_SCHEMA_NOT_AT_HEAD)
-
-    # ---- 3. DB-dependent dimensions. ----
-    db_ok = dims[DIM_RUNTIME_SCHEMA] == PASS and dims[DIM_PRIVACY_BOUNDARY] == PASS and period_dir is not None
-    if not db_ok:
-        # A mandatory failure (runtime/schema or privacy) prevented the
-        # DB-dependent readiness dimensions from being evaluated — an
-        # unevaluated mandatory dimension is never reported PASS (there is
-        # no "mostly ready"). ``read_only`` stays PASS: no DB operation ran,
-        # so the Gate made no business write. The blocking reason codes
-        # above already explain the FAIL.
-        for dim in (
-            DIM_CUTOVER_INPUTS,
-            DIM_RECONCILIATION,
-            DIM_WORK_SURFACES,
-            DIM_DATA_PRODUCTS,
-        ):
-            dims[dim] = FAIL
-    else:
-        fingerprint_before = _schema_fingerprint(session)
-
-        # 3a. Required cutover inputs — never synthesized, never inferred,
-        # and read ONLY through the hardened private-input boundary. A
-        # symlinked ``expected/`` directory, a symlinked plan/baseline
-        # file, or any nested path resolving outside the private root is
-        # rejected BEFORE its content could be parsed.
-        period_prefix = period_dir.relative_to(root).as_posix()
-        cutover_inputs_diag: dict[str, Any] = {}
-        baseline_bytes: bytes | None = None
-
-        try:
-            read_private_file(root, f"{period_prefix}/backfill-plan.json")
-        except PrivateRootError as exc:
-            cutover_inputs_diag["backfill_plan"] = "missing" if exc.reason_code == REASON_INPUT_MISSING else "escape"
-            dims[DIM_CUTOVER_INPUTS] = FAIL
-            reasons.append(
-                REASON_BACKFILL_PLAN_MISSING if exc.reason_code == REASON_INPUT_MISSING else REASON_PRIVATE_INPUT_ESCAPE
-            )
-        else:
-            cutover_inputs_diag["backfill_plan"] = "present"
-
-        try:
-            baseline_bytes = read_private_file(root, f"{period_prefix}/expected/cutover-baseline.json")
-        except PrivateRootError as exc:
-            cutover_inputs_diag["cutover_baseline"] = (
-                "missing" if exc.reason_code == REASON_INPUT_MISSING else "escape"
-            )
-            dims[DIM_CUTOVER_INPUTS] = FAIL
-            reasons.append(
-                REASON_BASELINE_MISSING if exc.reason_code == REASON_INPUT_MISSING else REASON_PRIVATE_INPUT_ESCAPE
-            )
-        else:
-            cutover_inputs_diag["cutover_baseline"] = "present"
-
-        diagnostics["cutover_inputs"] = cutover_inputs_diag
-
-        if dims[DIM_CUTOVER_INPUTS] == FAIL:
-            # A mandatory input is missing, so reconciliation cannot be
-            # evaluated — an unevaluated mandatory dimension is never a
-            # PASS. The missing-input reason code(s) above already explain
-            # why; no separate reason is added.
-            dims[DIM_RECONCILIATION] = FAIL
-
-        if dims[DIM_CUTOVER_INPUTS] == PASS:
-            # 3b. Private cutover reconciliation — the canonical
-            # implementation, never a second one. UNRESOLVED == 0 required.
-            # OPEN backfill-produced Tasks already surface as unconditional
-            # UNRESOLVED inside ``reconcile``, so no duplicate check exists.
-            # ``baseline_bytes`` came from the hardened input boundary, so
-            # parsing it immediately is safe.
-            assert baseline_bytes is not None  # inputs PASS means both read
+            diagnostics["privacy_error"] = str(exc)
+        if root is not None:
+            diagnostics["private_root"] = str(root)
             try:
-                baseline = json.loads(baseline_bytes.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                dims[DIM_RECONCILIATION] = FAIL
-                reasons.append(REASON_BASELINE_PARSE)
-                diagnostics["reconciliation_error"] = str(exc)
+                reader = PrivatePeriodReader.open(root, period)
+            except PrivateRootError as exc:
+                dims[DIM_PRIVACY_BOUNDARY] = FAIL
+                reasons.append(exc.reason_code)
+                diagnostics["period_error"] = str(exc)
+
+        # ---- 2. Runtime / schema (canonical postgresql+psycopg, == head). ----
+        probe = runtime_check(session)
+        engine_bind = session.get_bind()
+        diagnostics["runtime"] = {
+            "dialect": getattr(engine_bind.dialect, "name", None),
+            "dialect_driver": getattr(getattr(engine_bind, "dialect", None), "driver", None),
+            "drivername": getattr(engine_bind.url, "drivername", None),
+            "dialect_ok": probe.dialect_ok,
+            "schema_ok": probe.schema_ok,
+            "dialect_reason_code": probe.dialect_reason_code,
+            "schema_reason_code": probe.schema_reason_code,
+            "dialect_reason": probe.dialect_reason,
+            "schema_reason": probe.schema_reason,
+        }
+        if not probe.dialect_ok:
+            dims[DIM_RUNTIME_SCHEMA] = FAIL
+            reasons.append(probe.dialect_reason_code or REASON_NON_POSTGRESQL)
+        elif not probe.schema_ok:
+            dims[DIM_RUNTIME_SCHEMA] = FAIL
+            reasons.append(probe.schema_reason_code or REASON_SCHEMA_NOT_AT_HEAD)
+
+        # ---- 3. DB-dependent dimensions. ----
+        db_ok = (
+            dims[DIM_RUNTIME_SCHEMA] == PASS
+            and dims[DIM_PRIVACY_BOUNDARY] == PASS
+            and reader is not None
+        )
+        if not db_ok:
+            # A mandatory failure (runtime/schema or privacy) prevented the
+            # DB-dependent readiness dimensions from being evaluated — an
+            # unevaluated mandatory dimension is never reported PASS (there is
+            # no "mostly ready"). ``read_only`` stays PASS: no DB operation ran,
+            # so the Gate made no business write. The blocking reason codes
+            # above already explain the FAIL.
+            for dim in (
+                DIM_CUTOVER_INPUTS,
+                DIM_RECONCILIATION,
+                DIM_WORK_SURFACES,
+                DIM_DATA_PRODUCTS,
+            ):
+                dims[dim] = FAIL
+        else:
+            fingerprint_before = _schema_fingerprint(session)
+            assert reader is not None
+
+            # 3a. Required cutover inputs — never synthesized, never
+            # inferred, and read ONLY through the descriptor-anchored
+            # private-input boundary. A symlinked period/``expected`` dir, a
+            # symlinked plan/baseline file, a non-regular input type, an
+            # oversized input, or any path escape is rejected BEFORE its
+            # content could be parsed.
+            cutover_inputs_diag: dict[str, Any] = {}
+            baseline_bytes: bytes | None = None
+
+            try:
+                reader.read("backfill-plan.json")
+            except PrivateRootError as exc:
+                cutover_inputs_diag["backfill_plan"] = _classify_input(exc)
+                dims[DIM_CUTOVER_INPUTS] = FAIL
+                reasons.append(_input_reason(exc, REASON_BACKFILL_PLAN_MISSING))
             else:
+                cutover_inputs_diag["backfill_plan"] = "present"
+
+            try:
+                baseline_bytes = reader.read("expected/cutover-baseline.json")
+            except PrivateRootError as exc:
+                cutover_inputs_diag["cutover_baseline"] = _classify_input(exc)
+                dims[DIM_CUTOVER_INPUTS] = FAIL
+                reasons.append(_input_reason(exc, REASON_BASELINE_MISSING))
+            else:
+                cutover_inputs_diag["cutover_baseline"] = "present"
+
+            diagnostics["cutover_inputs"] = cutover_inputs_diag
+
+            if dims[DIM_CUTOVER_INPUTS] == FAIL:
+                # A mandatory input is missing/escaping, so reconciliation
+                # cannot be evaluated — an unevaluated mandatory dimension is
+                # never a PASS. The input reason code(s) above already explain
+                # why; no separate reason is added.
+                dims[DIM_RECONCILIATION] = FAIL
+
+            if dims[DIM_CUTOVER_INPUTS] == PASS:
+                # 3b. Private cutover reconciliation — the canonical
+                # implementation, never a second one. UNRESOLVED == 0 required.
+                # OPEN backfill-produced Tasks already surface as
+                # unconditional UNRESOLVED inside ``reconcile``, so no
+                # duplicate check exists. ``baseline_bytes`` came from the
+                # hardened input boundary, so parsing it immediately is safe.
+                assert baseline_bytes is not None  # inputs PASS means both read
                 try:
-                    reconciliation = reconcile(session, baseline)
-                except Exception as exc:  # noqa: BLE001
+                    baseline = json.loads(baseline_bytes.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     dims[DIM_RECONCILIATION] = FAIL
-                    reasons.append(REASON_RECONCILIATION_ERROR)
+                    reasons.append(REASON_BASELINE_PARSE)
                     diagnostics["reconciliation_error"] = str(exc)
                 else:
-                    diagnostics["reconciliation"] = {
-                        "unresolved_count": reconciliation.unresolved_count,
-                        "passed": reconciliation.passed,
-                        "entries": [
-                            {
-                                "key": e.key,
-                                "outcome": e.outcome,
-                                "baseline_outcome": e.baseline_outcome,
-                            }
-                            for e in reconciliation.entries
-                        ],
-                        "open_backfill_task_keys": [
-                            e.key for e in reconciliation.entries if e.key.startswith("unresolved:backfill_task")
-                        ],
-                    }
-                    if not (reconciliation.passed and reconciliation.unresolved_count == 0):
+                    try:
+                        reconciliation = reconcile(session, baseline)
+                    except Exception as exc:  # noqa: BLE001
                         dims[DIM_RECONCILIATION] = FAIL
-                        reasons.append(REASON_RECONCILIATION_UNRESOLVED)
+                        reasons.append(REASON_RECONCILIATION_ERROR)
+                        diagnostics["reconciliation_error"] = str(exc)
+                    else:
+                        diagnostics["reconciliation"] = {
+                            "unresolved_count": reconciliation.unresolved_count,
+                            "passed": reconciliation.passed,
+                            "entries": [
+                                {
+                                    "key": e.key,
+                                    "outcome": e.outcome,
+                                    "baseline_outcome": e.baseline_outcome,
+                                }
+                                for e in reconciliation.entries
+                            ],
+                            "open_backfill_task_keys": [
+                                e.key
+                                for e in reconciliation.entries
+                                if e.key.startswith("unresolved:backfill_task")
+                            ],
+                        }
+                        if not (reconciliation.passed and reconciliation.unresolved_count == 0):
+                            dims[DIM_RECONCILIATION] = FAIL
+                            reasons.append(REASON_RECONCILIATION_UNRESOLVED)
 
-        # 3c. Required work surfaces — same target DB, existing paths.
-        surfaces_ok, surfaces = _run_surfaces(session, period)
-        diagnostics["surfaces"] = surfaces
-        if not surfaces_ok:
-            dims[DIM_WORK_SURFACES] = FAIL
-            reasons.append(REASON_SURFACE_ERROR)
+            # 3c. Required work surfaces — same target DB, existing paths.
+            surfaces_ok, surfaces = _run_surfaces(session, period)
+            diagnostics["surfaces"] = surfaces
+            if not surfaces_ok:
+                dims[DIM_WORK_SURFACES] = FAIL
+                reasons.append(REASON_SURFACE_ERROR)
 
-        # 3d. Required Data Products — same target DB, byte-deterministic.
-        exports_ok, any_export_error, exports = _verify_exports(session, period)
-        diagnostics["exports"] = exports
-        if not exports_ok:
-            dims[DIM_DATA_PRODUCTS] = FAIL
-            reasons.append(REASON_EXPORT_ERROR if any_export_error else REASON_EXPORT_NONDETERMINISM)
+            # 3d. Required Data Products — same target DB, byte-deterministic.
+            exports_ok, any_export_error, exports = _verify_exports(session, period)
+            diagnostics["exports"] = exports
+            if not exports_ok:
+                dims[DIM_DATA_PRODUCTS] = FAIL
+                reasons.append(REASON_EXPORT_ERROR if any_export_error else REASON_EXPORT_NONDETERMINISM)
 
-        # 3e. Read-only — the Gate must not mutate the thing it judges.
-        fingerprint_after = _schema_fingerprint(session)
-        diagnostics["read_only"] = {
-            "fingerprint_before": fingerprint_before,
-            "fingerprint_after": fingerprint_after,
-            "unchanged": fingerprint_before == fingerprint_after,
-        }
-        if fingerprint_after != fingerprint_before:
-            dims[DIM_READ_ONLY] = FAIL
-            reasons.append(REASON_BUSINESS_STATE_MUTATED)
+            # 3e. Read-only — the Gate must not mutate the thing it judges.
+            fingerprint_after = _schema_fingerprint(session)
+            diagnostics["read_only"] = {
+                "fingerprint_before": fingerprint_before,
+                "fingerprint_after": fingerprint_after,
+                "unchanged": fingerprint_before == fingerprint_after,
+            }
+            if fingerprint_after != fingerprint_before:
+                dims[DIM_READ_ONLY] = FAIL
+                reasons.append(REASON_BUSINESS_STATE_MUTATED)
+    finally:
+        if reader is not None:
+            try:
+                reader.close()
+            except OSError:
+                pass
 
-    # Reason codes are reported once each (two escaping inputs share the
-    # same PRIVATE_INPUT_ESCAPE code rather than stacking duplicates).
+    # Reason codes are reported once each (e.g. two escaping inputs share
+    # one PRIVATE_INPUT_ESCAPE code rather than stacking duplicates).
     reason_codes = tuple(dict.fromkeys(reasons))
 
     result = FirstStageCutoverGateResult(

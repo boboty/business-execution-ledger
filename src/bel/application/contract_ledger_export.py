@@ -31,6 +31,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 
 from bel.application.contract_business_ledger import ContractBusinessLedger, ContractLedgerRow
+from bel.infrastructure.deterministic_xlsx import deterministic_xlsx_bytes, set_fixed_workbook_properties
 
 _DANGEROUS_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
@@ -222,8 +223,13 @@ def export_contract_business_ledger_xlsx(ledger: ContractBusinessLedger) -> byte
     same flattening as CSV). Detail sheets are optional lossless
     breakouts, each explicitly keyed by ``procurement_contract_id`` (and,
     for the sales-scope sheet, ``sales_contract_id``) — never an
-    apportioned amount (section 28)."""
+    apportioned amount (section 28).
+
+    Byte-stable across identical state and wall-clock time: package
+    metadata (ZIP entry timestamps, docProps/core.xml created/modified)
+    is pinned through the canonical deterministic-XLSX normalizer."""
     wb = Workbook()
+    set_fixed_workbook_properties(wb)
     _write_main_sheet(wb.active, ledger)
     wb.active.title = "Contract Business Ledger"
     _write_items_sheet(wb.create_sheet("Contract Items"), ledger)
@@ -232,7 +238,7 @@ def export_contract_business_ledger_xlsx(ledger: ContractBusinessLedger) -> byte
 
     buffer = io.BytesIO()
     wb.save(buffer)
-    return buffer.getvalue()
+    return deterministic_xlsx_bytes(buffer.getvalue())
 
 
 def _write_header(ws, headers: list[str]) -> None:

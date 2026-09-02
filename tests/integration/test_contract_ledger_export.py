@@ -313,3 +313,24 @@ def test_no_outbound_eligibility_invented(db_session):
     reader = csv.DictReader(io.StringIO(csv_bytes.decode("utf-8-sig")))
     row = next(reader)
     assert row["outbound_invoice_preparation_state"] == "NOT_EVALUATED_BY_RULE"
+
+
+def test_xlsx_byte_identical_across_wall_clock_boundary_and_metadata_pinned(db_session):
+    """G0 repair #2 (Blocker B): Contract Business Ledger XLSX must be
+    byte-identical across a REAL wall-clock/ZIP-timestamp boundary and its
+    package metadata (ZIP date_time + core.xml created/modified) must be
+    fully pinned — previously this exporter did a raw openpyxl save carrying
+    wall-clock metadata (the gate's EXPORT_NONDETERMINISM root cause)."""
+    from tests.xlsx_assertions import assert_xlsx_exporter_deterministic
+
+    frag = _make_fragment(db_session)
+    c1 = _make_contract(db_session, frag.id, contract_no="PO-DET-0001")
+    _make_contract(db_session, frag.id, contract_no="PO-DET-0002")
+    # a linked sales scope so the breakout sheets carry rows too
+    sc = _make_sales_contract(db_session, frag.id, sales_contract_no="SC-DET-0001", customer="Det Customer")
+    _link(db_session, c1, sc)
+    db_session.commit()
+
+    ledger = get_contract_business_ledger(db_session)
+    assert len(ledger.rows) == 2
+    assert_xlsx_exporter_deterministic(export_contract_business_ledger_xlsx, ledger)
