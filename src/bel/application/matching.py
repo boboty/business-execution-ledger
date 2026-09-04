@@ -89,6 +89,16 @@ class MatchRunSummary:
     subject_ids: list[uuid.UUID] = field(default_factory=list)
 
 
+def normalized_contract_counterparties(contracts: Sequence[Contract]) -> set[str]:
+    """The canonical eligibility counterparty set for the current
+    procurement scope: the normalized counterparties of every Contract.
+    M001 eligibility (``_is_eligible``) is membership in this set, and the
+    first-stage cutover Payment-scope filter reuses the SAME function, so
+    matching and cutover backfill can never drift on what a
+    "contract-related" bank counterparty is."""
+    return {n for c in contracts if (n := normalize_counterparty(c.counterparty)) is not None}
+
+
 def _is_eligible(subject_counterparty: str | None, contract_counterparties: set[str]) -> bool:
     """Eligibility (spec sections 9/14) is defined by counterparty
     identity ALONE — never by amount. An invoice/payment whose
@@ -138,9 +148,7 @@ def _run_match_pass(
     # Eligibility gate (spec sections 9/14): counterparty membership only,
     # checked before anything else. Subjects that fail this never become
     # a MatchCase — see _is_eligible's docstring.
-    contract_counterparties = {
-        n for c in contracts if (n := normalize_counterparty(c.counterparty)) is not None
-    }
+    contract_counterparties = normalized_contract_counterparties(contracts)
     eligible_subjects = [s for s in subjects if _is_eligible(get_counterparty(s), contract_counterparties)]
 
     summary = MatchRunSummary()

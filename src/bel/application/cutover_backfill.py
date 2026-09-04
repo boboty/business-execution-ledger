@@ -57,7 +57,10 @@ Evidence (gate-fix section 2, HARD).
 
 from __future__ import annotations
 
+import json
+import string
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -81,6 +84,7 @@ from bel.application.contract_item_facts import (
     ContractItemFactError,
     create_contract_item_fact,
 )
+from bel.application.matching import normalized_contract_counterparties
 from bel.application.procurement_sales_link import (
     ProcurementSalesLinkFactConflict,
     ProcurementSalesLinkFactError,
@@ -96,6 +100,7 @@ from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
 from bel.domain.exception import ExceptionStatus, ExceptionType, TaskException
 from bel.domain.invoice import Invoice, InvoiceDirection, InvoiceItem
+from bel.domain.normalize import normalize_counterparty
 from bel.domain.payment import Payment, PaymentDirection
 from bel.domain.procurement_sales_link import ConfirmationType as LinkConfirmationType
 from bel.infrastructure.persistence.repositories import (
@@ -112,8 +117,20 @@ from bel.infrastructure.persistence.repositories import (
 CONTRACT_LEDGER_SOURCE_TYPE = "contract_ledger_xlsx"
 INVOICE_LEDGER_SOURCE_TYPE = "invoice_ledger_xlsx"
 BANK_STATEMENT_SOURCE_TYPE = "cmb_bank_statement_pdf"
+SCOPE_DECISION_SOURCE_TYPE = "cutover_payment_scope_decision"
 DEFAULT_CONTRACT_TYPE = "出口报关购销合同"
 DEFAULT_CURRENCY = "CNY"
+
+# Payment-scope adjudication (cutover-only private input): a decision is
+# applied ONLY when it is an explicit OUT_OF_SCOPE that a human has
+# confirmed. A DRAFT pending business confirmation is never applied.
+SCOPE_DECISION_OUTCOME_OUT_OF_SCOPE = "OUT_OF_SCOPE"
+SCOPE_DECISION_CONFIRMATION_HUMAN = "HUMAN_CONFIRMED"
+SCOPE_DECISION_CONFIRMATION_DRAFT = "DRAFT_NEEDS_BUSINESS_CONFIRMATION"
+_SCOPE_DECISION_CONFIRMATIONS = (
+    SCOPE_DECISION_CONFIRMATION_HUMAN,
+    SCOPE_DECISION_CONFIRMATION_DRAFT,
+)
 
 
 def _as_date(value: Any) -> date:
@@ -201,8 +218,10 @@ def _row_fragments(
     return fragment_ids
 
 
-def _get_or_create_document(session: Session, file_path: Path, *, source_type: str, now: datetime) -> tuple[EvidenceDocument, bool]:
-    sha256 = compute_sha256(file_path)
+def _get_or_create_document(
+    session: Session, file_path: Path, *, source_type: str, now: datetime, sha256: str | None = None,
+) -> tuple[EvidenceDocument, bool]:
+    sha256 = sha256 or compute_sha256(file_path)
     evidence_repo = EvidenceRepository(session)
     existing = evidence_repo.find_document_by_sha256(sha256)
     if existing is not None:
@@ -488,9 +507,165 @@ def backfill_invoices(
 
 
 # ---------------------------------------------------------------------------
-# Payment backfill — identity (source_account_id, transaction_date,
-# direction, amount, bank_reference)
+# Payment backfill — direction-scoped eligibility, explicit adjudication,
+# then identity (source_account_id, transaction_date, direction, amount,
+# bank_reference)
 # ---------------------------------------------------------------------------
+
+
+def _first_stage_out_scope_parties(session: Session) -> set[str] | None:
+    """The normalized counterparty set of the CURRENT first-stage
+    PROCUREMENT (OUT) Payment scope: the canonical M001 eligibility basis
+    (``bel.application.matching.normalized_contract_counterparties`` — the
+    single membership rule, never a second competing rule). This drives a
+    deterministic first-stage OUT exclusion only. Sales-side IN receipts
+    are NEVER auto-excluded by membership in this set — absence from known
+    ``SalesContract.customer`` values is not evidence of OUT_OF_SCOPE (an
+    unknown payer, a payer/customer mismatch, or ``customer=NULL`` all stay
+    conservative). Returns ``None`` when no procurement Contract exists at
+    all: an empty scope cannot affirmatively establish a row as OUTSIDE, so
+    callers keep the conservative path."""
+    parties = normalized_contract_counterparties(ContractRepository(session).list_all())
+    return parties or None
+
+
+def _import_scope_decision_evidence(session: Session, path: Path, applied: list[dict[str, Any]], *, now: datetime) -> None:
+    """Record the APPLIED (HUMAN_CONFIRMED) scope adjudication as Evidence
+    under a distinct source_type (``cutover_payment_scope_decision``), so
+    the intake disposition is auditable without any schema change. One
+    EvidenceDocument per artifact file (dedup by sha256); one fragment per
+    applied decision, located by the SAME bank EvidenceFragment locator
+    (page, transaction_index) — a source-row pointer, never Payment
+    identity, never a generated bank_reference. A DRAFT artifact is never
+    imported here because it disposes nothing."""
+    if not applied:
+        return
+    document, is_reimport = _get_or_create_document(session, path, source_type=SCOPE_DECISION_SOURCE_TYPE, now=now)
+    if is_reimport:
+        return
+    evidence_repo = EvidenceRepository(session)
+    for entry in applied:
+        fragment = EvidenceFragment(
+            id=uuid.uuid4(), evidence_document_id=document.id, fragment_kind=FragmentKind.MANUAL_FACT,
+            sheet_name=None, row_number=None,
+            locator_json={"page": int(entry["page"]), "transaction_index": int(entry["transaction_index"])},
+            raw_data=dict(entry), created_at=now,
+        )
+        evidence_repo.add_fragment(fragment)
+    session.flush()
+
+
+def _read_payment_scope_decision_artifact(path: Path, *, expected_source_sha256: str) -> list[dict[str, Any]]:
+    """Load the cutover-only Payment-scope adjudication artifact
+    (``<period>/facts/payment-scope-decisions.json``) and bind it to the
+    EXACT immutable bank source document.
+
+    Binding & validation happen in full BEFORE anything is applied (no
+    partial artifact may affect database state):
+
+      1. schema: a version-1 JSON object with an ``entries`` list;
+      2. source binding: ``source_sha256`` must be present and EQUAL to the
+         SHA256 of the exact bank source file this artifact was confirmed
+         against — a mismatch or a missing value is a HARD FAIL, and the
+         artifact can never silently bind to a different source document;
+      3. locator schema: every entry's ``page`` / ``transaction_index``
+         must be an exact non-negative JSON/Python integer — numeric
+         strings, floats, booleans, null and negatives are rejected, never
+         coerced;
+      4. duplicate locators within one artifact are rejected (no
+         last-write-wins, no tolerance even for identical payloads);
+      5. the artifact is fully validated before any source parsing or
+         database interaction.
+
+    This phase is deliberately pure: no Evidence or other database object
+    exists until the source is parsed and every confirmed locator is proved
+    to resolve exactly once."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("payment scope decisions must be a JSON object")
+    if raw.get("version") != 1:
+        raise ValueError("payment scope decisions require version=1")
+    entries = raw.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("payment scope decisions require an 'entries' list")
+
+    source_sha256 = raw.get("source_sha256")
+    if (
+        not isinstance(source_sha256, str)
+        or len(source_sha256) != 64
+        or any(char not in string.hexdigits for char in source_sha256)
+        or source_sha256 != expected_source_sha256
+    ):
+        raise ValueError(
+            "payment scope decision artifact source_sha256 does not match the exact bank source document — "
+            "refusing to apply any decision"
+        )
+
+    seen: set[tuple[int, int]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("payment scope decision entries must be objects")
+        if entry.get("decision") != SCOPE_DECISION_OUTCOME_OUT_OF_SCOPE:
+            raise ValueError(f"payment scope decision supports only decision={SCOPE_DECISION_OUTCOME_OUT_OF_SCOPE!r}")
+        confirmation_type = entry.get("confirmation_type")
+        if confirmation_type not in _SCOPE_DECISION_CONFIRMATIONS:
+            raise ValueError(
+                "payment scope decision confirmation_type must be one of "
+                f"{sorted(_SCOPE_DECISION_CONFIRMATIONS)!r}"
+            )
+        page, transaction_index = entry.get("page"), entry.get("transaction_index")
+        # Strict non-negative integers; booleans are ints in Python and
+        # must be rejected — type() is used, never int() coercion.
+        if type(page) is not int or page < 0 or type(transaction_index) is not int or transaction_index < 0:
+            raise ValueError(
+                "payment scope decision locators (page, transaction_index) must be exact non-negative integers"
+            )
+        locator = (page, transaction_index)
+        if locator in seen:
+            raise ValueError("payment scope decision artifact contains a duplicate locator")
+        seen.add(locator)
+    return entries
+
+
+def _resolve_payment_scope_decisions(
+    entries: list[dict[str, Any]], transactions: list[ParsedBankTransaction],
+) -> list[dict[str, Any]]:
+    """Resolve every confirmed adjudication against its already-bound source.
+
+    The full artifact was schema-validated before parsing. This second pure
+    phase proves one-to-one source-row resolution before any decision can
+    create Evidence or alter the eventual Payment disposition."""
+    available = Counter((t.page_index, t.transaction_index) for t in transactions)
+    applied: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry["confirmation_type"] == SCOPE_DECISION_CONFIRMATION_HUMAN:
+            locator = (entry["page"], entry["transaction_index"])
+            if available[locator] != 1:
+                raise ValueError(
+                    "payment scope decision locator must resolve to exactly one transaction in the bound source"
+                )
+            applied.append(entry)
+    return applied
+
+
+def _load_payment_scope_decisions(
+    session: Session,
+    path: Path,
+    transactions: list[ParsedBankTransaction],
+    *,
+    expected_source_sha256: str,
+    now: datetime,
+) -> dict[tuple[int, int], dict[str, Any]]:
+    """Compatibility wrapper for focused tests and non-plan callers.
+
+    Production plan execution uses the same two pure validation phases
+    before creating its bank EvidenceDocument; this wrapper keeps the
+    private artifact Evidence write after both phases have succeeded."""
+    entries = _read_payment_scope_decision_artifact(path, expected_source_sha256=expected_source_sha256)
+    applied = _resolve_payment_scope_decisions(entries, transactions)
+    if applied:
+        _import_scope_decision_evidence(session, path, applied, now=now)
+    return {(e["page"], e["transaction_index"]): e for e in applied}
 
 
 def backfill_payment_transactions(
@@ -500,14 +675,39 @@ def backfill_payment_transactions(
     source_account_id: str | None,
     document_id: uuid.UUID,
     created_at: datetime | None = None,
+    scope_decisions: dict[tuple[int, int], dict[str, Any]] | None = None,
 ) -> BackfillOutcome:
     """The identity-resolution core, factored out so it can be tested
     without a real PDF: ``backfill_payments`` below is a thin wrapper
-    that parses a file and calls this."""
+    that parses a file and calls this.
+
+    Decision order for every parsed row:
+      1. the bank EvidenceFragment is created FIRST (Bank Statement !=
+         Payment Ledger — an excluded movement is never deleted, never
+         omitted);
+      2. deterministic OUT procurement scope filter (M001 counterparty
+         membership only) — a procurement OUT payment to a non-scope party
+         is excluded without any further input;
+      3. explicit private scope adjudication (HUMAN_CONFIRMED
+         OUT_OF_SCOPE, keyed by source locator) — the only way a
+         non-business IN bank movement is excluded;
+      4. otherwise the row continues conservatively (an IN receipt is never
+         auto-excluded merely because its payer is unknown / mismatched /
+         ``customer=NULL`` — it may exist before any SalesContract is
+         known);
+      5. the frozen Payment identity validation runs unchanged: a row with
+         incomplete identity stays IDENTITY_INCOMPLETE.
+
+    Missing ``bank_reference`` is NEVER an out-of-scope reason. ``scope_decisions``
+    locators (page_index, transaction_index) identify the source Evidence
+    row a decision refers to; they are never used as Payment business
+    identity and never generate a bank_reference."""
     now = created_at or datetime.now(timezone.utc)
     outcome = BackfillOutcome()
     payment_repo = PaymentRepository(session)
     evidence_repo = EvidenceRepository(session)
+    scope_decisions = scope_decisions or {}
+    out_scope_parties = _first_stage_out_scope_parties(session)
 
     for txn in transactions:
         fragment = EvidenceFragment(
@@ -521,6 +721,18 @@ def backfill_payment_transactions(
 
         direction = PaymentDirection.IN if txn.signed_amount >= 0 else PaymentDirection.OUT
         amount = abs(txn.signed_amount)
+
+        # Step 2 — deterministic OUT procurement scope filter (M001
+        # membership). Evidence above is kept; nothing below is produced.
+        if direction == PaymentDirection.OUT and out_scope_parties is not None:
+            normalized_cp = normalize_counterparty(txn.counterparty)
+            if normalized_cp and normalized_cp not in out_scope_parties:
+                continue
+
+        # Step 3 — explicit HUMAN_CONFIRMED OUT_OF_SCOPE adjudication,
+        # anchored to this source Evidence row's own locator.
+        if (txn.page_index, txn.transaction_index) in scope_decisions:
+            continue
 
         if not source_account_id or not txn.bank_reference:
             # No stable business identity exists for this row (that is
@@ -594,21 +806,62 @@ def backfill_payment_transactions(
 
 
 def backfill_payments(
-    session: Session, file_path: Path, profile: str, *, source_account_id: str | None, created_at: datetime | None = None
+    session: Session,
+    file_path: Path,
+    profile: str,
+    *,
+    source_account_id: str | None,
+    created_at: datetime | None = None,
+    scope_decisions_path: Path | None = None,
 ) -> BackfillOutcome:
     """``source_account_id`` is an explicit caller-supplied input seam
     (section 7): the current CMB statement adapter cannot deterministically
     parse an account identifier from the PDF text layer, so it is never
-    guessed from the filename, counterparty, or profile name."""
+    guessed from the filename, counterparty, or profile name.
+
+    ``scope_decisions_path`` (optional, cutover-only) names a private
+    Payment-scope adjudication artifact that the backfill PLAN has already
+    resolved strictly inside the period directory. Only HUMAN_CONFIRMED
+    OUT_OF_SCOPE decisions are applied and recorded as Evidence
+    (source_type ``cutover_payment_scope_decision``); the path itself is
+    orchestration — it never becomes a business fact or a rule manifest.
+
+    Every adjudication artifact is BOUND to the exact immutable bank source
+    document: the artifact's ``source_sha256`` must equal the SHA256 of
+    ``file_path``, or the whole load hard-fails and nothing is applied. The
+    SHA is provenance binding only — it is never Payment identity and never
+    a bank_reference fallback. An invalid artifact (mismatch, malformed
+    locator, duplicate, unresolvable) raises BEFORE any bank EvidenceDocument
+    is created, so an invalid artifact can never partially affect database
+    state nor mask a later corrected retry as a re-import."""
     if profile != "cmb":
         raise ValueError(f"unsupported bank profile {profile!r}")
     now = created_at or datetime.now(timezone.utc)
-    document, is_reimport = _get_or_create_document(session, file_path, source_type=BANK_STATEMENT_SOURCE_TYPE, now=now)
+    source_sha256 = compute_sha256(file_path)
+    artifact_entries: list[dict[str, Any]] = []
+    if scope_decisions_path is not None:
+        artifact_entries = _read_payment_scope_decision_artifact(
+            scope_decisions_path, expected_source_sha256=source_sha256
+        )
+
+    # Pure reads + complete source-row resolution before any DB write.
+    parsed = parse_cmb_bank_statement(file_path)
+    if compute_sha256(file_path) != source_sha256:
+        raise ValueError("bank source changed while validating payment scope decisions")
+    scope_decisions: dict[tuple[int, int], dict[str, Any]] = {}
+    applied_decisions = _resolve_payment_scope_decisions(artifact_entries, parsed.transactions)
+    scope_decisions = {(entry["page"], entry["transaction_index"]): entry for entry in applied_decisions}
+
+    document, is_reimport = _get_or_create_document(
+        session, file_path, source_type=BANK_STATEMENT_SOURCE_TYPE, now=now, sha256=source_sha256
+    )
     if is_reimport:
         return BackfillOutcome()
-    parsed = parse_cmb_bank_statement(file_path)
+    if scope_decisions_path is not None:
+        _import_scope_decision_evidence(session, scope_decisions_path, applied_decisions, now=now)
     return backfill_payment_transactions(
-        session, parsed.transactions, source_account_id=source_account_id, document_id=document.id, created_at=now
+        session, parsed.transactions, source_account_id=source_account_id, document_id=document.id, created_at=now,
+        scope_decisions=scope_decisions,
     )
 
 

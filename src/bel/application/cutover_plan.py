@@ -73,6 +73,12 @@ CLOSED_PLAN_SECTIONS = (
 # Reconciliation's own acceptance material, never a backfill Fact source.
 _EXPECTED_DIR_NAME = "expected"
 
+# Closed key set for each ``payments`` plan entry. ``scope_decisions`` is
+# the one optional, cutover-only REFERENCE to a private Payment-scope
+# adjudication artifact — a path reference only; the plan stays
+# orchestration, never a business-rule manifest.
+_PAYMENT_ENTRY_KEYS = frozenset({"path", "profile", "source_account_id", "scope_decisions"})
+
 
 class CutoverPlanError(ValueError):
     """A rejected backfill plan — unknown section, malformed entry, or a
@@ -184,12 +190,28 @@ def run_backfill_plan(session: Session, plan: dict[str, Any], *, period_dir: Pat
     if "payments" in plan:
         results = []
         for entry in plan["payments"]:
+            if not isinstance(entry, dict):
+                raise CutoverPlanError("payments entries must be JSON objects")
+            unknown = sorted(set(entry) - set(_PAYMENT_ENTRY_KEYS))
+            if unknown:
+                raise CutoverPlanError(f"payments entry contains unrecognised key(s): {unknown}")
             path = _resolve_plan_path(period_dir, entry["path"])
             profile = entry.get("profile", "cmb")
             source_account_id = entry.get("source_account_id")
+            scope_decisions_path = None
+            if "scope_decisions" in entry:
+                if not isinstance(entry["scope_decisions"], str):
+                    raise CutoverPlanError("payments scope_decisions must be a string path")
+                scope_decisions_path = _resolve_plan_path(period_dir, entry["scope_decisions"])
+                relative_parts = scope_decisions_path.relative_to(period_dir).parts
+                if not relative_parts or relative_parts[0] == _EXPECTED_DIR_NAME:
+                    raise CutoverPlanError("payments scope_decisions must live inside the period, never under expected/")
             results.append(
                 _outcome_to_dict(
-                    backfill_payments(session, path, profile, source_account_id=source_account_id, created_at=created_at)
+                    backfill_payments(
+                        session, path, profile, source_account_id=source_account_id, created_at=created_at,
+                        scope_decisions_path=scope_decisions_path,
+                    )
                 )
             )
         sections["payments"] = results

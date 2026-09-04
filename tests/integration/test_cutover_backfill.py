@@ -10,6 +10,7 @@ synthetic workbook factories as the rest of the suite
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -19,15 +20,23 @@ import pytest
 
 from bel.adapters.pdf.cmb_bank_statement import ParsedBankTransaction
 from bel.application.cutover_backfill import (
+    SCOPE_DECISION_CONFIRMATION_DRAFT,
+    SCOPE_DECISION_CONFIRMATION_HUMAN,
+    SCOPE_DECISION_OUTCOME_OUT_OF_SCOPE,
+    SCOPE_DECISION_SOURCE_TYPE,
+    _load_payment_scope_decisions,
     backfill_contract_items,
     backfill_contracts,
     backfill_invoices,
     backfill_payment_transactions,
+    backfill_payments,
     backfill_procurement_sales_links,
     backfill_sales_contracts,
     backfill_shipments,
 )
+from bel.application.cutover_plan import CutoverPlanError, run_backfill_plan
 from bel.application.sales_contract_facts import create_sales_contract_fact
+from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
 from bel.infrastructure.persistence.database import make_engine, make_session_factory
 from bel.infrastructure.persistence.models import Base
@@ -265,6 +274,73 @@ def _txn(index=0, amount=Decimal("100.00"), bank_reference="REF-1", counterparty
     )
 
 
+def _seed_scope_contract(session, counterparty="ScopeSupplier", contract_no="SCOPE-1"):
+    """A real, Evidence-backed Contract whose counterparty is a party of
+    the first-stage procurement scope — the DB state the cutover
+    Payment-scope filter resolves against (mirrors the reconciliation
+    suite's ``_make_contract``)."""
+    doc = EvidenceDocument(
+        id=uuid.uuid4(), file_name="scope", sha256=uuid.uuid4().hex + uuid.uuid4().hex, source_type="t",
+        imported_at=NOW,
+    )
+    EvidenceRepository(session).add_document(doc)
+    frag = EvidenceFragment(
+        id=uuid.uuid4(), evidence_document_id=doc.id, fragment_kind=FragmentKind.MANUAL_FACT, sheet_name=None,
+        row_number=None, locator_json={}, raw_data={}, created_at=NOW,
+    )
+    EvidenceRepository(session).add_fragment(frag)
+    session.flush()
+    contract = Contract(
+        id=uuid.uuid4(), contract_no=contract_no, contract_type="出口报关购销合同", counterparty=counterparty,
+        buyer="BuyerX", gross_amount=Decimal("1000.00"), currency="CNY", contract_date=date(2026, 1, 1),
+        current_source_fragment_id=frag.id, created_at=NOW, updated_at=NOW,
+    )
+    ContractRepository(session).add(contract)
+    session.flush()
+    return contract
+
+
+def _new_bank_document(session, tag: str):
+    doc_id = uuid.uuid4()
+    EvidenceRepository(session).add_document(
+        EvidenceDocument(
+            id=doc_id, file_name=f"bank-{tag}", sha256=uuid.uuid4().hex + uuid.uuid4().hex,
+            source_type="cmb_bank_statement_pdf", imported_at=NOW,
+        )
+    )
+    session.flush()
+    return doc_id
+
+
+def _seed_sales_contract(session, *, customer=None, sales_contract_no="SC-1", our_entity="BuyerS"):
+    """A genuine, Evidence-backed SalesContract scope (customer optional —
+    NULL is a legitimate first-stage state). Mirrors the reconciliation
+    suite's sales-contract seeding."""
+    frag = _make_fragment(session)
+    fields = {"currency": "CNY", "gross_amount": Decimal("500.00"), "contract_date": date(2026, 1, 1)}
+    if customer is not None:
+        fields["customer"] = customer
+    return create_sales_contract_fact(
+        session, our_entity=our_entity, sales_contract_no=sales_contract_no, fields=fields,
+        source_fragment_id=frag.id, created_at=NOW,
+    ).sales_contract
+
+
+def _confirmed_decision(index, page=0, *, confirmation=SCOPE_DECISION_CONFIRMATION_HUMAN):
+    """One synthetic private scope decision anchored to the bank Evidence
+    row locator (page, transaction_index)."""
+    return {
+        (page, index): {
+            "decision": SCOPE_DECISION_OUTCOME_OUT_OF_SCOPE,
+            "confirmation_type": confirmation,
+            "page": page,
+            "transaction_index": index,
+            "category": "NON_BUSINESS_INBOUND",
+            "reason": "synthetic reviewed non-business inbound bank movement",
+        }
+    }
+
+
 def test_k_payment_exact_replay(db_session):
     doc_id = uuid.uuid4()
     EvidenceRepository(db_session).add_document(
@@ -326,6 +402,529 @@ def test_o_same_identity_conflicting_evidence_produces_task(db_session):
     )
     assert result.tasks[0].kind == "CONFLICT"
     assert len(PaymentRepository(db_session).list_all()) == 1  # existing untouched, no second row
+
+
+# ---------------------------------------------------------------------------
+# First-stage Payment-scope filter REPAIR #2 (cutover): the automatic filter
+# is procurement-OUT only (M001 membership). Sales-side IN receipts are never
+# auto-excluded by negative SalesContract.customer membership; non-business
+# IN bank movements are excluded ONLY through an explicit HUMAN_CONFIRMED
+# OUT_OF_SCOPE private adjudication anchored to the bank Evidence locator.
+# Payment identity is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_scope_repair_a_out_unrelated_procurement_counterparty_excluded(db_session):
+    _seed_scope_contract(db_session, counterparty="ScopeSupplier")
+    doc_id = _new_bank_document(db_session, "A")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="UnrelatedOutParty", bank_reference=None, amount=Decimal("-5.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+    )
+    assert result.created == 0
+    assert result.tasks == []
+    assert PaymentRepository(db_session).list_all() == []
+    assert EvidenceRepository(db_session).find_fragment_by_document(doc_id) is not None
+
+
+def test_scope_repair_b_out_known_procurement_missing_ref_identity_task(db_session):
+    _seed_scope_contract(db_session, counterparty="ScopeSupplier")
+    doc_id = _new_bank_document(db_session, "B")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="ScopeSupplier", bank_reference=None, amount=Decimal("-100.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+    )
+    assert result.created == 0
+    assert PaymentRepository(db_session).list_all() == []
+    assert len(result.tasks) == 1
+    assert result.tasks[0].kind == "IDENTITY_INCOMPLETE"
+    assert result.tasks[0].detail["missing_bank_reference"] is True
+
+
+def test_scope_out_known_procurement_complete_identity_payment_created(db_session):
+    _seed_scope_contract(db_session, counterparty="ScopeSupplier")
+    doc_id = _new_bank_document(db_session, "out-ok")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="ScopeSupplier", bank_reference="REF-OUT", amount=Decimal("-100.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+    )
+    assert result.created == 1
+    assert result.tasks == []
+    payments = PaymentRepository(db_session).list_all()
+    assert len(payments) == 1
+    assert payments[0].counterparty == "ScopeSupplier"
+
+
+def test_scope_repair_c_in_known_sales_customer_not_excluded_no_auto_match(db_session):
+    _seed_sales_contract(db_session, customer="KnownCustomer", sales_contract_no="SC-K")
+    doc_id = _new_bank_document(db_session, "C")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="KnownCustomer", bank_reference="REF-IN-C", amount=Decimal("100.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+    )
+    assert result.created == 1
+    assert result.tasks == []
+    # No automatic sales matching of any kind: no MatchCase, no SalesMatchCandidate.
+    from bel.infrastructure.persistence.repositories import MatchCaseRepository
+
+    assert MatchCaseRepository(db_session).list_all() == []
+
+
+def test_scope_repair_d_in_unknown_payer_not_automatically_excluded(db_session):
+    """An unknown payer is never automatically OUT_OF_SCOPE, even when a
+    populated procurement scope exists (IN is not compared against it)."""
+    _seed_scope_contract(db_session, counterparty="ScopeSupplier")
+    doc_id = _new_bank_document(db_session, "D")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="UnknownPayer", bank_reference="REF-IN-D", amount=Decimal("100.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+    )
+    assert result.created == 1
+    assert result.tasks == []
+
+
+def test_scope_repair_e_in_sales_customer_null_not_automatically_excluded(db_session):
+    _seed_sales_contract(db_session, customer=None, sales_contract_no="SC-NULL")
+    doc_id = _new_bank_document(db_session, "E")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="SomePayer", bank_reference="REF-IN-E", amount=Decimal("100.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+    )
+    assert result.created == 1
+    assert result.tasks == []
+
+
+def test_scope_repair_f_in_payer_customer_mismatch_not_automatically_excluded(db_session):
+    _seed_sales_contract(db_session, customer="CustomerA", sales_contract_no="SC-A")
+    doc_id = _new_bank_document(db_session, "F")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="DifferentPayer", bank_reference="REF-IN-F", amount=Decimal("100.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+    )
+    assert result.created == 1
+    assert result.tasks == []
+
+
+def test_scope_repair_g_in_explicit_human_confirmed_out_of_scope(db_session):
+    doc_id = _new_bank_document(db_session, "G")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="ReviewedPayer", bank_reference=None, amount=Decimal("100.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+        scope_decisions=_confirmed_decision(0),
+    )
+    assert result.created == 0
+    assert result.tasks == []
+    assert PaymentRepository(db_session).list_all() == []
+    assert EvidenceRepository(db_session).find_fragment_by_document(doc_id) is not None
+
+
+def test_scope_repair_h_same_in_row_without_adjudication_is_conservative(db_session):
+    """Without an explicit adjudication, the SAME IN row is processed
+    normally: incomplete identity -> the existing Backfill Task."""
+    doc_id = _new_bank_document(db_session, "H")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="ReviewedPayer", bank_reference=None, amount=Decimal("100.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+    )
+    assert result.created == 0
+    assert len(result.tasks) == 1
+    assert result.tasks[0].kind == "IDENTITY_INCOMPLETE"
+
+
+def test_scope_repair_i_missing_bank_reference_alone_never_excludes(db_session):
+    """Missing bank_reference alone never triggers OUT_OF_SCOPE: with a
+    populated scope present, an IN row missing its reference still flows
+    into frozen identity validation (Task), never into an exclusion."""
+    _seed_scope_contract(db_session, counterparty="ScopeSupplier")
+    doc_id = _new_bank_document(db_session, "I")
+    result = backfill_payment_transactions(
+        db_session, [_txn(counterparty="RandomPayer", bank_reference=None, amount=Decimal("100.00"))],
+        source_account_id="ACC-1", document_id=doc_id,
+    )
+    assert result.created == 0
+    assert len(result.tasks) == 1
+    assert result.tasks[0].kind == "IDENTITY_INCOMPLETE"
+    assert result.tasks[0].detail["missing_bank_reference"] is True
+
+
+def test_scope_repair_j_scope_locator_not_usable_as_payment_identity(db_session):
+    """The adjudication locator pinpoints a SOURCE Evidence row; it is not
+    Payment business identity. Two rows with identical business content at
+    DIFFERENT locators: adjudicating locator (0,0) excludes only that row —
+    the identical-content row at (0,1) still creates a normal Payment and
+    neither is affected by a dedup/conflict via the locator."""
+    doc_id = _new_bank_document(db_session, "J")
+    t0 = _txn(index=0, counterparty="SameInPayer", bank_reference="REF-J", amount=Decimal("50.00"))
+    t1 = _txn(index=1, counterparty="SameInPayer", bank_reference="REF-J", amount=Decimal("50.00"))
+    result = backfill_payment_transactions(
+        db_session, [t0, t1], source_account_id="ACC-1", document_id=doc_id,
+        scope_decisions=_confirmed_decision(0),
+    )
+    assert result.created == 1
+    assert result.tasks == []
+    payments = PaymentRepository(db_session).list_all()
+    assert len(payments) == 1
+    assert payments[0].bank_reference == "REF-J"
+
+
+def test_scope_decision_loader_applies_confirmed_and_evidences_but_not_draft(tmp_path, db_session):
+    """File adjudication: HUMAN_CONFIRMED OUT_OF_SCOPE is applied AND
+    recorded as Evidence (source_type cutover_payment_scope_decision); a
+    DRAFT_NEEDS_BUSINESS_CONFIRMATION entry is never applied."""
+    from bel.adapters.common import compute_sha256
+
+    txns = [
+        _txn(index=0, counterparty="Any", bank_reference="R0", amount=Decimal("10.00")),
+        _txn(index=1, counterparty="Any", bank_reference="R1", amount=Decimal("10.00")),
+    ]
+    source_sha = "a" * 64
+    artifact = {
+        "version": 1,
+        "source_sha256": source_sha,
+        "entries": [
+            {
+                "decision": SCOPE_DECISION_OUTCOME_OUT_OF_SCOPE,
+                "confirmation_type": SCOPE_DECISION_CONFIRMATION_HUMAN,
+                "page": 0, "transaction_index": 0,
+                "category": "NON_BUSINESS_INBOUND", "reason": "synthetic confirmed",
+            },
+            {
+                "decision": SCOPE_DECISION_OUTCOME_OUT_OF_SCOPE,
+                "confirmation_type": SCOPE_DECISION_CONFIRMATION_DRAFT,
+                "page": 0, "transaction_index": 1,
+                "category": "NON_BUSINESS_INBOUND", "reason": "synthetic draft",
+            },
+        ]
+    }
+    path = tmp_path / "payment-scope-decisions.json"
+    path.write_text(json.dumps(artifact), encoding="utf-8")
+    applied = _load_payment_scope_decisions(
+        db_session, path, txns, expected_source_sha256=source_sha, now=NOW
+    )
+    assert (0, 0) in applied
+    assert (0, 1) not in applied  # DRAFT is never applied
+
+    doc = EvidenceRepository(db_session).find_document_by_sha256(compute_sha256(path))
+    assert doc is not None
+    assert doc.source_type == SCOPE_DECISION_SOURCE_TYPE
+    assert EvidenceRepository(db_session).find_fragment_by_document(doc.id) is not None
+
+
+def test_plan_rejects_scope_decisions_under_expected(tmp_path, db_session):
+    period_dir = tmp_path / "period"
+    period_dir.mkdir()
+    plan = {
+        "version": 1,
+        "payments": [
+            {"path": "bank/stmt.pdf", "profile": "cmb", "source_account_id": "ACC",
+             "scope_decisions": "expected/payment-scope-decisions.json"},
+        ],
+    }
+    with pytest.raises(CutoverPlanError):
+        run_backfill_plan(db_session, plan, period_dir=period_dir, created_at=NOW)
+
+
+def test_plan_rejects_unknown_payments_entry_key(tmp_path, db_session):
+    period_dir = tmp_path / "period"
+    period_dir.mkdir()
+    plan = {
+        "version": 1,
+        "payments": [{"path": "bank/stmt.pdf", "profile": "cmb", "source_account_id": "ACC", "surprise": True}],
+    }
+    with pytest.raises(CutoverPlanError):
+        run_backfill_plan(db_session, plan, period_dir=period_dir, created_at=NOW)
+
+
+def test_plan_rejects_scope_decisions_path_escape(tmp_path, db_session):
+    period_dir = tmp_path / "period"
+    period_dir.mkdir()
+    plan = {
+        "version": 1,
+        "payments": [
+            {"path": "bank/stmt.pdf", "profile": "cmb", "source_account_id": "ACC",
+             "scope_decisions": "../payment-scope-decisions.json"},
+        ],
+    }
+    with pytest.raises(CutoverPlanError):
+        run_backfill_plan(db_session, plan, period_dir=period_dir, created_at=NOW)
+
+
+def test_plan_wires_scope_decisions_end_to_end(tmp_path, db_session):
+    """The plan references a private adjudication artifact under facts/,
+    the wrapper applies a HUMAN_CONFIRMED OUT_OF_SCOPE decision (an
+    in-scope OUT row excluded by adjudication), and the adjudication is
+    recorded as Evidence — plan stays orchestration."""
+    from bel.adapters.common import compute_sha256
+    from fixtures.synthetic.bank_pdf import build_cmb_bank_statement_pdf
+
+    period_dir = tmp_path / "period"
+    (period_dir / "contracts").mkdir(parents=True)
+    (period_dir / "bank").mkdir()
+    (period_dir / "facts").mkdir()
+
+    _write_ledger(period_dir / "contracts" / "ledger.xlsx", [[1, "SCOPE-C", "ScopeSupplier", "BuyerX", 100]])
+    pdf = period_dir / "bank" / "stmt.pdf"
+    build_cmb_bank_statement_pdf(
+        pdf, "1000.00", [("20260105", "对公转账出", "REF-A", "desc", "ScopeSupplier", "100.00")]
+    )
+    decisions_file = period_dir / "facts" / "payment-scope-decisions.json"
+    decisions_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_sha256": compute_sha256(pdf),
+                "entries": [
+                    {
+                        "decision": SCOPE_DECISION_OUTCOME_OUT_OF_SCOPE,
+                        "confirmation_type": SCOPE_DECISION_CONFIRMATION_HUMAN,
+                        "page": 0, "transaction_index": 0,
+                        "category": "NON_BUSINESS_INBOUND", "reason": "plan plumbing synthetic",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan = {
+        "version": 1,
+        "contracts": {"path": "contracts/ledger.xlsx"},
+        "payments": [
+            {"path": "bank/stmt.pdf", "profile": "cmb", "source_account_id": "ACC-P",
+             "scope_decisions": "facts/payment-scope-decisions.json"},
+        ],
+    }
+    result = run_backfill_plan(db_session, plan, period_dir=period_dir, created_at=NOW)
+    assert result.sections["contracts"]["created"] == 1
+    payments = result.sections["payments"][0]
+    assert payments["created"] == 0
+    assert payments["tasks"] == []
+    assert PaymentRepository(db_session).list_all() == []
+    doc = EvidenceRepository(db_session).find_document_by_sha256(compute_sha256(decisions_file))
+    assert doc is not None
+    assert doc.source_type == SCOPE_DECISION_SOURCE_TYPE
+
+
+# ---------------------------------------------------------------------------
+# Repair #3 — scope adjudication source-SHA binding, strict/unique locator
+# schema, exact one-to-one resolution. No private values anywhere.
+# ---------------------------------------------------------------------------
+
+
+def _dec_entry(page=0, index=0, confirmation=SCOPE_DECISION_CONFIRMATION_HUMAN):
+    return {
+        "decision": SCOPE_DECISION_OUTCOME_OUT_OF_SCOPE,
+        "confirmation_type": confirmation,
+        "page": page, "transaction_index": index,
+        "category": "NON_BUSINESS_INBOUND", "reason": "synthetic reviewed decision",
+    }
+
+
+def _write_scope_artifact(tmp_path, entries, *, source_sha="a" * 64, name="scope.json", include_sha=True):
+    payload = {"version": 1}
+    if include_sha:
+        payload["source_sha256"] = source_sha
+    payload["entries"] = entries
+    path = tmp_path / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _load_scope(path, db_session, txns, expected="a" * 64):
+    return _load_payment_scope_decisions(
+        db_session, path, txns, expected_source_sha256=expected, now=NOW
+    )
+
+
+def _two_txn_rows():
+    return [_txn(index=0), _txn(index=1)]
+
+
+def test_repair3_wrong_source_sha_hard_fail(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [_dec_entry(0, 0)], source_sha="b" * 64)
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows(), expected="a" * 64)
+
+
+def test_repair3_missing_source_sha256_hard_fail(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [_dec_entry(0, 0)], include_sha=False)
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_unsupported_artifact_version_hard_fail(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [_dec_entry(0, 0)])
+    payload = json.loads(art.read_text(encoding="utf-8"))
+    payload["version"] = 2
+    art.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_malformed_source_sha256_hard_fail(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [_dec_entry(0, 0)], source_sha="not-a-sha256")
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_page_numeric_string_rejected(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [_dec_entry(page="0", index=0)])
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_transaction_index_numeric_string_rejected(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [_dec_entry(page=0, index="4")])
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_page_boolean_rejected(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [dict(_dec_entry(0, 0), page=True)])
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_float_locator_rejected(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [dict(_dec_entry(0, 0), page=0.0)])
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_negative_locator_rejected(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [_dec_entry(0, -1)])
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_duplicate_locator_rejected(tmp_path, db_session):
+    # Duplicates are rejected even when the payload is byte-identical.
+    art = _write_scope_artifact(tmp_path, [_dec_entry(0, 0), _dec_entry(0, 0)])
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_zero_match_locator_rejected(tmp_path, db_session):
+    art = _write_scope_artifact(tmp_path, [_dec_entry(0, 9)])  # only (0,0),(0,1) exist
+    with pytest.raises(ValueError):
+        _load_scope(art, db_session, _two_txn_rows())
+
+
+def test_repair3_draft_only_not_applied_and_not_evidenced(tmp_path, db_session):
+    from bel.adapters.common import compute_sha256
+
+    art = _write_scope_artifact(tmp_path, [_dec_entry(0, 0, confirmation=SCOPE_DECISION_CONFIRMATION_DRAFT)])
+    applied = _load_scope(art, db_session, _two_txn_rows())
+    assert applied == {}
+    assert EvidenceRepository(db_session).find_document_by_sha256(compute_sha256(art)) is None
+
+
+def test_repair3_unique_valid_locator_applies(tmp_path, db_session):
+    from bel.adapters.common import compute_sha256
+
+    art = _write_scope_artifact(tmp_path, [_dec_entry(0, 0), _dec_entry(0, 1, confirmation=SCOPE_DECISION_CONFIRMATION_DRAFT)])
+    applied = _load_scope(art, db_session, _two_txn_rows())
+    assert set(applied) == {(0, 0)}
+    assert EvidenceRepository(db_session).find_document_by_sha256(compute_sha256(art)) is not None
+
+
+def _wrapper_case(tmp_path, db_session, rows, *, scope_entries, seed_contract=True):
+    """Build a synthetic CMB PDF + a source-bound adjudication artifact and
+    run the cutover wrapper against them (single, fresh bank source)."""
+    from bel.adapters.common import compute_sha256
+    from fixtures.synthetic.bank_pdf import build_cmb_bank_statement_pdf
+
+    period = tmp_path / "period"
+    (period / "bank").mkdir(parents=True)
+    (period / "facts").mkdir()
+    if seed_contract:
+        _seed_scope_contract(db_session, counterparty="ScopeSupplier")
+    pdf = period / "bank" / "stmt.pdf"
+    build_cmb_bank_statement_pdf(pdf, "1000.00", rows)
+    art = period / "facts" / "payment-scope-decisions.json"
+    art.write_text(
+        json.dumps({"version": 1, "source_sha256": compute_sha256(pdf), "entries": scope_entries}),
+        encoding="utf-8",
+    )
+    return pdf, art
+
+
+def test_repair3_valid_human_confirmed_wrapper_no_payment_no_task_evidence_retained(tmp_path, db_session):
+    pdf, art = _wrapper_case(
+        tmp_path, db_session,
+        [("20260105", "对公转账出", "REF-A", "desc", "ScopeSupplier", "10.00")],
+        scope_entries=[_dec_entry(0, 0)],
+    )
+    result = backfill_payments(db_session, pdf, "cmb", source_account_id="ACC-1", scope_decisions_path=art)
+    assert result.created == 0
+    assert result.tasks == []
+    assert PaymentRepository(db_session).list_all() == []
+    # Bank EvidenceFragment for the excluded row is retained.
+    from bel.adapters.common import compute_sha256
+
+    bank_doc = EvidenceRepository(db_session).find_document_by_sha256(compute_sha256(pdf))
+    assert bank_doc is not None
+    assert EvidenceRepository(db_session).find_fragment_by_document(bank_doc.id) is not None
+    # Adjudication recorded as Evidence.
+    decision_doc = EvidenceRepository(db_session).find_document_by_sha256(compute_sha256(art))
+    assert decision_doc is not None
+    assert decision_doc.source_type == SCOPE_DECISION_SOURCE_TYPE
+
+
+def test_repair3_cross_source_artifact_reuse_rejected(tmp_path, db_session):
+    """One scope artifact cannot bind to two different payment sources: a
+    mismatch hard-fails BEFORE any bank EvidenceDocument is created."""
+    from bel.adapters.common import compute_sha256
+    from fixtures.synthetic.bank_pdf import build_cmb_bank_statement_pdf
+
+    _seed_scope_contract(db_session, counterparty="ScopeSupplier")
+    pdf_a = tmp_path / "a.pdf"
+    build_cmb_bank_statement_pdf(pdf_a, "1000.00", [("20260105", "对公转账出", "REF-A", "d", "ScopeSupplier", "10.00")])
+    sha_a = compute_sha256(pdf_a)
+    pdf_b = tmp_path / "b.pdf"
+    build_cmb_bank_statement_pdf(pdf_b, "2000.00", [("20260106", "对公转账出", "REF-B", "d", "ScopeSupplier", "30.00")])
+    sha_b = compute_sha256(pdf_b)
+    art = tmp_path / "scope.json"
+    art.write_text(json.dumps({"version": 1, "source_sha256": sha_a, "entries": [_dec_entry(0, 0)]}), encoding="utf-8")
+
+    # Reusing the artifact confirmed for source A against source B -> hard fail.
+    with pytest.raises(ValueError):
+        backfill_payments(db_session, pdf_b, "cmb", source_account_id="ACC-1", scope_decisions_path=art)
+    # Nothing was partially persisted for B, so a corrected retry is never masked.
+    assert EvidenceRepository(db_session).find_document_by_sha256(sha_b) is None
+    assert PaymentRepository(db_session).list_all() == []
+
+    # The same artifact correctly applies to its own source A.
+    result_a = backfill_payments(db_session, pdf_a, "cmb", source_account_id="ACC-1", scope_decisions_path=art)
+    assert result_a.created == 0
+    assert result_a.tasks == []
+
+
+def test_repair3_source_sha256_never_becomes_payment_identity(tmp_path, db_session):
+    """source_sha256 is provenance binding only. It never appears on a
+    Payment, never in an identity-incomplete Task key, and never in the
+    per-entry adjudication Evidence."""
+    from bel.adapters.common import compute_sha256
+
+    pdf, art = _wrapper_case(
+        tmp_path, db_session,
+        [("20260105", "对公转账出", "REF-A", "desc", "ScopeSupplier", "10.00"),
+         ("20260106", "对公转账出", "REF-B", "desc", "ScopeSupplier", "20.00")],
+        scope_entries=[_dec_entry(0, 0)],
+    )
+    sha = compute_sha256(pdf)
+    result = backfill_payments(db_session, pdf, "cmb", source_account_id="ACC-1", scope_decisions_path=art)
+    # Row (0,0) excluded; in-scope row (0,1) still flows to frozen identity
+    # validation (the synthetic PDF carries no parsed reference -> Task).
+    assert result.created == 0
+    assert len(result.tasks) == 1
+    assert result.tasks[0].kind == "IDENTITY_INCOMPLETE"
+    for task in result.tasks:
+        assert sha not in task.detail["identity_key"]
+    assert all(not hasattr(p, "source_sha256") for p in PaymentRepository(db_session).list_all())
+    # The adjudication Evidence fragment carries only the decision fields.
+    decision_doc = EvidenceRepository(db_session).find_document_by_sha256(compute_sha256(art))
+    frag = EvidenceRepository(db_session).find_fragment_by_document(decision_doc.id)
+    assert "source_sha256" not in frag.raw_data
 
 
 # ---------------------------------------------------------------------------
