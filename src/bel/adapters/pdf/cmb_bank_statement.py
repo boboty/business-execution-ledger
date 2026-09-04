@@ -18,10 +18,14 @@ not use fixed pixel columns for amount/balance/counterparty. Instead:
      (`-?[\\d,]+\\.\\d{2}`) are the amount and balance, left one first —
      found by pattern, not by x-position, so a page's column drift
      never matters.
-  3. business_type is the leftmost remaining word; a lone long digit
-     token right after it (if any) is bank_reference; everything else
-     before the amount is description, everything after the balance is
-     counterparty.
+  3. Three fixed columns precede the amount, distinguished by their
+     left-edge x0 band (the statement auto-sizes column x-positions per
+     page, but the column ORDER — 业务类型 < 票据号 < 摘要 — and their
+     relative x-gaps are stable): the leftmost column is business_type;
+     the 票据号 (Bill No.) column carries the bank's own transaction
+     reference (numeric or alphanumeric, possibly wrapping onto a second
+     line within the column); the 摘要 column is the description.
+     Everything after the balance is the counterparty.
   4. Page footers ("第N页/共M页 ...") are excluded by finding that
      marker's own vertical position and treating it as the bottom
      boundary of the page's last band — otherwise footer text bleeds
@@ -47,8 +51,17 @@ import pdfplumber
 DATE_RE = re.compile(r"^\d{8}$")
 MONEY_RE = re.compile(r"^-?[\d,]+\.\d{2}$")
 FOOTER_RE = re.compile(r"^第\d+页")
-BANK_REFERENCE_RE = re.compile(r"^\d{4,}$")
 DATE_X_RANGE = (20, 66)
+# 票据号 (Bill No.) data column — its left-edge x0 band sits strictly
+# between the 业务类型 column (business type, leftmost) and the 摘要 column
+# (description). The statement auto-sizes column x-positions per page (the
+# 票据号 header label drifts from x0=127 to x0=141 across pages), but the
+# DATA's own left edge stays in a narrow band (~113-134) and always clears
+# the business-type column (<=~81) on the left and the description column
+# (>=~167) on the right. This band — the statement's own column layout, not
+# a "looks like a number" content heuristic — is what identifies the
+# reference.
+BILL_NO_X_RANGE = (95.0, 160.0)
 TABLE_TOP = 118  # below the repeated account-info header block on every page
 
 RAW_DATE_KEY = "日期"
@@ -126,16 +139,21 @@ def _parse_band(band: list[dict]) -> dict[str, Any]:
         )
 
     amount_w, balance_w = money_words
-    before = sorted((w for w in rest if w["x0"] < amount_w["x0"]), key=lambda w: (w["top"], w["x0"]))
+    before = [w for w in rest if w["x0"] < amount_w["x0"]]
     after = sorted((w for w in rest if w["x0"] > balance_w["x0"]), key=lambda w: (w["top"], w["x0"]))
 
-    business_type = before[0]["text"] if before else None
-    remaining = before[1:]
-    bank_reference = None
-    if remaining and BANK_REFERENCE_RE.match(remaining[0]["text"]):
-        bank_reference = remaining[0]["text"]
-        remaining = remaining[1:]
-    description = "".join(w["text"] for w in remaining) or None
+    def _read_column(x_min: float, x_max: float) -> str | None:
+        """Concatenate one left-edge x0 column in top-first reading order
+        (a wrapped reference/description keeps its natural line order —
+        never re-sorted by x0 across the wrap)."""
+        tokens = sorted(
+            (w for w in before if x_min <= w["x0"] < x_max), key=lambda w: (w["top"], w["x0"])
+        )
+        return "".join(w["text"] for w in tokens) or None
+
+    business_type = _read_column(0.0, BILL_NO_X_RANGE[0])
+    bank_reference = _read_column(BILL_NO_X_RANGE[0], BILL_NO_X_RANGE[1])
+    description = _read_column(BILL_NO_X_RANGE[1], float("inf"))
     counterparty = "".join(w["text"] for w in after) or None
 
     return {
