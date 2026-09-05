@@ -111,10 +111,21 @@ class MatchMethod:
 
 
 class AllocationMatchMethod:
-    """The specific mechanism an Allocation was created under — always
-    this one literal value in Phase 2A, per spec section 17."""
+    """The specific mechanism an Allocation was created under.
+
+    ``EXACT_COUNTERPARTY_AMOUNT_UNIQUE`` — Phase 2A's original literal
+    (spec section 17): the subject had exactly ONE candidate contract.
+
+    ``EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL`` — added by the confirmed
+    chronological-matching business rule (docs/PHASE2A-DECISIONS.md): the
+    subject had several EXACTLY equivalent candidate contracts (same
+    counterparty + same amount), and BEL allocated it deterministically to
+    the earliest candidate with sufficient remaining capacity. It is NOT a
+    unique-candidate decision, so it is never mislabelled as
+    ``..._UNIQUE``."""
 
     EXACT_COUNTERPARTY_AMOUNT_UNIQUE = "EXACT_COUNTERPARTY_AMOUNT_UNIQUE"
+    EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL = "EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL"
 
 
 class ConfirmationType:

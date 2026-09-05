@@ -742,10 +742,14 @@ class PaymentModel(Base):
 
 class InvoiceAllocationModel(Base):
     """Many-to-many by construction: an Invoice can have allocations
-    against more than one Contract, and vice versa. Phase 2A never
-    auto-splits — every row here comes from a unique-candidate M001
-    match or a future manual confirmation. See docs/RULES.md-adjacent
-    docs/PHASE2A-DECISIONS.md for the M001 rule."""
+    against more than one Contract, and vice versa. BEL never auto-splits
+    a single row across several Contracts — every row here comes from an
+    automatic procurement match (either a unique-candidate decision,
+    `EXACT_COUNTERPARTY_AMOUNT_UNIQUE`, or a deterministic chronological
+    decision between equivalent candidates,
+    `EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL`) or a manual/human
+    confirmation. See docs/PHASE2A-DECISIONS.md for the confirmed
+    explicit -> chronological -> human procurement rule."""
 
     __tablename__ = "invoice_allocations"
 
@@ -763,6 +767,10 @@ class InvoiceAllocationModel(Base):
 
 
 class PaymentAllocationModel(Base):
+    """Same allocation semantics as InvoiceAllocationModel — each row is a
+    unique-candidate (`..._UNIQUE`) or chronological (`..._CHRONOLOGICAL`)
+    automatic procurement decision, or a manual/human confirmation."""
+
     __tablename__ = "payment_allocations"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)

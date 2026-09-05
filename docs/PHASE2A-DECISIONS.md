@@ -123,6 +123,110 @@ least reproducible run-to-run. This path is exercised only by the
 synthetic `test_allocation_capacity_exceeded_blocks_second_unique_match`,
 not tuned against any particular dataset.
 
+## SUPERSEDED: "multiple equivalent candidates => HUMAN_CONFIRMATION_REQUIRED"
+
+The former rule above — several EXACTLY equivalent candidates (same
+counterparty + same amount) must land in `HUMAN_CONFIRMATION_REQUIRED`
+because sequence guessing was forbidden — is **superseded by later
+business-owner confirmation** for procurement. The historical text above
+is kept on purpose as the record of what Phase 2A originally decided.
+
+New frozen procurement rule — *explicit, then chronological, then human*:
+
+1. **Explicit relationship wins.** A subject that already has an
+   authoritative MatchCase/Allocation (AUTO_CONFIRMED, a human-confirmed
+   `RESOLVED` case, an `HUMAN_CONFIRMATION_REQUIRED` case, ...) is never
+   reconsidered, reassigned, or duplicated.
+2. **Otherwise chronological allocation.** When a procurement Invoice /
+   OUT Payment can correspond to several equivalent Contracts (same
+   counterparty + same amount), BEL does NOT ask a human merely for that
+   reason. Subjects are processed in business chronological order
+   (invoice `issue_date` ASC / OUT payment `transaction_date` ASC), and
+   each subject allocates to the EARLIEST candidate Contract
+   (`contract_date` ASC) that still has sufficient remaining capacity.
+   Within a same date a deterministic stable tie-break is used — a real
+   business/source identifier first (`contract_no`, invoice
+   `external_invoice_key`/`digital_invoice_no`/`invoice_no` tried in that
+   order — a blank/whitespace-only value does not count as usable and
+   falls through to the next one, exactly like `NULL` would — payment
+   `bank_reference`), UUID only as the final tie-breaker.
+
+   **Dates are required ONLY when chronology is actually needed to choose
+   between multiple otherwise-valid possibilities.** Chronology uses real
+   business dates; a missing date is never replaced by technical ordering
+   (`NULL`-first/last, `created_at`, import order, `contract_no`, or UUID
+   used *as if* it were a date). Specifically:
+
+   - a subject with exactly ONE valid candidate Contract (or whose multiple
+     original candidates are narrowed by capacity to exactly ONE that can
+     accept it) allocates normally even when `contract_date` /
+     `issue_date` is NULL — chronology is not needed when no real choice
+     remains;
+   - if MORE than one valid candidate remains AND choosing requires the
+     chronological fallback, EVERY competing candidate must have a real
+     `contract_date`; if any competing candidate has `contract_date = NULL`,
+     BEL cannot truthfully determine the earliest Contract and the case is
+     `HUMAN_CONFIRMATION_REQUIRED` (no allocation);
+   - likewise an Invoice needing subject chronology with `issue_date = NULL`
+     is never given a fabricated ordering — it stays
+     `HUMAN_CONFIRMATION_REQUIRED` (OUT Payment `transaction_date` is
+     domain-required and unchanged).
+
+   **"Effective uniqueness" must be established independently of any
+   chronological allocation created in the same unresolved cohort this
+   run — never manufactured by processing order.** Unresolved subjects
+   sharing the same normalized counterparty + exact amount share the same
+   static candidate Contract pool and are therefore a *cohort* competing
+   for that pool. A missing date sorted last is not evidence of anything:
+   letting a dated cohort member consume capacity first and then treating
+   the narrowed leftover as "the one remaining candidate" for an undated
+   sibling would fabricate a chronology the source data never established
+   — that "effective uniqueness" was CREATED by this run's own undefined
+   ordering, not by the business facts. Concretely: for a cohort of 2+
+   unresolved subjects, chronological fallback allocation runs for the
+   WHOLE cohort this pass only when it is well-defined for every member —
+   every competing subject has a real business date AND every Contract
+   still able to accept one of them, by pre-existing *pre-run*
+   authoritative capacity alone, has a real `contract_date`. If either
+   is missing anywhere in the cohort, NONE of its members are
+   chronologically allocated this run — not even the dated ones — and
+   each stays `HUMAN_CONFIRMATION_REQUIRED` with the full static candidate
+   list; dated members are never processed first merely to consume
+   capacity and narrow what an undated sibling sees. A single unresolved
+   subject is never subject to this cohort check (nothing else in this
+   run could have manufactured its uniqueness), and capacity already
+   consumed by a pre-existing authoritative decision (a prior run, or a
+   human confirmation) is unaffected by this rule — it can still make a
+   cohort, or a lone subject, genuinely and independently unique.
+
+   The allocation carries
+   `AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL` and the
+   MatchCase is `AUTO_CONFIRMED` — meaning BEL deterministically applied
+   the confirmed business rule, NOT that source Evidence explicitly proved
+   that exact one-to-one historical relationship. Once a Contract's
+   capacity is consumed, the next chronological subject naturally advances
+   to the next chronological available Contract.
+3. **Human review only when the deterministic rule cannot resolve** — e.g.
+   no candidate has sufficient remaining capacity (the existing
+   `HUMAN_CONFIRMATION_REQUIRED` + `ALLOCATION_CAPACITY_EXCEEDED`
+   protection path, never a silent over-allocation), zero valid Contract
+   correspondence (`UNMATCHED`), chronology unavailable because a competing
+   date is missing, or conflicting explicit information. HCR is NOT raised
+   merely because two or more same-counterparty / same-amount Contracts
+   exist when their dates are all present and the chronological rule can
+   decide.
+
+Why: accounting does not require arbitrary atom-by-atom manual
+confirmation when equivalent transactions can be deterministically
+allocated without changing the business result.
+
+The former "no sequence guessing" tests and the synthetic golden baseline
+were updated to the confirmed rule (e.g. the former two-invoice /
+two-contract HCR test is now
+`test_two_contracts_two_invoices_chronological_allocation`), and the
+matching module now processes subjects and candidates in business
+chronological order instead of `sorted by str(id)`.
+
 ## `MatchCaseStatus` for the capacity-exceeded outcome
 
 Spec section 25's status enum (`AUTO_CONFIRMED` /
