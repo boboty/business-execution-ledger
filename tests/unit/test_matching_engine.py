@@ -43,7 +43,8 @@ def _make_fragment(session, doc_sha="a" * 64):
 
 
 def _make_contract(
-    session, fragment_id, counterparty, gross_amount, *, contract_no=None, contract_date=None, contract_id=None
+    session, fragment_id, counterparty, gross_amount, *, contract_no=None, contract_date=None, contract_id=None,
+    buyer="Buyer Co",
 ):
     now = datetime.now(timezone.utc)
     c = Contract(
@@ -51,7 +52,7 @@ def _make_contract(
         contract_no=contract_no or f"C-{uuid.uuid4().hex[:8]}",
         contract_type=None,
         counterparty=counterparty,
-        buyer="Buyer Co",
+        buyer=buyer,
         gross_amount=Decimal(gross_amount),
         currency="CNY",
         contract_date=contract_date,
@@ -92,7 +93,7 @@ def _make_invoice(
 
 def _make_payment(
     session, fragment_id, counterparty, amount, *, direction=PaymentDirection.OUT, transaction_date=None,
-    bank_reference=None,
+    bank_reference=None, source_account_id=None,
 ):
     now = datetime.now(timezone.utc)
     p = Payment(
@@ -102,6 +103,7 @@ def _make_payment(
         amount=Decimal(amount),
         counterparty=counterparty,
         business_type=None,
+        source_account_id=source_account_id,
         bank_reference=bank_reference,
         description=None,
         running_balance=None,
@@ -110,6 +112,99 @@ def _make_payment(
     )
     PaymentRepository(session).add(p)
     return p
+
+
+def test_two_by_two_undated_equivalent_cohort_uses_canonical_pairing(db_session):
+    """Stable business keys, not insertion order or UUID, choose the
+    representation after the whole undated cohort is proven equivalent."""
+    frag = _make_fragment(db_session)
+    ca = _make_contract(
+        db_session, frag.id, "Seller A", "1000.00", contract_no="C-A", contract_date=None,
+        contract_id=uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+    )
+    cb = _make_contract(
+        db_session, frag.id, "Seller A", "1000.00", contract_no="C-B", contract_date=None,
+        contract_id=uuid.UUID("0a0a0a0a-0a0a-0a0a-0a0a-0a0a0a0a0a0a"),
+    )
+    ib = _make_invoice(
+        db_session, frag.id, "Seller A", "1000.00", external_invoice_key="I-B",
+        invoice_id=uuid.UUID("0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b"),
+    )
+    ia = _make_invoice(
+        db_session, frag.id, "Seller A", "1000.00", external_invoice_key="I-A",
+        invoice_id=uuid.UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"),
+    )
+    db_session.flush()
+
+    first = match_invoices(db_session)
+    second = match_invoices(db_session)
+
+    assert first.auto_confirmed == 2
+    assert first.human_confirmation_required == 0
+    assert second.auto_confirmed == 0
+    assert second.already_matched_skipped == 2
+    assert [a.invoice_id for a in InvoiceAllocationRepository(db_session).list_for_contract(ca.id)] == [ia.id]
+    assert [a.invoice_id for a in InvoiceAllocationRepository(db_session).list_for_contract(cb.id)] == [ib.id]
+    methods = {
+        a.match_method
+        for contract in (ca, cb)
+        for a in InvoiceAllocationRepository(db_session).list_for_contract(contract.id)
+    }
+    assert methods == {AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL}
+
+
+def test_three_by_three_undated_equivalent_payment_cohort(db_session):
+    frag = _make_fragment(db_session)
+    contracts = [
+        _make_contract(db_session, frag.id, "Seller A", "700.00", contract_no=f"C-{suffix}")
+        for suffix in ("C", "A", "B")
+    ]
+    payments = [
+        _make_payment(
+            db_session, frag.id, "Seller A", "700.00", transaction_date=date(2026, 8, 1),
+            bank_reference=f"R-{suffix}", source_account_id="ACCOUNT-A",
+        )
+        for suffix in ("C", "A", "B")
+    ]
+    db_session.flush()
+
+    summary = match_payments(db_session)
+
+    assert summary.auto_confirmed == 3
+    assert summary.human_confirmation_required == 0
+    expected = zip(sorted(contracts, key=lambda c: c.contract_no), sorted(payments, key=lambda p: p.bank_reference))
+    for contract, payment in expected:
+        allocations = PaymentAllocationRepository(db_session).list_for_contract(contract.id)
+        assert [a.payment_id for a in allocations] == [payment.id]
+        assert allocations[0].match_method == AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL
+
+
+def test_equivalent_canonicalization_requires_complete_subject_identity(db_session):
+    frag = _make_fragment(db_session)
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-A")
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-B")
+    _make_invoice(db_session, frag.id, "Seller A", "900.00")
+    _make_invoice(db_session, frag.id, "Seller A", "900.00")
+    db_session.flush()
+
+    summary = match_invoices(db_session)
+
+    assert summary.auto_confirmed == 0
+    assert summary.human_confirmation_required == 2
+
+
+def test_equivalent_canonicalization_rejects_different_contract_state(db_session):
+    frag = _make_fragment(db_session)
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-A", buyer="Buyer A")
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-B", buyer="Buyer B")
+    _make_invoice(db_session, frag.id, "Seller A", "900.00", external_invoice_key="I-A")
+    _make_invoice(db_session, frag.id, "Seller A", "900.00", external_invoice_key="I-B")
+    db_session.flush()
+
+    summary = match_invoices(db_session)
+
+    assert summary.auto_confirmed == 0
+    assert summary.human_confirmation_required == 2
 
 
 def test_unique_candidate_auto_confirms_and_allocates(db_session):

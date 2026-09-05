@@ -75,7 +75,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Callable, Sequence
+from typing import Callable, Hashable, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -206,6 +206,24 @@ def _invoice_chronological_key(invoice) -> tuple:
     )
 
 
+def _invoice_canonical_identity(invoice) -> str | None:
+    """Stable Invoice business/source identity for representation only."""
+    return _first_usable_key(invoice.external_invoice_key, invoice.digital_invoice_no, invoice.invoice_no)
+
+
+def _payment_canonical_identity(payment) -> tuple | None:
+    """The frozen complete Payment identity; never falls back to UUID/order."""
+    if not payment.source_account_id or not payment.bank_reference or payment.transaction_date is None:
+        return None
+    return (
+        payment.source_account_id,
+        payment.transaction_date,
+        payment.direction,
+        payment.amount,
+        payment.bank_reference,
+    )
+
+
 def _run_match_pass(
     *,
     session: Session,
@@ -214,6 +232,7 @@ def _run_match_pass(
     get_amount: Callable[[object], Decimal],
     get_counterparty: Callable[[object], str | None],
     get_subject_date: Callable[[object], date | None],
+    get_subject_canonical_identity: Callable[[object], Hashable | None],
     contracts: Sequence[Contract],
     match_case_repo: MatchCaseRepository,
     candidate_repo: MatchCandidateRepository,
@@ -306,6 +325,7 @@ def _run_match_pass(
         cohorts.setdefault(cohort_key, []).append(subject)
 
     blocked_subject_ids: set[uuid.UUID] = set()
+    equivalent_canonical_contract_by_subject: dict[uuid.UUID, uuid.UUID] = {}
     for members in cohorts.values():
         if len(members) < 2:
             # No competition — a lone subject's uniqueness (or lack of it)
@@ -320,8 +340,47 @@ def _run_match_pass(
             continue
         subjects_dated = all(get_subject_date(s) is not None for s in members)
         contracts_dated = all(contract_by_id[cid].contract_date is not None for cid in initially_viable)
-        if not (subjects_dated and contracts_dated):
-            blocked_subject_ids.update(s.id for s in members)
+        if subjects_dated and contracts_dated:
+            continue
+
+        # Missing chronology is not itself permission to canonicalize.  The
+        # whole PRE-COHORT snapshot must prove a complete, exact one-to-one
+        # permutation whose only variable is the edge identity.
+        blocked_subject_ids.update(s.id for s in members)
+        member_candidate_sets = [frozenset(candidates_by_subject[s.id]) for s in members]
+        if not member_candidate_sets or any(candidate_set != member_candidate_sets[0] for candidate_set in member_candidate_sets):
+            continue
+        complete_candidates = member_candidate_sets[0]
+        if len(complete_candidates) != len(members) or len(complete_candidates) < 2:
+            continue
+        if any(_remaining(cid) != cohort_amount for cid in complete_candidates):
+            continue
+
+        candidate_contracts = [contract_by_id[cid] for cid in complete_candidates]
+        contract_identities = [(c.contract_no, c.counterparty) for c in candidate_contracts]
+        if any(not no or not counterparty for no, counterparty in contract_identities):
+            continue
+        if len(set(contract_identities)) != len(contract_identities):
+            continue
+        # Contract-level state affected by a full allocation must already be
+        # equivalent. Identity is deliberately excluded: choosing its stable
+        # ordering is the canonical representation this rule exists to make.
+        contract_states = {
+            (c.contract_type, c.buyer, c.gross_amount, c.currency, c.contract_date)
+            for c in candidate_contracts
+        }
+        if len(contract_states) != 1:
+            continue
+
+        subject_identities = [get_subject_canonical_identity(s) for s in members]
+        if any(identity is None for identity in subject_identities) or len(set(subject_identities)) != len(subject_identities):
+            continue
+        ordered_subjects = sorted(zip(subject_identities, members), key=lambda pair: pair[0])
+        ordered_contracts = sorted(candidate_contracts, key=lambda c: (c.contract_no, c.counterparty))
+        equivalent_canonical_contract_by_subject.update(
+            (subject.id, contract.id)
+            for (_, subject), contract in zip(ordered_subjects, ordered_contracts, strict=True)
+        )
 
     # Pass 2: process unresolved subjects in business chronological order.
     # Chronology is only ever REQUIRED to choose between more than one valid
@@ -353,7 +412,10 @@ def _run_match_pass(
             summary.subject_ids.append(subject.id)
             continue
 
-        if subject.id in blocked_subject_ids:
+        equivalent_canonical = subject.id in equivalent_canonical_contract_by_subject
+        if equivalent_canonical:
+            chosen_contract_id = equivalent_canonical_contract_by_subject[subject.id]
+        elif subject.id in blocked_subject_ids:
             # This subject's cohort has 2+ unresolved competing members and
             # an undefined chronological order this run (see the cohort
             # snapshot above) — never let it fall through to the dynamic
@@ -477,11 +539,12 @@ def _run_match_pass(
         remaining_capacity[chosen_contract_id] -= amount
         # A multi-candidate decision is chronological allocation, never
         # mislabelled as a unique-candidate decision.
-        match_method = (
-            AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL
-            if len(candidates) > 1
-            else AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE
-        )
+        if equivalent_canonical:
+            match_method = AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL
+        elif len(candidates) > 1:
+            match_method = AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL
+        else:
+            match_method = AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_UNIQUE
         match_case_repo.add(
             MatchCase(
                 id=match_case_id,
@@ -566,6 +629,7 @@ def match_invoices(session: Session) -> MatchRunSummary:
         get_amount=lambda inv: inv.gross_amount,
         get_counterparty=lambda inv: inv.seller,
         get_subject_date=lambda inv: inv.issue_date,
+        get_subject_canonical_identity=_invoice_canonical_identity,
         contracts=contracts,
         match_case_repo=match_case_repo,
         candidate_repo=candidate_repo,
@@ -628,6 +692,7 @@ def match_payments(session: Session) -> MatchRunSummary:
         get_amount=lambda p: p.amount,
         get_counterparty=lambda p: p.counterparty,
         get_subject_date=lambda p: p.transaction_date,
+        get_subject_canonical_identity=_payment_canonical_identity,
         contracts=contracts,
         match_case_repo=match_case_repo,
         candidate_repo=candidate_repo,

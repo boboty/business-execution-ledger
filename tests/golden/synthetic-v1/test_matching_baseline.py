@@ -13,6 +13,7 @@ from bel.application.import_contract_ledger import import_contract_ledger
 from bel.application.import_invoices import import_invoices
 from bel.application.matching import match_invoices, match_payments
 from bel.domain.invoice import InvoiceDirection
+from bel.domain.matching import AllocationMatchMethod
 from bel.infrastructure.persistence.models import (
     InvoiceAllocationModel,
     MatchCaseModel,
@@ -56,9 +57,18 @@ def test_synthetic_matching_run_matches_baseline(
     assert invoice_match_case_count == inv_baseline["eligible_total"]
     assert payment_match_case_count == pay_baseline["eligible_total"]
 
-    # Ambiguous-amount subjects must never get an allocation.
-    ambiguous_amounts = {Decimal(a) for a in baseline["ambiguous_amount_clusters"]}
-    invoice_allocation_amounts = {a.allocated_gross_amount for a in db_session.query(InvoiceAllocationModel).all()}
-    payment_allocation_amounts = {a.allocated_amount for a in db_session.query(PaymentAllocationModel).all()}
-    assert ambiguous_amounts.isdisjoint(invoice_allocation_amounts)
-    assert ambiguous_amounts.isdisjoint(payment_allocation_amounts)
+    # The independently synthetic complete 2x2 cohorts now exercise the
+    # equivalent-permutation convention, never the chronological method.
+    equivalent_amounts = {Decimal(a) for a in baseline["equivalent_canonical_amount_clusters"]}
+    invoice_methods = {
+        a.match_method for a in db_session.query(InvoiceAllocationModel).all()
+        if a.allocated_gross_amount in equivalent_amounts
+    }
+    expected_method = AllocationMatchMethod.EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL
+    assert invoice_methods == {expected_method}
+    # This older synthetic PDF intentionally lacks a complete Payment
+    # business identity, so its analogous cohort remains HCR.
+    assert not {
+        a.match_method for a in db_session.query(PaymentAllocationModel).all()
+        if a.allocated_amount in equivalent_amounts
+    }

@@ -12,14 +12,15 @@ Scenario map (see tests/golden/synthetic-v1/):
     counterparties -> BusinessKeyConflict), one missing 外销合同编码.
   Invoices: 6 groups / 7 item rows. Supplier Alpha is a 2-item invoice
     (unique match). Supplier Zeta appears on two separate invoices at
-    the same amount as two same-amount contracts (ambiguous match x2).
+    the same amount as two same-amount contracts (complete equivalent
+    permutation cohort x2).
     Supplier Eta has one normal invoice (unique match) and one
     negative/red invoice at an amount no contract has (unmatched).
     "UnrelatedServicesCo" is not a party to any contract (out of
     scope).
   Payments (bank statement): 7 OUT transactions. Supplier Beta/Delta/
-    Gamma are unique matches; Supplier Zeta appears twice at the
-    ambiguous amount; "UnrelatedLogisticsCo" is out of scope;
+    Gamma are unique matches; Supplier Zeta appears twice in the complete
+    equivalent-permutation cohort; "UnrelatedLogisticsCo" is out of scope;
     Supplier Eta's payment amount matches no contract (unmatched).
 """
 
@@ -52,10 +53,10 @@ INVOICE_ROWS = [
      "Widget A", None, "件", 8, "100.00", 800.00, None, None, 800.00, "正常", 1250.00, 0, 1250.00],
     [None, None, None, None, None, None, None,
      "Widget A Accessory", None, "件", 5, "90.00", 450.00, None, None, 450.00, None, None, None, None],
-    # Invoice 2: Supplier Zeta, ambiguous (two contracts at 1580.00)
+    # Invoice 2: Supplier Zeta, complete equivalent 2x2 cohort
     ["Tmpl", " ", "数电票（普通发票）", "2026-07-06", None, "DIGITAL-SYN-002", "SupplierZeta",
      "Product Z", None, "件", 10, "158.00", 1580.00, None, None, 1580.00, "正常", 1580.00, 0, 1580.00],
-    # Invoice 3: Supplier Zeta, second invoice at the same ambiguous amount
+    # Invoice 3: Supplier Zeta, second subject in the equivalent cohort
     ["Tmpl", " ", "数电票（普通发票）", "2026-07-07", None, "DIGITAL-SYN-003", "SupplierZeta",
      "Product Z", None, "件", 10, "158.00", 1580.00, None, None, 1580.00, "正常", 1580.00, 0, 1580.00],
     # Invoice 4: Supplier Eta, unique match to PO-SYN-007 (990.25)

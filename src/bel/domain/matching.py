@@ -122,10 +122,17 @@ class AllocationMatchMethod:
     counterparty + same amount), and BEL allocated it deterministically to
     the earliest candidate with sufficient remaining capacity. It is NOT a
     unique-candidate decision, so it is never mislabelled as
-    ``..._UNIQUE``."""
+    ``..._UNIQUE``.
+
+    ``EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL`` — a complete
+    one-to-one cohort whose every legal pairing has the same authoritative
+    business effect.  Stable business identities choose one canonical
+    representation; they do not assert historical chronology or a
+    source-proven edge."""
 
     EXACT_COUNTERPARTY_AMOUNT_UNIQUE = "EXACT_COUNTERPARTY_AMOUNT_UNIQUE"
     EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL = "EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL"
+    EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL = "EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL"
 
 
 class ConfirmationType:

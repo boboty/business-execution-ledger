@@ -206,7 +206,22 @@ New frozen procurement rule — *explicit, then chronological, then human*:
    that exact one-to-one historical relationship. Once a Contract's
    capacity is consumed, the next chronological subject naturally advances
    to the next chronological available Contract.
-3. **Human review only when the deterministic rule cannot resolve** — e.g.
+3. **Equivalent-permutation canonicalization.** If chronology is unavailable,
+   BEL may still auto-confirm a whole unresolved cohort only when the
+   pre-cohort snapshot proves a complete one-to-one graph: every subject has
+   the same complete viable Contract set, subject and Contract counts match,
+   every Contract has exactly one subject's required capacity, stable business
+   identities are complete and unique, no prior decision distinguishes an
+   edge, and the affected Contract-level state is otherwise identical. BEL
+   then pairs stable subject and Contract business identities positionally and
+   records `EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL`.
+
+   This is a deterministic canonical representation only. **Canonical pairing
+   is not historical chronology and is not source proof of the particular
+   one-to-one edge.** Contract numbers, row/import order, UUIDs, timestamps and
+   source position remain forbidden substitutes for missing business dates.
+
+4. **Human review only when the deterministic rule cannot resolve** — e.g.
    no candidate has sufficient remaining capacity (the existing
    `HUMAN_CONFIRMATION_REQUIRED` + `ALLOCATION_CAPACITY_EXCEEDED`
    protection path, never a silent over-allocation), zero valid Contract
