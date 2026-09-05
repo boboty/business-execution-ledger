@@ -150,6 +150,20 @@ Existing R5 security is never weakened.
 
 ## 5. Required cutover inputs
 
+输入校验补充：Gate 解析计划并调用现有 `validate_plan` 检查结构，但不执行
+计划，也不据此认定回填已经完成。基线必须是包含显式 `entries` 列表的对象；
+每项具有非空字符串键和对象类型的 `expected`。合法的空列表仍允许表达空
+范围，`{}`、错误类型或畸形 JSON 不再当作空基线接受。结构合法不等于业务
+已确认；后者仍由独立业务验收材料负责。
+
+私有报告记录本次描述符读取所得计划和基线字节的 SHA-256，并共享正式对账
+的原因码、预期值、实际值和不同字段。报告不是新的事实来源，也不能复制成
+基线；散列只标识读取的控制输入，不证明所有来源或业务签署。
+
+覆盖边界：当前正式对账比较合同执行事实层；月结、开票准备和异常中心的
+可运行、可导出验证不等于对所有业务结论进行了独立对账。业务切换接受必须
+明确这些结论的复核范围。参见 [项目再评估](PROJECT-REASSESSMENT.md)。
+
 For the selected period the Gate requires at least:
 
 - `<period>/backfill-plan.json`

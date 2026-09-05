@@ -123,3 +123,18 @@ def test_cutover_reconcile_missing_private_root_is_a_clean_error(tmp_path):
     result = _run_bel(db_path, nonexistent_root, "cutover", "reconcile", "--period", "2026-01")
     assert result.returncode != 0
     assert "does not resolve" in (result.stdout + result.stderr)
+
+
+def test_cutover_reconcile_malformed_json_is_private_failure(tmp_path):
+    db_path = tmp_path / 'bel.db'
+    _upgrade_head(db_path)
+    root = tmp_path / 'private'
+    expected = root / '2026-01' / 'expected'
+    expected.mkdir(parents=True)
+    (expected / 'cutover-baseline.json').write_text('{SYNTHETIC_SENSITIVE_MARKER')
+    result = _run_bel(db_path, root, 'cutover', 'reconcile', '--period', '2026-01')
+    assert result.returncode != 0
+    assert result.stdout.strip() == 'P2D_CUTOVER_RECONCILIATION: FAIL'
+    assert result.stderr == ''
+    assert 'SYNTHETIC_SENSITIVE_MARKER' not in result.stdout
+    assert (root / 'reports' / 'cutover-reconciliation-2026-01.json').is_file()

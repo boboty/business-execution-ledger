@@ -73,7 +73,8 @@ from bel.application.contract_ledger_export import (
     export_contract_business_ledger_csv,
     export_contract_business_ledger_xlsx,
 )
-from bel.application.cutover_reconciliation import reconcile
+from bel.application.cutover_plan import CutoverPlanError, validate_plan
+from bel.application.cutover_reconciliation import CutoverBaselineError, reconcile, reconciliation_diagnostics, validate_baseline
 from bel.application.exception_task_data_product import (
     build_exception_task_data_product,
     export_exception_task_csv,
@@ -143,6 +144,8 @@ REASON_PRIVATE_INPUT_ESCAPE = REASON_INPUT_ESCAPE
 REASON_PRIVATE_INPUT_UNSAFE_TYPE = REASON_INPUT_UNSAFE_TYPE
 REASON_PRIVATE_INPUT_TOO_LARGE = REASON_INPUT_TOO_LARGE
 REASON_BASELINE_PARSE = "BASELINE_PARSE_ERROR"
+REASON_BASELINE_INVALID = "BASELINE_INVALID"
+REASON_BACKFILL_PLAN_INVALID = "BACKFILL_PLAN_INVALID"
 REASON_RECONCILIATION_UNRESOLVED = "RECONCILIATION_UNRESOLVED"
 REASON_RECONCILIATION_ERROR = "RECONCILIATION_ERROR"
 REASON_SURFACE_ERROR = "SURFACE_ERROR"
@@ -626,13 +629,20 @@ def _run_gate_impl(
             baseline_bytes: bytes | None = None
 
             try:
-                reader.read("backfill-plan.json")
+                plan_bytes = reader.read("backfill-plan.json")
             except PrivateRootError as exc:
                 cutover_inputs_diag["backfill_plan"] = _classify_input(exc)
                 dims[DIM_CUTOVER_INPUTS] = FAIL
                 reasons.append(_input_reason(exc, REASON_BACKFILL_PLAN_MISSING))
             else:
                 cutover_inputs_diag["backfill_plan"] = "present"
+                cutover_inputs_diag["backfill_plan_sha256"] = hashlib.sha256(plan_bytes).hexdigest()
+                try:
+                    validate_plan(json.loads(plan_bytes.decode("utf-8")))
+                except (json.JSONDecodeError, UnicodeDecodeError, CutoverPlanError):
+                    dims[DIM_CUTOVER_INPUTS] = FAIL
+                    reasons.append(REASON_BACKFILL_PLAN_INVALID)
+                    cutover_inputs_diag["backfill_plan"] = "invalid"
 
             try:
                 baseline_bytes = reader.read("expected/cutover-baseline.json")
@@ -642,6 +652,17 @@ def _run_gate_impl(
                 reasons.append(_input_reason(exc, REASON_BASELINE_MISSING))
             else:
                 cutover_inputs_diag["cutover_baseline"] = "present"
+                cutover_inputs_diag["cutover_baseline_sha256"] = hashlib.sha256(baseline_bytes).hexdigest()
+                try:
+                    validate_baseline(json.loads(baseline_bytes.decode("utf-8")))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    dims[DIM_CUTOVER_INPUTS] = FAIL
+                    reasons.append(REASON_BASELINE_PARSE)
+                    cutover_inputs_diag["cutover_baseline"] = "invalid"
+                except CutoverBaselineError:
+                    dims[DIM_CUTOVER_INPUTS] = FAIL
+                    reasons.append(REASON_BASELINE_INVALID)
+                    cutover_inputs_diag["cutover_baseline"] = "invalid"
 
             diagnostics["cutover_inputs"] = cutover_inputs_diag
 
@@ -675,16 +696,7 @@ def _run_gate_impl(
                         diagnostics["reconciliation_error"] = str(exc)
                     else:
                         diagnostics["reconciliation"] = {
-                            "unresolved_count": reconciliation.unresolved_count,
-                            "passed": reconciliation.passed,
-                            "entries": [
-                                {
-                                    "key": e.key,
-                                    "outcome": e.outcome,
-                                    "baseline_outcome": e.baseline_outcome,
-                                }
-                                for e in reconciliation.entries
-                            ],
+                            **reconciliation_diagnostics(reconciliation),
                             "open_backfill_task_keys": [
                                 e.key
                                 for e in reconciliation.entries

@@ -199,3 +199,20 @@ def test_source_path_resolving_into_expected_via_symlink_is_rejected(db_session,
     with pytest.raises(CutoverPlanExpectedPath):
         run_backfill_plan(db_session, plan, period_dir=period_dir, created_at=NOW)
     assert ContractRepository(db_session).list_all() == []
+
+
+def test_malformed_late_section_is_rejected_before_backfill(monkeypatch, db_session, tmp_path):
+    from datetime import datetime, timezone
+    from bel.application import cutover_plan
+    calls = []
+    (tmp_path / 'contracts.xlsx').write_bytes(b'')
+
+    def backfill(*args, **kwargs):
+        calls.append(True)
+        return cutover_plan.BackfillOutcome()
+
+    monkeypatch.setattr(cutover_plan, 'backfill_contracts', backfill)
+    plan = {'version': 1, 'contracts': {'path': 'contracts.xlsx'}, 'payments': [None]}
+    with pytest.raises(cutover_plan.CutoverPlanError):
+        cutover_plan.run_backfill_plan(db_session, plan, period_dir=tmp_path, created_at=datetime.now(timezone.utc))
+    assert calls == []

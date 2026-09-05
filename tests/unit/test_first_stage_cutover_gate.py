@@ -653,7 +653,7 @@ def test_input_real_files_inside_period_are_accepted(db_session, gate_root):
     contract = _prepare_contract_and_real_inputs(db_session, gate_root)
     result = _run(db_session, gate_root)
     assert result.passed
-    assert result.diagnostics["cutover_inputs"] == {
+    assert {k: result.diagnostics["cutover_inputs"][k] for k in ("backfill_plan", "cutover_baseline")} == {
         "backfill_plan": "present", "cutover_baseline": "present",
     }
 
@@ -939,3 +939,50 @@ def test_gate_reports_non_canonical_driver_reason(db_session, gate_root):
     assert not result.passed
     assert result.runtime_schema == FAIL
     assert REASON_NON_CANONICAL_DATABASE_DRIVER in result.reason_codes
+
+
+@pytest.mark.parametrize('document,reason', [
+    ('{}', 'BASELINE_INVALID'), ('[]', 'BASELINE_INVALID'),
+    ('{"entries": null}', 'BASELINE_INVALID'), ('{invalid', 'BASELINE_PARSE_ERROR'),
+])
+def test_invalid_baseline_is_an_input_failure(db_session, gate_root, document, reason):
+    path = gate_root / '2026-01' / 'expected' / 'cutover-baseline.json'
+    path.write_text(document)
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert result.cutover_inputs == FAIL
+    assert result.reconciliation == FAIL
+    assert reason in result.reason_codes
+    assert result.read_only == PASS
+
+
+@pytest.mark.parametrize('document', ['not json', '[]', '{"version": true}',
+    '{"contracts": {}}', '{"invoices": {}}', '{"payments": [null]}'])
+def test_invalid_plan_cannot_pass_gate(db_session, gate_root, document):
+    (gate_root / '2026-01' / 'backfill-plan.json').write_text(document)
+    _write_baseline(gate_root / '2026-01', [])
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    assert result.cutover_inputs == FAIL
+    assert 'BACKFILL_PLAN_INVALID' in result.reason_codes
+
+
+def test_private_report_binds_inputs_and_explains_discrepancies(db_session, gate_root):
+    import hashlib
+    contract = _make_contract(db_session)
+    entries = _contract_entries(contract)
+    entries[0]['expected']['buyer'] = 'ExpectedReviewBuyer'
+    _write_baseline(gate_root / '2026-01', entries)
+    before = _schema_fingerprint(db_session)
+    result = _run(db_session, gate_root)
+    assert not result.passed
+    report = json.loads((gate_root / 'reports' / 'first-stage-cutover-gate-2026-01.json').read_text())
+    for field, path in [('backfill_plan', 'backfill-plan.json'),
+                        ('cutover_baseline', 'expected/cutover-baseline.json')]:
+        assert report['cutover_inputs'][field + '_sha256'] == hashlib.sha256(
+            (gate_root / '2026-01' / path).read_bytes()).hexdigest()
+    difference = next(e for e in report['reconciliation']['entries'] if e['reason_code'] == 'VALUE_MISMATCH')
+    assert difference['differing_fields'] == ['buyer']
+    assert difference['expected']['buyer'] == 'ExpectedReviewBuyer'
+    assert difference['actual']['buyer'] == contract.buyer
+    assert _schema_fingerprint(db_session) == before

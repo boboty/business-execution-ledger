@@ -153,8 +153,26 @@ def validate_plan(plan: dict[str, Any]) -> None:
     unknown = sorted(set(plan.keys()) - set(CLOSED_PLAN_SECTIONS))
     if unknown:
         raise CutoverPlanError(f"backfill plan contains unrecognised section(s): {unknown}")
-    if plan.get("version") not in (None, PLAN_VERSION):
+    if "version" in plan and (type(plan["version"]) is not int or plan["version"] != PLAN_VERSION):
         raise CutoverPlanError(f"unsupported backfill plan version: {plan.get('version')!r}")
+    for section in ("contracts", "cutover_fact_pack", "invoices", "payments"):
+        if section not in plan:
+            continue
+        entries = plan[section]
+        if section in ("contracts", "cutover_fact_pack"):
+            entries = [entries]
+        elif not isinstance(entries, list):
+            raise CutoverPlanError("backfill source sections must be lists")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not entry["path"].strip():
+                raise CutoverPlanError("backfill entries require a non-empty path")
+            if section == "invoices" and entry.get("direction") not in ("PURCHASE", "SALES"):
+                raise CutoverPlanError("invoice direction must be PURCHASE or SALES")
+            if section == "payments":
+                if set(entry) - _PAYMENT_ENTRY_KEYS:
+                    raise CutoverPlanError("payment entry contains unrecognised keys")
+                if "scope_decisions" in entry and not isinstance(entry["scope_decisions"], str):
+                    raise CutoverPlanError("payment scope_decisions must be a string path")
 
 
 def _outcome_to_dict(outcome: BackfillOutcome) -> dict[str, Any]:

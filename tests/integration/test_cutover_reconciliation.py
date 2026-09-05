@@ -637,3 +637,38 @@ def test_baseline_key_prefixed_unresolved_is_never_silently_skipped(db_session):
     result = reconcile(db_session, {"entries": entries})
     assert not result.passed
     assert any(e.key == "unresolved:smuggled:1" and e.outcome == OUTCOME_UNRESOLVED for e in result.entries)
+
+
+@pytest.mark.parametrize('baseline', [None, [], {}, {'entries': None}, {'entries': {}},
+    {'entries': [None]}, {'entries': [{'key': [], 'expected': {}}]},
+    {'entries': [{'key': '', 'expected': {}}]}, {'entries': [{'key': 'x'}]},
+    {'entries': [{'key': 'x', 'expected': [], 'outcome': 'MATCH'}]}])
+def test_malformed_baseline_never_passes_empty_database(db_session, baseline):
+    from bel.application.cutover_reconciliation import CutoverBaselineError
+    with pytest.raises(CutoverBaselineError):
+        reconcile(db_session, baseline)
+
+
+def test_explicit_empty_baseline_remains_valid(db_session):
+    assert reconcile(db_session, {'entries': []}).passed
+
+
+def test_review_differences_use_canonical_comparison_and_stable_order(db_session):
+    from bel.application.cutover_reconciliation import reconciliation_diagnostics
+    contract = _make_contract(db_session, gross_amount=Decimal('83.00'))
+    entries = _contract_entries(contract, OUTCOME_MATCH)
+    entries[0]['expected']['gross_amount'] = '83.000'  # equivalent, not a difference
+    entries[0]['expected']['buyer'] = 'IndependentExpectedBuyer'
+    entries.append({'key': 'contract:missing', 'expected': {}, 'outcome': 'MATCH'})
+    result = reconcile(db_session, {'entries': entries})
+    changed = next(e for e in result.entries if e.key == _contract_key(contract))
+    assert changed.reason_code == 'VALUE_MISMATCH'
+    assert changed.differing_fields == ('buyer',)
+    assert changed.expected['buyer'] == 'IndependentExpectedBuyer'
+    assert changed.actual['buyer'] == contract.buyer
+    assert next(e for e in result.entries if e.key == 'contract:missing').reason_code == 'MISSING_ACTUAL'
+    assert reconciliation_diagnostics(result) == reconciliation_diagnostics(
+        reconcile(db_session, {'entries': list(reversed(entries))}))
+    extra = reconcile(db_session, {'entries': []})
+    assert all(e.reason_code == 'MISSING_BASELINE_ENTRY' for e in extra.entries)
+    assert all(e.actual is not None and e.expected is None for e in extra.entries)

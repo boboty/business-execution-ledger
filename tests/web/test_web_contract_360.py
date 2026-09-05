@@ -342,3 +342,29 @@ def test_contract360_item_allocation_is_scoped_to_own_contract(tmp_path):
     assert "已确认到合同商品" in page_b, "Contract B must show line 1 as linked to a real contract item"
     assert "请选择合同商品" not in page_b, "Contract B must NOT offer the allocation form"
     assert "尚未归属本合同范围" not in page_b
+
+
+def test_chronological_basis_is_explained_on_invoice_and_payment(web_client, web_ctx, contract_id_by_no):
+    from uuid import UUID
+    from sqlalchemy import update
+    from bel.infrastructure.persistence.models import InvoiceAllocationModel, PaymentAllocationModel
+    contract_id = contract_id_by_no['PO-CLOSE-001']
+    method = 'EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL'
+    with web_ctx.app.state.session_factory() as session:
+        for model in (InvoiceAllocationModel, PaymentAllocationModel):
+            session.execute(update(model).where(model.contract_id == UUID(contract_id)).values(match_method=method))
+        session.commit()
+    html = web_client.get(f'/contracts/{contract_id}?period={CLOSE_PERIOD_FIXTURE}').text
+    assert html.count('按时间顺序分配（确定性约定，非来源逐笔证明）') >= 2
+    assert method in html
+    # The review Data Product must retain the same distinction after Excel export.
+    from bel.application.contract_business_ledger import get_contract_business_ledger
+    from bel.application.contract_ledger_export import export_contract_business_ledger_csv, export_contract_business_ledger_xlsx
+    from openpyxl import load_workbook
+    from io import BytesIO
+    with web_ctx.app.state.session_factory() as session:
+        ledger = get_contract_business_ledger(session)
+        assert export_contract_business_ledger_csv(ledger).decode('utf-8-sig').count(method) >= 2
+        workbook = load_workbook(BytesIO(export_contract_business_ledger_xlsx(ledger)))
+        cells = [str(cell.value) for sheet in workbook for row in sheet for cell in row]
+        assert sum(method in cell for cell in cells) >= 2

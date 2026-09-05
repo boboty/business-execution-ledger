@@ -2135,18 +2135,16 @@ def cutover_reconcile_cmd(ctx: click.Context, period: str) -> None:
     stdout is the safe scenario verdict line only — no unresolved_count,
     no business identities. Full diagnostics go ONLY to
     ``$BEL_PRIVATE_DATA_ROOT/reports/`` (gate-fix section 5, HARD)."""
-    from bel.application.cutover_reconciliation import reconcile
+    from bel.application.cutover_reconciliation import reconcile, reconciliation_diagnostics
+    from bel.infrastructure.private_paths import PrivatePeriodReader
 
     period_dir = _resolve_cutover_period_dir(period)
-    baseline_path = period_dir / "expected" / "cutover-baseline.json"
-    if not baseline_path.exists():
-        raise click.ClickException(f"expected/cutover-baseline.json not found under {period_dir}")
-
     import json
 
-    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     session_factory = _session_factory(ctx.obj["database_url"])
     try:
+        with PrivatePeriodReader.open(period_dir.parent, period) as reader:
+            baseline = json.loads(reader.read("expected/cutover-baseline.json").decode("utf-8"))
         with session_factory() as session:
             result = reconcile(session, baseline)
     except Exception as exc:  # noqa: BLE001 — stdout must stay safe even on failure
@@ -2156,12 +2154,7 @@ def cutover_reconcile_cmd(ctx: click.Context, period: str) -> None:
 
     _write_cutover_report(
         period_dir, f"cutover-reconciliation-{period}.json",
-        {
-            "unresolved_count": result.unresolved_count,
-            "entries": [
-                {"key": e.key, "outcome": e.outcome, "baseline_outcome": e.baseline_outcome} for e in result.entries
-            ],
-        },
+        reconciliation_diagnostics(result),
     )
     click.echo(f"P2D_CUTOVER_RECONCILIATION: {'PASS' if result.passed else 'FAIL'}")
 

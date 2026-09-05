@@ -1,5 +1,10 @@
 # Roadmap
 
+当前阶段顺序以 [项目再评估](docs/PROJECT-REASSESSMENT.md) 为准：先完成
+可复核的第一阶段切换验收闭环，再推进最小 Application Tool Contract。
+驾驶舱是按业务使用需要安排的可选投影，不是 Agent 接入的前置条件。
+下文的阶段记录保留历史上下文；功能完成不代表业务已经接受切换。
+
 Business Execution Ledger (BEL) is being built as a deterministic
 business execution layer for agentic systems. The roadmap is
 intentionally capability-driven rather than feature-volume-driven: each
@@ -357,8 +362,8 @@ declaration. A Gate PASS means BEL MAY be declared System of Record; the
 declaration is a separate human/business acceptance step after the REAL
 private Gate PASS.
 
-**Passing this gate is what makes BEL the System of Record and demotes
-the legacy Excel to a read-only reference / Data Product.**
+**Gate PASS 是技术就绪判断；只有后续业务负责人的明确接受与宣告，才能使
+BEL 成为 System of Record，并将旧 Excel 降为参考资料 / Data Product。**
 
 ## Post first-stage — Business Cockpit
 

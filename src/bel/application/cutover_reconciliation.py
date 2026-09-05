@@ -73,7 +73,7 @@ deduped, so a genuine collision still fails the Gate unconditionally:
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -139,6 +139,10 @@ class ReconciliationEntry:
     key: str
     outcome: str
     baseline_outcome: str | None = None
+    reason_code: str | None = None
+    expected: dict[str, Any] | None = None
+    actual: dict[str, Any] | None = None
+    differing_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -146,6 +150,39 @@ class ReconciliationResult:
     entries: tuple[ReconciliationEntry, ...]
     unresolved_count: int
     passed: bool
+
+
+class CutoverBaselineError(ValueError):
+    """Malformed acceptance material; never interpreted as an empty baseline."""
+
+
+def validate_baseline(baseline: Any) -> None:
+    """Validate structure, not business approval or the truth of expected values.
+
+    An explicit empty entries list is legal. Duplicate keys and unadjudicated
+    outcomes remain reconciliation findings under the existing rules.
+    Error messages contain no source values.
+    """
+    if not isinstance(baseline, dict) or not isinstance(baseline.get("entries"), list):
+        raise CutoverBaselineError("baseline must be an object with an explicit entries list")
+    for entry in baseline["entries"]:
+        if not isinstance(entry, dict):
+            raise CutoverBaselineError("baseline entries must be objects")
+        if not isinstance(entry.get("key"), str) or not entry["key"].strip():
+            raise CutoverBaselineError("baseline entry key must be a non-empty string")
+        if not isinstance(entry.get("expected"), dict):
+            raise CutoverBaselineError("baseline entry expected must be an object")
+        if "outcome" in entry and not isinstance(entry["outcome"], str):
+            raise CutoverBaselineError("baseline entry outcome must be a string")
+
+
+def reconciliation_diagnostics(result: ReconciliationResult) -> dict[str, Any]:
+    """Private report only. Never a baseline/Fact input or public CLI output."""
+    return {
+        "unresolved_count": result.unresolved_count,
+        "passed": result.passed,
+        "entries": [asdict(entry) for entry in result.entries],
+    }
 
 
 def _normalize_decimal(value: Any) -> Any:
@@ -433,8 +470,9 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
     Out-of-scope keys (section 34) never enter ``build_contract_execution_snapshot``
     in the first place, so there is nothing to special-case here — the
     snapshot's own key set already IS the in-scope set."""
+    validate_baseline(baseline)
     actual = build_contract_execution_snapshot(session)
-    raw_entries = baseline.get("entries", [])
+    raw_entries = baseline["entries"]
 
     results: list[ReconciliationEntry] = []
     unresolved = 0
@@ -448,7 +486,10 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
     key_counts = Counter(e["key"] for e in raw_entries)
     duplicate_keys = {key for key, count in key_counts.items() if count > 1}
     for key in sorted(duplicate_keys):
-        results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=None))
+        results.append(ReconciliationEntry(
+            key=key, outcome=OUTCOME_UNRESOLVED, reason_code="DUPLICATE_BASELINE_KEY",
+            actual=actual.get(key),
+        ))
         unresolved += 1
 
     baseline_entries = {e["key"]: e for e in raw_entries if e["key"] not in duplicate_keys}
@@ -456,7 +497,10 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
     resolvable_actual_keys: set[str] = set()
     for key in actual:
         if key.startswith(_UNRESOLVED_PREFIX):
-            results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=None))
+            results.append(ReconciliationEntry(
+                key=key, outcome=OUTCOME_UNRESOLVED, reason_code="UNRESOLVED_SOURCE",
+                actual=actual[key],
+            ))
             unresolved += 1
         else:
             resolvable_actual_keys.add(key)
@@ -467,25 +511,44 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
             # dropped either. A baseline naming one is itself an
             # unadjudicated discrepancy.
             results.append(
-                ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=entry.get("outcome"))
+                ReconciliationEntry(
+                    key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=entry.get("outcome"),
+                    reason_code="UNADJUDICATABLE_KEY", expected=entry["expected"], actual=actual.get(key),
+                )
             )
             unresolved += 1
             continue
         recorded_outcome = entry.get("outcome")
         actual_value = actual.get(key)
         if recorded_outcome not in _RECORDABLE_BASELINE_OUTCOMES:
-            results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=recorded_outcome))
+            results.append(ReconciliationEntry(
+                key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=recorded_outcome,
+                reason_code="UNADJUDICATED_OUTCOME", expected=entry["expected"], actual=actual_value,
+            ))
             unresolved += 1
             continue
         if actual_value is None:
             # expected an in-scope Fact that BEL's current state does not have.
-            results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=recorded_outcome))
+            results.append(ReconciliationEntry(
+                key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=recorded_outcome,
+                reason_code="MISSING_ACTUAL", expected=entry["expected"],
+            ))
             unresolved += 1
             continue
         if _normalize(actual_value) == _normalize(entry.get("expected")):
             results.append(ReconciliationEntry(key=key, outcome=recorded_outcome, baseline_outcome=recorded_outcome))
         else:
-            results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=recorded_outcome))
+            expected = entry["expected"]
+            differing_fields = tuple(sorted(
+                field for field in actual_value.keys() | expected.keys()
+                if field not in actual_value or field not in expected
+                or _normalize_value(field, actual_value[field]) != _normalize_value(field, expected[field])
+            ))
+            results.append(ReconciliationEntry(
+                key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=recorded_outcome,
+                reason_code="VALUE_MISMATCH", expected=expected, actual=actual_value,
+                differing_fields=differing_fields,
+            ))
             unresolved += 1
 
     for key in resolvable_actual_keys:
@@ -493,7 +556,12 @@ def reconcile(session: Session, baseline: dict[str, Any]) -> ReconciliationResul
             continue  # already reported once, above — never double-counted
         if key not in baseline_entries:
             # BEL holds an in-scope Fact the baseline never adjudicated.
-            results.append(ReconciliationEntry(key=key, outcome=OUTCOME_UNRESOLVED, baseline_outcome=None))
+            results.append(ReconciliationEntry(
+                key=key, outcome=OUTCOME_UNRESOLVED, reason_code="MISSING_BASELINE_ENTRY", actual=actual[key],
+            ))
             unresolved += 1
 
-    return ReconciliationResult(entries=tuple(results), unresolved_count=unresolved, passed=unresolved == 0)
+    return ReconciliationResult(
+        entries=tuple(sorted(results, key=lambda e: (e.key, e.reason_code or ""))),
+        unresolved_count=unresolved, passed=unresolved == 0,
+    )

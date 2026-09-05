@@ -99,6 +99,7 @@ def _procurement_invoice_json(entry) -> dict:
         "invoice_external_key": entry.invoice.external_invoice_key if entry.invoice else None,
         "allocated_gross_amount": _decimal_json(entry.allocation.allocated_gross_amount),
         "confirmation_type": entry.allocation.confirmation_type,
+        "match_method": entry.allocation.match_method,
     }
 
 
@@ -107,6 +108,7 @@ def _outgoing_payment_json(entry) -> dict:
         "bank_reference": entry.payment.bank_reference if entry.payment else None,
         "allocated_amount": _decimal_json(entry.allocation.allocated_amount),
         "confirmation_type": entry.allocation.confirmation_type,
+        "match_method": entry.allocation.match_method,
     }
 
 
