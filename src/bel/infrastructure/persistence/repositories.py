@@ -445,6 +445,12 @@ class EvidenceRepository:
         )
         return _fragment_to_domain(m) if m else None
 
+    def list_fragments_for_document(self, document_id: uuid.UUID) -> list[EvidenceFragment]:
+        models = self._session.scalars(
+            select(EvidenceFragmentModel).where(EvidenceFragmentModel.evidence_document_id == document_id)
+        ).all()
+        return [_fragment_to_domain(model) for model in models]
+
 
 class ContractRepository:
     """Anchor + current-revision assembly (docs/PHASE2D1-R0-DECISIONS.md

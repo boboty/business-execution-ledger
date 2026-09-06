@@ -24,6 +24,7 @@ from bel.application.cutover_plan import (
     run_backfill_plan,
     validate_plan,
 )
+from bel.application.matching import MatchRunSummary
 from bel.infrastructure.persistence.database import make_engine, make_session_factory
 from bel.infrastructure.persistence.models import Base
 from bel.infrastructure.persistence.repositories import (
@@ -138,6 +139,58 @@ def test_end_to_end_plan_wires_full_chain(db_session, tmp_path):
     assert sales_contract.our_entity == "BuyerX"
     assert sales_contract.customer is None  # never inferred
     assert ProcurementSalesLinkRepository(db_session).get_current_link(contract.id, sales_contract.id) is not None
+
+
+def test_fact_pack_orchestration_orders_matching_between_stages(db_session, tmp_path, monkeypatch):
+    import bel.application.cutover_plan as cutover_plan
+
+    period_dir = tmp_path / "2026-01"
+    (period_dir / "facts").mkdir(parents=True)
+    (period_dir / "facts" / "pack.json").write_text(json.dumps({"version": 1}))
+    calls = []
+    original_import = cutover_plan.import_cutover_fact_pack
+
+    def recording_import(*args, **kwargs):
+        calls.append(kwargs["stage"])
+        return original_import(*args, **kwargs)
+
+    monkeypatch.setattr(cutover_plan, "import_cutover_fact_pack", recording_import)
+    monkeypatch.setattr(
+        cutover_plan, "match_invoices", lambda session: calls.append("match_invoices") or MatchRunSummary()
+    )
+    monkeypatch.setattr(
+        cutover_plan, "match_payments", lambda session: calls.append("match_payments") or MatchRunSummary()
+    )
+
+    cutover_plan.run_backfill_plan(
+        db_session, {"cutover_fact_pack": {"path": "facts/pack.json"}},
+        period_dir=period_dir, created_at=NOW,
+    )
+    assert calls == ["pre_match", "match_invoices", "match_payments", "post_match"]
+
+
+def test_matching_failure_never_runs_post_stage(db_session, tmp_path, monkeypatch):
+    import bel.application.cutover_plan as cutover_plan
+
+    period_dir = tmp_path / "2026-01"
+    (period_dir / "facts").mkdir(parents=True)
+    (period_dir / "facts" / "pack.json").write_text(json.dumps({"version": 1}))
+    stages = []
+    original_import = cutover_plan.import_cutover_fact_pack
+
+    def recording_import(*args, **kwargs):
+        stages.append(kwargs["stage"])
+        return original_import(*args, **kwargs)
+
+    monkeypatch.setattr(cutover_plan, "import_cutover_fact_pack", recording_import)
+    monkeypatch.setattr(cutover_plan, "match_invoices", lambda session: (_ for _ in ()).throw(RuntimeError("stop")))
+
+    with pytest.raises(RuntimeError, match="stop"):
+        cutover_plan.run_backfill_plan(
+            db_session, {"cutover_fact_pack": {"path": "facts/pack.json"}},
+            period_dir=period_dir, created_at=NOW,
+        )
+    assert stages == ["pre_match"]
 
 
 def test_plan_rejects_removed_entries_sections(db_session, tmp_path):

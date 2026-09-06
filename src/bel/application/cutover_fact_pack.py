@@ -91,6 +91,9 @@ ALLOWED_SECTIONS = (
     "accrual_basis_facts",
     "invoice_item_allocations",
 )
+PRE_MATCH_SECTIONS = frozenset(ALLOWED_SECTIONS[:-1])
+POST_MATCH_SECTIONS = frozenset({"invoice_item_allocations"})
+FACT_PACK_STAGES = frozenset({"all", "pre_match", "post_match"})
 
 # Named explicitly (not merely "anything not in ALLOWED_SECTIONS") so a
 # reviewer can see the forbidden list is a deliberate enumeration, not an
@@ -162,17 +165,41 @@ def validate_cutover_fact_pack(pack: dict[str, Any]) -> None:
         entries = pack.get(section, [])
         if not isinstance(entries, list):
             raise CutoverFactPackError(f"{section}: expected a list, got {type(entries).__name__}")
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise CutoverFactPackError(f"{section}[{index}]: expected a JSON object")
+    for index, entry in enumerate(pack.get("invoice_item_allocations", [])):
+        invoice_ref = entry.get("invoice")
+        if not isinstance(invoice_ref, dict) or "external_key" not in invoice_ref or "line_no" not in invoice_ref:
+            raise CutoverFactPackError(
+                f"invoice_item_allocations[{index}]: invoice.external_key and invoice.line_no are required"
+            )
+        for key in ("contract_selector", "source_item_key", "allocated_quantity", "allocated_net_amount"):
+            if key not in entry:
+                raise CutoverFactPackError(f"invoice_item_allocations[{index}]: {key} is required")
 
 
 def import_cutover_fact_pack(
-    session: Session, pack: dict[str, Any], *, file_name: str, created_at: datetime | None = None
+    session: Session,
+    pack: dict[str, Any],
+    *,
+    file_name: str,
+    created_at: datetime | None = None,
+    stage: str = "all",
 ) -> CutoverFactPackResult:
-    """Import a validated Human-Confirmed Cutover Fact Pack. Idempotent
-    on the pack's own JSON content (sha256), exactly like the Close Fact
-    Pack — a byte-identical re-run creates zero new Evidence/Facts."""
+    """Apply one dependency stage of a validated Cutover Fact Pack.
+
+    The whole pack is validated and owns one content-addressed Evidence
+    document regardless of stage. Replays reuse that document and its
+    one-per-entry fragments, then rely on each Fact's canonical identity
+    checks instead of treating an existing SHA as proof that every stage
+    completed.
+    """
     validate_cutover_fact_pack(pack)
     if pack.get("version") not in (None, PACK_VERSION):
         raise CutoverFactPackError(f"unsupported cutover fact pack version: {pack.get('version')!r}")
+    if stage not in FACT_PACK_STAGES:
+        raise CutoverFactPackError(f"unsupported cutover fact pack stage: {stage!r}")
 
     now = created_at or datetime.now(timezone.utc)
     payload = json.dumps(pack, sort_keys=True, default=str).encode("utf-8")
@@ -180,25 +207,31 @@ def import_cutover_fact_pack(
 
     evidence_repo = EvidenceRepository(session)
     existing_document = evidence_repo.find_document_by_sha256(sha256)
-    if existing_document is not None:
-        return CutoverFactPackResult(
-            evidence_document_id=existing_document.id, file_name=file_name, sha256=sha256, is_reimport=True
+    if existing_document is None:
+        document = EvidenceDocument(
+            id=uuid.uuid4(), file_name=file_name, sha256=sha256, source_type=CUTOVER_SOURCE_TYPE, imported_at=now
         )
-
-    document = EvidenceDocument(
-        id=uuid.uuid4(), file_name=file_name, sha256=sha256, source_type=CUTOVER_SOURCE_TYPE, imported_at=now
-    )
-    evidence_repo.add_document(document)
+        evidence_repo.add_document(document)
+    else:
+        document = existing_document
 
     result = CutoverFactPackResult(
-        evidence_document_id=document.id, file_name=file_name, sha256=sha256, is_reimport=False
+        evidence_document_id=document.id, file_name=file_name, sha256=sha256, is_reimport=existing_document is not None
     )
 
     entry_lists: dict[str, list[dict]] = {section: pack.get(section, []) for section in ALLOWED_SECTIONS}
 
-    fragment_ids: dict[tuple[str, int], uuid.UUID] = {}
+    fragment_ids: dict[tuple[str, int], uuid.UUID] = {
+        (fragment.locator_json["section"], int(fragment.locator_json["index"])): fragment.id
+        for fragment in evidence_repo.list_fragments_for_document(document.id)
+        if fragment.locator_json.get("cutover") is True
+        and fragment.locator_json.get("section") in ALLOWED_SECTIONS
+        and "index" in fragment.locator_json
+    }
     for section in ALLOWED_SECTIONS:
         for index, entry in enumerate(entry_lists[section]):
+            if (section, index) in fragment_ids:
+                continue
             fragment = EvidenceFragment(
                 id=uuid.uuid4(),
                 evidence_document_id=document.id,
@@ -216,11 +249,16 @@ def import_cutover_fact_pack(
     resolver = _ContractResolver(session)
     invoice_item_ids = _invoice_item_lookup(session)
     item_repo = ContractItemRepository(session)
+    active_sections = (
+        set(ALLOWED_SECTIONS)
+        if stage == "all"
+        else set(PRE_MATCH_SECTIONS if stage == "pre_match" else POST_MATCH_SECTIONS)
+    )
 
     # contract_items — routed through the SAME R1 write path as every
     # other ContractItem intake.
     contract_item_ids: dict[tuple[uuid.UUID, str], uuid.UUID] = {}
-    for index, entry in enumerate(entry_lists["contract_items"]):
+    for index, entry in enumerate(entry_lists["contract_items"] if "contract_items" in active_sections else []):
         fragment_id = fragment_ids[("contract_items", index)]
         contract = resolver.resolve(_selector_from(entry, "contract_items"), "contract_items")
         source_item_key = entry.get("source_item_key")
@@ -268,7 +306,9 @@ def import_cutover_fact_pack(
 
     # cost_recognition_facts
     cost_rec_repo = CostRecognitionFactRepository(session)
-    for index, entry in enumerate(entry_lists["cost_recognition_facts"]):
+    for index, entry in enumerate(
+        entry_lists["cost_recognition_facts"] if "cost_recognition_facts" in active_sections else []
+    ):
         fragment_id = fragment_ids[("cost_recognition_facts", index)]
         contract = resolver.resolve(_selector_from(entry, "cost_recognition_facts"), "cost_recognition_facts")
         basis = entry.get("basis")
@@ -288,7 +328,7 @@ def import_cutover_fact_pack(
 
     # accrual_basis_facts
     basis_repo = AccrualBasisFactRepository(session)
-    for index, entry in enumerate(entry_lists["accrual_basis_facts"]):
+    for index, entry in enumerate(entry_lists["accrual_basis_facts"] if "accrual_basis_facts" in active_sections else []):
         fragment_id = fragment_ids[("accrual_basis_facts", index)]
         contract = resolver.resolve(_selector_from(entry, "accrual_basis_facts"), "accrual_basis_facts")
         scope_type = entry.get("scope_type")
@@ -321,7 +361,9 @@ def import_cutover_fact_pack(
     # (see module docstring). Only the Fact itself is a permitted
     # cutover-fact type.
     hist_repo = HistoricalAccrualFactRepository(session)
-    for index, entry in enumerate(entry_lists["historical_accrual_facts"]):
+    for index, entry in enumerate(
+        entry_lists["historical_accrual_facts"] if "historical_accrual_facts" in active_sections else []
+    ):
         fragment_id = fragment_ids[("historical_accrual_facts", index)]
         contract = resolver.resolve(_selector_from(entry, "historical_accrual_facts"), "historical_accrual_facts")
         source_period = entry.get("source_period")
@@ -353,7 +395,9 @@ def import_cutover_fact_pack(
 
     # invoice_item_allocations
     alloc_repo = InvoiceItemAllocationRepository(session)
-    for index, entry in enumerate(entry_lists["invoice_item_allocations"]):
+    for index, entry in enumerate(
+        entry_lists["invoice_item_allocations"] if "invoice_item_allocations" in active_sections else []
+    ):
         fragment_id = fragment_ids[("invoice_item_allocations", index)]
         contract = resolver.resolve(_selector_from(entry, "invoice_item_allocations"), "invoice_item_allocations")
         invoice_ref = entry.get("invoice")

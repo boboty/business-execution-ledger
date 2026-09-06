@@ -60,6 +60,7 @@ from sqlalchemy.orm import Session
 
 from bel.application.cutover_backfill import BackfillOutcome, backfill_contracts, backfill_invoices, backfill_payments
 from bel.application.cutover_fact_pack import CutoverFactPackResult, import_cutover_fact_pack
+from bel.application.matching import match_invoices, match_payments
 
 PLAN_VERSION = 1
 CLOSED_PLAN_SECTIONS = (
@@ -183,6 +184,16 @@ def _outcome_to_dict(outcome: BackfillOutcome) -> dict[str, Any]:
     }
 
 
+def _merge_fact_pack_results(pre: CutoverFactPackResult, post: CutoverFactPackResult) -> dict[str, Any]:
+    merged = asdict(pre)
+    for key, value in asdict(post).items():
+        if key.endswith(("_created", "_skipped")):
+            merged[key] += value
+    merged["source_periods"] = sorted(set(pre.source_periods) | set(post.source_periods))
+    merged["is_reimport"] = pre.is_reimport
+    return merged
+
+
 def run_backfill_plan(session: Session, plan: dict[str, Any], *, period_dir: Path, created_at: datetime) -> PlanRunResult:
     """Execute one validated backfill plan. Every path section resolves
     strictly inside ``period_dir`` before it is opened. NEVER reads
@@ -239,10 +250,22 @@ def run_backfill_plan(session: Session, plan: dict[str, Any], *, period_dir: Pat
 
         path = _resolve_plan_path(period_dir, plan["cutover_fact_pack"]["path"])
         pack = json.loads(path.read_text(encoding="utf-8"))
-        result: CutoverFactPackResult = import_cutover_fact_pack(
-            session, pack, file_name=path.name, created_at=created_at
+        pre_result = import_cutover_fact_pack(
+            session, pack, file_name=path.name, created_at=created_at, stage="pre_match"
         )
-        sections["cutover_fact_pack"] = asdict(result)
+        # Matching owns its transaction boundary. Commit the replay-safe
+        # pre-stage first so a matching failure can never run the post-stage.
+        session.commit()
+        invoice_matching = match_invoices(session)
+        payment_matching = match_payments(session)
+        post_result = import_cutover_fact_pack(
+            session, pack, file_name=path.name, created_at=created_at, stage="post_match"
+        )
+        sections["cutover_fact_pack"] = _merge_fact_pack_results(pre_result, post_result)
+        sections["procurement_matching"] = {
+            "invoices": asdict(invoice_matching),
+            "payments": asdict(payment_matching),
+        }
 
     session.commit()
     return PlanRunResult(sections=sections)

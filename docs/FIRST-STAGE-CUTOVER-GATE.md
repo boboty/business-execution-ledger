@@ -336,6 +336,12 @@ Prerequisites:
 2. Schema at head: `alembic upgrade head`.
 3. The approved backfill plan executed for the period (via
    `bel cutover backfill --period YYYY-MM`).
+   The referenced Cutover Fact Pack remains one approved source artifact,
+   but is applied in dependency order: its four pre-match sections first,
+   then the existing procurement matching passes, then
+   `invoice_item_allocations`. The last section is necessarily post-match
+   because the unchanged 11-A guard requires an already-confirmed
+   contract-level `InvoiceAllocation` to the same Contract.
 4. Human/business corrections applied as needed (via existing commands).
 5. Private cutover acceptance material in place under
    `BEL_PRIVATE_DATA_ROOT`:

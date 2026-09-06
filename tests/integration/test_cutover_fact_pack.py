@@ -15,10 +15,12 @@ import pytest
 
 from bel.application.cutover_fact_pack import (
     CUTOVER_SOURCE_TYPE,
+    CutoverFactPackError,
     CutoverFactPackForbidden,
     import_cutover_fact_pack,
     validate_cutover_fact_pack,
 )
+from bel.application.matching import match_invoices
 from bel.domain.contract import Contract
 from bel.domain.evidence import EvidenceDocument, EvidenceFragment, FragmentKind
 from bel.domain.invoice import Invoice, InvoiceDirection, InvoiceItem
@@ -287,3 +289,103 @@ def test_reimport_same_pack_is_idempotent(db_session):
     assert first.is_reimport is False
     assert second.is_reimport is True
     assert len(CostRecognitionFactRepository(db_session).list_all()) == 1
+
+
+def test_dependency_stages_share_evidence_and_complete_after_matching(db_session):
+    contract = _make_contract(db_session)
+    invoice = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="INV-STAGED", issue_date=date(2025, 12, 1),
+        seller=contract.counterparty, buyer=contract.buyer, net_amount=Decimal("1000"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("1000"), invoice_status=None, source_fragment_id=_make_fragment(db_session).id,
+        created_at=NOW, updated_at=NOW,
+    )
+    InvoiceRepository(db_session).add(invoice)
+    db_session.flush()
+    InvoiceItemRepository(db_session).add(
+        InvoiceItem(
+            id=uuid.uuid4(), invoice_id=invoice.id, line_no=1, product_name="Widget", specification=None,
+            unit=None, quantity=Decimal("10"), unit_price=None, net_amount=Decimal("1000"), tax_rate=None,
+            tax_amount=Decimal("0"), gross_amount=Decimal("1000"), source_fragment_id=invoice.source_fragment_id,
+        )
+    )
+    pack = {
+        "contract_items": [{
+            "contract_selector": {"contract_no": contract.contract_no, "counterparty": contract.counterparty},
+            "source_item_key": "ITEM-STAGED", "product_name": "Widget", "quantity": "10",
+        }],
+        "historical_accrual_facts": [{
+            "contract_selector": {"contract_no": contract.contract_no, "counterparty": contract.counterparty},
+            "source_item_key": "ITEM-STAGED", "source_period": "2025-11", "quantity": "1",
+            "estimated_cost": "10",
+        }],
+        "invoice_item_allocations": [{
+            "contract_selector": {"contract_no": contract.contract_no, "counterparty": contract.counterparty},
+            "source_item_key": "ITEM-STAGED", "invoice": {"external_key": "INV-STAGED", "line_no": 1},
+            "allocated_quantity": "10", "allocated_net_amount": "1000",
+        }],
+    }
+
+    pre = import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="pre_match")
+    replay_pre = import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="pre_match")
+    assert pre.contract_items_created == 1
+    assert replay_pre.contract_items_skipped == 1
+    assert InvoiceItemAllocationRepository(db_session).list_all() == []
+
+    match_invoices(db_session)
+    post = import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="post_match")
+    replay_post = import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="post_match")
+    assert post.invoice_item_allocations_created == 1
+    assert replay_post.invoice_item_allocations_skipped == 1
+    assert post.evidence_document_id == pre.evidence_document_id
+    fragments = EvidenceRepository(db_session).list_fragments_for_document(pre.evidence_document_id)
+    assert len(fragments) == 3
+    assert all(fragment.fragment_kind == FragmentKind.MANUAL_FACT for fragment in fragments)
+    assert len(AccrualRepository(db_session).list_all()) == 0
+
+
+def test_post_stage_still_enforces_confirmed_same_contract_edge(db_session):
+    contract = _make_contract(db_session)
+    invoice = Invoice(
+        id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
+        digital_invoice_no=None, external_invoice_key="INV-NO-EDGE", issue_date=date(2025, 12, 1),
+        seller=contract.counterparty, buyer=contract.buyer, net_amount=Decimal("10"), tax_amount=Decimal("0"),
+        gross_amount=Decimal("10"), invoice_status=None, source_fragment_id=_make_fragment(db_session).id,
+        created_at=NOW, updated_at=NOW,
+    )
+    InvoiceRepository(db_session).add(invoice)
+    db_session.flush()
+    InvoiceItemRepository(db_session).add(
+        InvoiceItem(
+            id=uuid.uuid4(), invoice_id=invoice.id, line_no=1, product_name="Widget", specification=None,
+            unit=None, quantity=Decimal("1"), unit_price=None, net_amount=Decimal("10"), tax_rate=None,
+            tax_amount=Decimal("0"), gross_amount=Decimal("10"), source_fragment_id=invoice.source_fragment_id,
+        )
+    )
+    pack = {
+        "contract_items": [{
+            "contract_selector": {"contract_no": contract.contract_no, "counterparty": contract.counterparty},
+            "source_item_key": "ITEM-NO-EDGE", "product_name": "Widget",
+        }],
+        "invoice_item_allocations": [{
+            "contract_selector": {"contract_no": contract.contract_no, "counterparty": contract.counterparty},
+            "source_item_key": "ITEM-NO-EDGE", "invoice": {"external_key": "INV-NO-EDGE", "line_no": 1},
+            "allocated_quantity": "1", "allocated_net_amount": "10",
+        }],
+    }
+    import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="pre_match")
+    with pytest.raises(CutoverFactPackError):
+        import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="post_match")
+    assert InvoiceItemAllocationRepository(db_session).list_all() == []
+
+
+def test_malformed_post_entry_rejected_before_any_pack_write(db_session):
+    pack = {
+        "contract_items": [{"contract_selector": {}, "source_item_key": "ITEM"}],
+        "invoice_item_allocations": [{"invoice": {"external_key": "INV"}}],
+    }
+    with pytest.raises(CutoverFactPackError):
+        import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="pre_match")
+    from bel.infrastructure.persistence.models import EvidenceDocumentModel
+
+    assert db_session.query(EvidenceDocumentModel).count() == 0
