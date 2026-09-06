@@ -67,9 +67,11 @@ response = tools.call({
 `catalog()` 返回版本、能力名称、参数形状、READ/WRITE 副作用；写能力额外声明
 当前 enabled、全量采购发票 scope 和 RECONCILE_CURRENT_STATE 重试语义。
 
-* `invoices[]`: `invoice_id, match_case_id, match_status`。
-  后两项可为 null，仅表示没有已记录的 MatchCase，**不等于**符合匹配范围、
-  待匹配、无风险或规则判定的 UNMATCHED。销售和 UNKNOWN 方向不进入此投影。
+* `invoices[]`: `invoice_id, match_cases[]`；每个 MatchCase 为
+  `match_case_id, match_status`。一个采购发票的全部权威 MatchCase 都会返回，
+  `match_cases[]` 按 `match_case_id` 升序排列；没有已记录 MatchCase 时为 `[]`，
+  **不等于**符合匹配范围、待匹配、无风险或规则判定的 UNMATCHED。
+  不定义或推断单个“当前” MatchCase。销售和 UNKNOWN 方向不进入此投影。
 * `human_work[]`: `source_type, source_id, code, status, invoice_id,
   resolution_route, scopes[]`；每个 scope 有 `scope_type, scope_id`。
   保留现有 Center 的来源身份、全部候选 scope 和人工路径，只筛选关联采购发票的工作。
@@ -107,6 +109,8 @@ exactly-once 承诺。若要求固定输入集的审批和重放，应先扩展 
 不能在工具 handler 里自行筛选匹配算法输入。
 
 读取是当前状态投影，不是冻结快照；多次查询之间可能发生并发变化。
+在权威状态不变时，`invoices[]` 按 `invoice_id`、各发票的 `match_cases[]` 按
+`match_case_id` 确定性排序。
 本版列表全量返回，无截断和分页；大数据量优化延后，不默默漏掉工作。
 
 ## 验证与后续

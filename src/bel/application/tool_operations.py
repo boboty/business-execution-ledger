@@ -1,10 +1,12 @@
 """Deliberate procurement capabilities over the existing Application services.
 
 Sessions are owned here, never supplied by an operator. No matching rule lives
-in this projection; null match_status means no recorded case, not eligibility.
+in this projection; an empty match_cases list means no recorded case, not
+eligibility.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from uuid import UUID
 
 from bel.application.get_invoice import get_invoice
@@ -21,14 +23,19 @@ class ToolOperations:
 
     def list_work(self) -> dict:
         with self._sessions() as session:
-            cases = {c.subject_id: c for c in list_match_cases(session) if c.subject_type == "INVOICE"}
+            cases_by_invoice = defaultdict(list)
+            for case in list_match_cases(session):
+                if case.subject_type == "INVOICE":
+                    cases_by_invoice[case.subject_id].append(case)
             invoices = [i for i in InvoiceRepository(session).list_all() if i.direction == InvoiceDirection.PURCHASE]
             center = get_unresolved_work_center(session, filters=UnresolvedWorkFilters())
             invoice_ids = {i.id for i in invoices}
             return {"invoices": [
                 {"invoice_id": str(i.id),
-                 "match_case_id": str(cases[i.id].id) if i.id in cases else None,
-                 "match_status": cases[i.id].status if i.id in cases else None}
+                 "match_cases": [
+                     {"match_case_id": str(case.id), "match_status": case.status}
+                     for case in sorted(cases_by_invoice[i.id], key=lambda case: str(case.id))
+                 ]}
                 for i in sorted(invoices, key=lambda i: str(i.id))
             ], "human_work": [
                 {"source_type": w.source_type, "source_id": str(w.source_id),
