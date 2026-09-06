@@ -48,68 +48,49 @@ Finance, tax-rebate, ERP and BI systems are consumers of BEL output. Future inte
 
 ## Product goal
 
-BEL's first-stage (V1) Definition of Done is to **replace the manually-maintained contract business ledger spreadsheet as the System of Record for business facts and deterministic business state**. Business staff should stop hand-maintaining business status in Excel; from the facts it continuously receives, BEL should reconstruct contract execution state, produce period-close/accrual judgments at any point in time, give the data needed to prepare outbound invoicing, expose what it cannot determine, and export business results as Data Products.
+BEL has completed its first-stage cutover and is now the **System of Record for first-stage contract-execution facts and deterministic business state**. From traceable Evidence and confirmed Facts, it reconstructs contract execution state, computes period-close judgments, prepares invoicing data, exposes unresolved work, and exports governed Data Products.
 
-Excel remains supported as an import format, an export format, a cutover/backfill source, a downstream handoff format, and a human-readable data product. **It is demoted from System of Record only after the first-stage cutover gate passes.** Feature completion alone is not enough: legacy data and source Evidence must be backfilled, reconciled against a business-confirmed Cutover Baseline, and every cutover discrepancy must be adjudicated.
+Excel is no longer the System of Record. It remains supported as import and backfill material, an export and downstream handoff format, a human-readable Data Product, and historical material.
 
-See [docs/V1-SCOPE.md](docs/V1-SCOPE.md) for the frozen V1 boundary and [ROADMAP.md](ROADMAP.md) for the capability sequence.
+See the [First-stage System of Record Declaration](docs/FIRST-STAGE-SOR-DECLARATION.md) for the frozen milestone and the [Roadmap](ROADMAP.md) for the capability sequence.
 
-## Current capabilities — through Phase 2D.2
+## Current capabilities — v0.3.0
 
-Phase 2D.1, **Business Fact Foundation & Contract Ledger**, is implementation-complete. The current system includes:
+The first-stage capability sequence is complete:
 
-- traceable `Evidence → Fact → Decision` chains and deterministic purchase-side matching
-- procurement-side `Contract` facts with stable identity and revision history
-- everyday `ContractItem` fact maintenance with supplement/correction semantics
-- `Shipment` / export execution facts associated with procurement contracts
-- a separate sales-side `SalesContract` scope carrying the external customer
-- many-to-many `ProcurementSalesLink` relationships between procurement and sales scopes, with no invented amount/quantity apportionment
-- purchase-side `InvoiceAllocation` / `PaymentAllocation` and human-confirmed sales-side `SalesInvoiceAllocation` / `SalesPaymentAllocation`
-- `ContractItem ↔ InvoiceItem` confirmed allocation
-- accrual, reversal, historical close facts, and current whole-fact supersession semantics where required for cutover
-- a read-only period-close preview that recomputes numbered rules from current facts
-- three human-facing work surfaces:
-  - **合同业务总账 / Contract Business Ledger** — cross-contract current business-fact projection with filters, CSV export and XLSX export
-  - **合同360° / Contract 360** — drill-down view for one procurement contract and its current related facts
-  - **月结工作台 / Period Close Workbench** — read-only projected close judgment and blockers, with an exportable **Period Close Business Data Product** (XLSX: six logical sheets; CSV: one unified long table) via both the Web workbench and `bel period-close export`
-- legacy backfill infrastructure with business-identity-aware replay handling
-- a closed, human-confirmed Cutover Fact path for the explicitly allowed fact types
-- private Cutover Baseline reconciliation with `MATCH / BEL_CORRECTED_LEGACY / UNRESOLVED` outcomes
-- persistent Tasks for incomplete, ambiguous or conflicting backfill identities
-- synthetic golden tests, migration tests, privacy scanning, and private-data acceptance boundaries suitable for a public repository
+- **Phase 2D.1 — Business Fact Foundation & Contract Ledger:** traceable contract-execution Facts, revision history, procurement and sales scopes, deterministic procurement matching, confirmed allocations, legacy backfill, and cutover reconciliation.
+- **Phase 2D.1-P — PostgreSQL Runtime Baseline & Migration Discipline:** PostgreSQL 18 is the production/runtime persistence contract; SQLite remains a test-only convenience.
+- **Phase 2D.2 — Period Close Business Data Product:** deterministic close projection and reproducible XLSX/CSV delivery.
+- **Phase 2D.3 — Invoice Preparation Workbench & Data Product:** separate sales invoice preparation and supplier invoice request views, with factual comparisons and management attention signals; BEL does not perform legal invoicing.
+- **Phase 2D.4 — Exception & Task Center & Data Product:** one read-only center over authoritative unresolved-work sources without collapsing their distinct semantics.
+- **Real First-stage Cutover Gate and SoR declaration:** source-driven cutover, independent reconciliation, final Gate PASS, and explicit business declaration completed for `v0.3.0`.
 
-The Phase 2D.1 cutover work is **infrastructure and rehearsal only**. BEL has **not** yet passed the first-stage cutover gate and must not yet be declared the System of Record.
+The five first-stage work surfaces are:
 
-**Phase 2D.1-P — PostgreSQL Runtime Baseline & Migration Discipline** followed as an infrastructure-only phase: PostgreSQL 18 is now the production/runtime persistence contract (SQLite remains a test-only convenience), with mechanically-enforced migration immutability. No V1 business scope changed. See [docs/PERSISTENCE-MIGRATION-POLICY.md](docs/PERSISTENCE-MIGRATION-POLICY.md).
+- **Contract Business Ledger**
+- **Contract 360**
+- **Period Close**
+- **Invoice Preparation**
+- **Exception & Task Center**
 
-PostgreSQL is BEL's runtime persistence contract, and runtime data is always rebuildable from authoritative source Evidence and approved Fact Packs via the documented rebuild path (`docs/PERSISTENCE-MIGRATION-POLICY.md`) — local database files are never a source of truth. Private acceptance evidence and results remain outside the repository, under `$BEL_PRIVATE_DATA_ROOT/reports/`. **This does not replace the later business-confirmed first-stage cutover gate.**
+The corresponding Data Products are:
 
-**Phase 2D.2 — Period Close Business Data Product** is implementation-complete (pending pre-Gate/Gate review): the existing read-only period-close preview/workbench is now also exportable as a deliverable, traceable, reproducible Data Product (XLSX and CSV), through the same Application-layer path for both Web and CLI. It introduces no new close rule, no persisted close result, and no finance-system vocabulary — see [docs/PHASE2D2-DECISIONS.md](docs/PHASE2D2-DECISIONS.md) and [docs/PHASE2D2-ACCEPTANCE.md](docs/PHASE2D2-ACCEPTANCE.md).
+- **Contract Ledger**
+- **Period Close**
+- **Invoice Preparation**
+- **Exception & Task**
 
-## Not built yet
-
-The remaining V1 critical path is intentionally narrow:
-
-- **Phase 2D.3 — Outbound Invoicing Workbench**: freeze invoicing eligibility semantics, provide invoice-preparation data, and export the preparation data product; BEL prepares data but does not perform legal invoicing
-- **Phase 2D.4 — Exception & Task Center**: one human-facing center and data product for authoritative unresolved work already produced by BEL
-- **FIRST-STAGE CUTOVER GATE**: complete backfill, private reconciliation, unresolved cutover discrepancy = 0, and explicit System-of-Record switch
-
-Also deliberately not built yet:
-
-- Business Cockpit
-- Agent Runtime
-- MCP / external agent tool ecosystem
-- downstream finance, tax, ERP or BI adapters
-- automatic sales-side amount matching
-- procurement/sales bridge apportionment
+PostgreSQL runtime state remains rebuildable from authoritative source Evidence and approved Fact Packs. Private acceptance inputs and diagnostics remain outside the repository under `$BEL_PRIVATE_DATA_ROOT`; the public repository contains no private cutover values.
 
 ## Next up
 
-**Phase 2D.3 — Outbound Invoicing Workbench.**
+**Minimal Application Tool Contract.**
 
-Freezes invoicing eligibility semantics against the business, then provides invoice-preparation data and its export; BEL prepares data but never performs the legal act of invoicing.
+The next capability is a small, stable Application boundary through which an Agent Runtime can read and operate BEL without direct database access or prompt-owned business rules. It will make read, proposal, validation, write, retry, uncertainty, and human-confirmation semantics explicit while remaining independent of any particular model or runtime.
 
-After 2D.3, V1 proceeds to the Exception & Task Center and then the first-stage cutover gate. See [ROADMAP.md](ROADMAP.md).
+The **Agent Runtime is not implemented** and comes only after this contract is defined and tested. The **Business Cockpit** remains an optional later business-facing projection; it is not a prerequisite for Agent access.
+
+Other deliberately deferred capabilities include MCP/external-agent ecosystem contracts, downstream finance/tax/ERP/BI adapters, automatic sales-side amount matching, and procurement/sales bridge apportionment.
 
 ## Getting started
 
@@ -143,6 +124,8 @@ cp .env.example .env
 .venv/bin/bel web
 # http://127.0.0.1:8000/contract-ledger
 # http://127.0.0.1:8000/period-close
+# http://127.0.0.1:8000/invoice-preparation
+# http://127.0.0.1:8000/exceptions
 
 # Verification
 .venv/bin/pytest
@@ -161,12 +144,16 @@ Cutover/backfill acceptance uses a private data root outside the repository. Exp
 - [Domain](docs/DOMAIN.md) — canonical business objects and semantics
 - [Rules](docs/RULES.md) — numbered deterministic business rules
 - [Roadmap](ROADMAP.md) — capability sequence through first-stage cutover and beyond
+- [First-stage SoR Declaration](docs/FIRST-STAGE-SOR-DECLARATION.md) — frozen `v0.3.0` System-of-Record milestone
+- [First-stage Cutover Gate](docs/FIRST-STAGE-CUTOVER-GATE.md) — final technical cutover contract
 - [Golden Tests](docs/GOLDEN-TEST.md) — verification methodology
 - [Private Data Policy](docs/PRIVATE-DATA-POLICY.md) — sensitive-data handling boundary
 - [Phase 2D.0 Decisions](docs/PHASE2D0-DECISIONS.md) / [Acceptance](docs/PHASE2D0-ACCEPTANCE.md) — V1 product rebaseline
 - [Phase 2D.1 R0 Decisions](docs/PHASE2D1-R0-DECISIONS.md) / [Acceptance](docs/PHASE2D1-R0-ACCEPTANCE.md) — frozen sales, Shipment, correction and cutover semantics
 - [Persistence & Migration Policy](docs/PERSISTENCE-MIGRATION-POLICY.md) — PostgreSQL runtime contract, migration immutability rules (Phase 2D.1-P)
 - [Phase 2D.2 Decisions](docs/PHASE2D2-DECISIONS.md) / [Acceptance](docs/PHASE2D2-ACCEPTANCE.md) — Period Close Business Data Product
+- [Phase 2D.3 Rule Freeze](docs/PHASE2D3-RULE-FREEZE.md) / [Acceptance](docs/PHASE2D3-ACCEPTANCE.md) — Invoice Preparation
+- [Phase 2D.4 Decisions](docs/PHASE2D4-DECISIONS.md) / [Acceptance](docs/PHASE2D4-ACCEPTANCE.md) — Exception & Task Center
 - [Contributing](CONTRIBUTING.md) — contribution rules and development setup
 
 Implementation decisions and acceptance criteria for each phase are kept in `docs/PHASE*-DECISIONS.md` and `docs/PHASE*-ACCEPTANCE.md` so design changes are explicit rather than silently retrofitted to code.
