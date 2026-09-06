@@ -59,7 +59,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from bel.application.cutover_backfill import BackfillOutcome, backfill_contracts, backfill_invoices, backfill_payments
-from bel.application.cutover_fact_pack import CutoverFactPackResult, import_cutover_fact_pack
+from bel.application.cutover_fact_pack import (
+    CutoverFactPackResult,
+    import_cutover_fact_pack,
+    validate_post_match_readiness,
+)
 from bel.application.matching import match_invoices, match_payments
 
 PLAN_VERSION = 1
@@ -198,7 +202,14 @@ def run_backfill_plan(session: Session, plan: dict[str, Any], *, period_dir: Pat
     """Execute one validated backfill plan. Every path section resolves
     strictly inside ``period_dir`` before it is opened. NEVER reads
     anything under ``expected/`` — that is reconciliation's own concern,
-    not backfill's (section 47, HARD)."""
+    not backfill's (section 47, HARD).
+
+    When a Cutover Fact Pack is present, this is intentionally the one
+    preparation path: source backfill -> pre-match pack -> procurement
+    Invoice/Payment matching -> targeted readiness check -> post-match
+    pack. Without a pack it remains plain source backfill and does not
+    run matching as a hidden side effect.
+    """
     validate_plan(plan)
     sections: dict[str, Any] = {}
 
@@ -258,6 +269,7 @@ def run_backfill_plan(session: Session, plan: dict[str, Any], *, period_dir: Pat
         session.commit()
         invoice_matching = match_invoices(session)
         payment_matching = match_payments(session)
+        validate_post_match_readiness(session, pack)
         post_result = import_cutover_fact_pack(
             session, pack, file_name=path.name, created_at=created_at, stage="post_match"
         )

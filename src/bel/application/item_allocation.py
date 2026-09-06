@@ -22,7 +22,7 @@ from bel.domain.matching import ConfirmationType, InvoiceAllocation
 from bel.infrastructure.persistence.repositories import InvoiceAllocationRepository
 
 
-def _contract_allocation_exists(
+def has_confirmed_contract_allocation(
     allocations: Iterable[InvoiceAllocation], invoice_id: uuid.UUID, contract_id: uuid.UUID
 ) -> bool:
     """A confirmed (AUTO_CONFIRMED / HUMAN_CONFIRMED) contract-level
@@ -60,7 +60,7 @@ def validate_item_allocation(
     invoice_allocations = invoice_allocations if invoice_allocations is not None else InvoiceAllocationRepository(session).list_for_contract(
         contract_item.contract_id
     )
-    if not _contract_allocation_exists(invoice_allocations, invoice_item.invoice_id, contract_item.contract_id):
+    if not has_confirmed_contract_allocation(invoice_allocations, invoice_item.invoice_id, contract_item.contract_id):
         raise ValueError(
             f"InvoiceItem {invoice_item.id} cannot be allocated to ContractItem {contract_item.id}: "
             "no CONFIRMED contract-level InvoiceAllocation links the invoice to the contract_item's contract (11-A)"

@@ -17,8 +17,10 @@ from bel.application.cutover_fact_pack import (
     CUTOVER_SOURCE_TYPE,
     CutoverFactPackError,
     CutoverFactPackForbidden,
+    CutoverFactPackNotReady,
     import_cutover_fact_pack,
     validate_cutover_fact_pack,
+    validate_post_match_readiness,
 )
 from bel.application.matching import match_invoices
 from bel.domain.contract import Contract
@@ -206,6 +208,7 @@ def test_e_allowed_invoice_item_allocation(db_session):
             }
         ],
     }
+    validate_post_match_readiness(db_session, pack)
     result = import_cutover_fact_pack(db_session, pack, file_name="pack.json")
     assert result.invoice_item_allocations_created == 1
     assert len(InvoiceItemAllocationRepository(db_session).list_all()) == 1
@@ -332,7 +335,10 @@ def test_dependency_stages_share_evidence_and_complete_after_matching(db_session
     assert replay_pre.contract_items_skipped == 1
     assert InvoiceItemAllocationRepository(db_session).list_all() == []
 
+    with pytest.raises(CutoverFactPackNotReady, match="POST_MATCH_CONFIRMED_CONTRACT_ALLOCATION_MISSING"):
+        validate_post_match_readiness(db_session, pack)
     match_invoices(db_session)
+    validate_post_match_readiness(db_session, pack)
     post = import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="post_match")
     replay_post = import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="post_match")
     assert post.invoice_item_allocations_created == 1
@@ -346,6 +352,7 @@ def test_dependency_stages_share_evidence_and_complete_after_matching(db_session
 
 def test_post_stage_still_enforces_confirmed_same_contract_edge(db_session):
     contract = _make_contract(db_session)
+    wrong_contract = _make_contract(db_session, contract_no="C-WRONG", counterparty="Other Supplier")
     invoice = Invoice(
         id=uuid.uuid4(), direction=InvoiceDirection.PURCHASE, invoice_type=None, invoice_no=None,
         digital_invoice_no=None, external_invoice_key="INV-NO-EDGE", issue_date=date(2025, 12, 1),
@@ -362,6 +369,23 @@ def test_post_stage_still_enforces_confirmed_same_contract_edge(db_session):
             tax_amount=Decimal("0"), gross_amount=Decimal("10"), source_fragment_id=invoice.source_fragment_id,
         )
     )
+    from bel.domain.matching import ConfirmationType, InvoiceAllocation, MatchCase, MatchCaseStatus, MatchMethod
+    from bel.infrastructure.persistence.repositories import InvoiceAllocationRepository, MatchCaseRepository
+
+    match_case = MatchCase(
+        id=uuid.uuid4(), subject_type="INVOICE", subject_id=invoice.id, status=MatchCaseStatus.AUTO_CONFIRMED,
+        match_method=MatchMethod.M001, created_at=NOW, resolved_at=NOW,
+    )
+    MatchCaseRepository(db_session).add(match_case)
+    db_session.flush()
+    InvoiceAllocationRepository(db_session).add(
+        InvoiceAllocation(
+            id=uuid.uuid4(), invoice_id=invoice.id, contract_id=wrong_contract.id, match_case_id=match_case.id,
+            allocated_gross_amount=Decimal("10"), match_method=MatchMethod.M001,
+            confirmation_type=ConfirmationType.AUTO_CONFIRMED, created_at=NOW,
+        )
+    )
+    db_session.flush()
     pack = {
         "contract_items": [{
             "contract_selector": {"contract_no": contract.contract_no, "counterparty": contract.counterparty},
@@ -374,6 +398,8 @@ def test_post_stage_still_enforces_confirmed_same_contract_edge(db_session):
         }],
     }
     import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="pre_match")
+    with pytest.raises(CutoverFactPackNotReady, match="POST_MATCH_CONFIRMED_CONTRACT_ALLOCATION_MISSING"):
+        validate_post_match_readiness(db_session, pack)
     with pytest.raises(CutoverFactPackError):
         import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="post_match")
     assert InvoiceItemAllocationRepository(db_session).list_all() == []
@@ -389,3 +415,65 @@ def test_malformed_post_entry_rejected_before_any_pack_write(db_session):
     from bel.infrastructure.persistence.models import EvidenceDocumentModel
 
     assert db_session.query(EvidenceDocumentModel).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("section", "selector"),
+    [
+        ("contract_items", None),
+        ("historical_accrual_facts", "not-an-object"),
+        ("cost_recognition_facts", {"counterparty": "Supplier"}),
+        ("accrual_basis_facts", {"contract_no": "  ", "counterparty": "Supplier"}),
+        ("invoice_item_allocations", {"contract_no": "C", "counterparty": "  "}),
+    ],
+)
+def test_malformed_selector_in_every_allowed_section_is_atomic(db_session, section, selector):
+    entries = {
+        "contract_items": {"source_item_key": "ITEM"},
+        "historical_accrual_facts": {
+            "source_item_key": "ITEM", "source_period": "2025-11", "quantity": "1", "estimated_cost": "1",
+        },
+        "cost_recognition_facts": {"recognition_date": "2025-11-01", "basis": "MANUAL_CONFIRMED"},
+        "accrual_basis_facts": {"scope_type": "CONTRACT", "estimated_cost": "1"},
+        "invoice_item_allocations": {
+            "source_item_key": "ITEM", "invoice": {"external_key": "INV", "line_no": 1},
+            "allocated_quantity": "1", "allocated_net_amount": "1",
+        },
+    }
+    entry = entries[section]
+    if selector is not None:
+        entry["contract_selector"] = selector
+    with pytest.raises(CutoverFactPackError):
+        import_cutover_fact_pack(db_session, {section: [entry]}, file_name="pack.json", stage="pre_match")
+    from bel.infrastructure.persistence.models import EvidenceDocumentModel
+
+    assert db_session.query(EvidenceDocumentModel).filter_by(source_type=CUTOVER_SOURCE_TYPE).count() == 0
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        {"contract_no": "C"},
+        {"contract_no": "C", "counterparty": ""},
+        {"contract_no": "C", "counterparty": "Supplier"},
+    ],
+)
+def test_malformed_post_selector_prevents_pre_stage_writes(db_session, selector):
+    if selector.get("counterparty") == "Supplier":
+        selector = {"contract_no": "", "counterparty": "Supplier"}
+    pack = {
+        "contract_items": [{
+            "contract_selector": {"contract_no": "C", "counterparty": "Supplier"},
+            "source_item_key": "ITEM",
+        }],
+        "invoice_item_allocations": [{
+            "contract_selector": selector, "source_item_key": "ITEM",
+            "invoice": {"external_key": "INV", "line_no": 1},
+            "allocated_quantity": "1", "allocated_net_amount": "1",
+        }],
+    }
+    with pytest.raises(CutoverFactPackError):
+        import_cutover_fact_pack(db_session, pack, file_name="pack.json", stage="pre_match")
+    from bel.infrastructure.persistence.models import ContractItemModel
+
+    assert db_session.query(ContractItemModel).count() == 0

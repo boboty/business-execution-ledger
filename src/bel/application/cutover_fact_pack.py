@@ -60,7 +60,7 @@ from bel.application.import_close_facts import (
     _invoice_item_lookup,
     _selector_from,
 )
-from bel.application.item_allocation import validate_item_allocation
+from bel.application.item_allocation import has_confirmed_contract_allocation, validate_item_allocation
 from bel.domain.accrual import (
     AccrualBasisFact,
     AccrualBasisScopeType,
@@ -77,8 +77,10 @@ from bel.infrastructure.persistence.repositories import (
     CostRecognitionFactRepository,
     EvidenceRepository,
     HistoricalAccrualFactRepository,
+    InvoiceAllocationRepository,
     InvoiceItemAllocationRepository,
     InvoiceItemRepository,
+    InvoiceRepository,
 )
 
 CUTOVER_SOURCE_TYPE = "cutover_baseline_manual"
@@ -125,6 +127,12 @@ class CutoverFactPackForbidden(CutoverFactPackError):
     facts (section 19/39's HARD requirement)."""
 
 
+class CutoverFactPackNotReady(CutoverFactPackError):
+    """A post-match entry's required confirmed Invoice -> Contract edge
+    is not ready. The category is intentionally value-free so callers
+    can report the dependency failure without exposing business data."""
+
+
 @dataclass
 class CutoverFactPackResult:
     evidence_document_id: uuid.UUID
@@ -168,15 +176,85 @@ def validate_cutover_fact_pack(pack: dict[str, Any]) -> None:
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 raise CutoverFactPackError(f"{section}[{index}]: expected a JSON object")
+            selector = entry.get("contract_selector")
+            if not isinstance(selector, dict):
+                raise CutoverFactPackError(f"{section}[{index}]: contract_selector must be a JSON object")
+            for selector_key in ("contract_no", "counterparty"):
+                value = selector.get(selector_key)
+                if not isinstance(value, str) or not value.strip():
+                    raise CutoverFactPackError(
+                        f"{section}[{index}]: contract_selector.{selector_key} must be a non-empty string"
+                    )
+    required_non_empty_strings = {
+        "contract_items": ("source_item_key",),
+        "historical_accrual_facts": ("source_item_key", "source_period"),
+        "invoice_item_allocations": ("source_item_key",),
+    }
+    required_keys = {
+        "historical_accrual_facts": ("quantity", "estimated_cost"),
+        "cost_recognition_facts": ("recognition_date", "basis"),
+        "accrual_basis_facts": ("scope_type", "estimated_cost"),
+        "invoice_item_allocations": ("allocated_quantity", "allocated_net_amount"),
+    }
+    for section, keys in required_non_empty_strings.items():
+        for index, entry in enumerate(pack.get(section, [])):
+            for key in keys:
+                if not isinstance(entry.get(key), str) or not entry[key].strip():
+                    raise CutoverFactPackError(f"{section}[{index}]: {key} must be a non-empty string")
+    for section, keys in required_keys.items():
+        for index, entry in enumerate(pack.get(section, [])):
+            for key in keys:
+                if key not in entry or entry[key] is None:
+                    raise CutoverFactPackError(f"{section}[{index}]: {key} is required")
     for index, entry in enumerate(pack.get("invoice_item_allocations", [])):
         invoice_ref = entry.get("invoice")
-        if not isinstance(invoice_ref, dict) or "external_key" not in invoice_ref or "line_no" not in invoice_ref:
+        if not isinstance(invoice_ref, dict):
+            raise CutoverFactPackError(f"invoice_item_allocations[{index}]: invoice must be a JSON object")
+        external_key = invoice_ref.get("external_key")
+        if not isinstance(external_key, str) or not external_key.strip():
             raise CutoverFactPackError(
-                f"invoice_item_allocations[{index}]: invoice.external_key and invoice.line_no are required"
+                f"invoice_item_allocations[{index}]: invoice.external_key must be a non-empty string"
             )
-        for key in ("contract_selector", "source_item_key", "allocated_quantity", "allocated_net_amount"):
-            if key not in entry:
-                raise CutoverFactPackError(f"invoice_item_allocations[{index}]: {key} is required")
+        line_no = invoice_ref.get("line_no")
+        try:
+            if isinstance(line_no, bool):
+                raise ValueError
+            parsed_line_no = int(line_no)
+            if isinstance(line_no, float) and parsed_line_no != line_no:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise CutoverFactPackError(
+                f"invoice_item_allocations[{index}]: invoice.line_no must be an integer"
+            ) from None
+
+
+def validate_post_match_readiness(session: Session, pack: dict[str, Any]) -> None:
+    """Gate only the post entries named by this pack on their shared
+    11-A prerequisite. No unrelated matching result blocks this check."""
+    validate_cutover_fact_pack(pack)
+    resolver = _ContractResolver(session)
+    invoice_repo = InvoiceRepository(session)
+    item_repo = InvoiceItemRepository(session)
+    allocation_repo = InvoiceAllocationRepository(session)
+    for entry in pack.get("invoice_item_allocations", []):
+        try:
+            contract = resolver.resolve(_selector_from(entry, "invoice_item_allocations"), "invoice_item_allocations")
+        except ValueError as exc:
+            raise CutoverFactPackNotReady("POST_MATCH_CONTRACT_NOT_RESOLVED") from exc
+        invoice_ref = entry["invoice"]
+        invoice = invoice_repo.find_by_external_key(invoice_ref["external_key"])
+        if invoice is None:
+            raise CutoverFactPackNotReady("POST_MATCH_INVOICE_NOT_FOUND")
+        matching_items = [
+            item
+            for item in item_repo.list_for_invoice(invoice.id)
+            if item.line_no == int(invoice_ref["line_no"])
+        ]
+        if len(matching_items) != 1:
+            raise CutoverFactPackNotReady("POST_MATCH_INVOICE_ITEM_NOT_FOUND")
+        allocations = allocation_repo.list_for_contract(contract.id)
+        if not has_confirmed_contract_allocation(allocations, invoice.id, contract.id):
+            raise CutoverFactPackNotReady("POST_MATCH_CONFIRMED_CONTRACT_ALLOCATION_MISSING")
 
 
 def import_cutover_fact_pack(

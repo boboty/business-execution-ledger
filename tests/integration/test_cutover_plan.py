@@ -141,7 +141,9 @@ def test_end_to_end_plan_wires_full_chain(db_session, tmp_path):
     assert ProcurementSalesLinkRepository(db_session).get_current_link(contract.id, sales_contract.id) is not None
 
 
-def test_fact_pack_orchestration_orders_matching_between_stages(db_session, tmp_path, monkeypatch):
+def test_fact_pack_orchestration_orders_readiness_and_does_not_globally_block_hcr(
+    db_session, tmp_path, monkeypatch
+):
     import bel.application.cutover_plan as cutover_plan
 
     period_dir = tmp_path / "2026-01"
@@ -156,17 +158,22 @@ def test_fact_pack_orchestration_orders_matching_between_stages(db_session, tmp_
 
     monkeypatch.setattr(cutover_plan, "import_cutover_fact_pack", recording_import)
     monkeypatch.setattr(
-        cutover_plan, "match_invoices", lambda session: calls.append("match_invoices") or MatchRunSummary()
+        cutover_plan,
+        "match_invoices",
+        lambda session: calls.append("match_invoices") or MatchRunSummary(human_confirmation_required=1),
     )
     monkeypatch.setattr(
         cutover_plan, "match_payments", lambda session: calls.append("match_payments") or MatchRunSummary()
+    )
+    monkeypatch.setattr(
+        cutover_plan, "validate_post_match_readiness", lambda session, pack: calls.append("readiness")
     )
 
     cutover_plan.run_backfill_plan(
         db_session, {"cutover_fact_pack": {"path": "facts/pack.json"}},
         period_dir=period_dir, created_at=NOW,
     )
-    assert calls == ["pre_match", "match_invoices", "match_payments", "post_match"]
+    assert calls == ["pre_match", "match_invoices", "match_payments", "readiness", "post_match"]
 
 
 def test_matching_failure_never_runs_post_stage(db_session, tmp_path, monkeypatch):
@@ -191,6 +198,18 @@ def test_matching_failure_never_runs_post_stage(db_session, tmp_path, monkeypatc
             period_dir=period_dir, created_at=NOW,
         )
     assert stages == ["pre_match"]
+
+
+def test_plan_without_fact_pack_does_not_run_matching(db_session, tmp_path, monkeypatch):
+    import bel.application.cutover_plan as cutover_plan
+
+    monkeypatch.setattr(
+        cutover_plan, "match_invoices", lambda session: pytest.fail("plain backfill must not run matching")
+    )
+    monkeypatch.setattr(
+        cutover_plan, "match_payments", lambda session: pytest.fail("plain backfill must not run matching")
+    )
+    cutover_plan.run_backfill_plan(db_session, {"version": 1}, period_dir=tmp_path, created_at=NOW)
 
 
 def test_plan_rejects_removed_entries_sections(db_session, tmp_path):
