@@ -2,8 +2,8 @@
 
 第一阶段切换验收与 System of Record 宣告已于 2026-09-06 完成，并以
 `v0.3.0 — First-stage System of Record` 标记。当前阶段顺序以
-[项目再评估](docs/PROJECT-REASSESSMENT.md) 为准：下一步推进最小
-Application Tool Contract。驾驶舱是按业务使用需要安排的可选投影，不是
+[项目再评估](docs/PROJECT-REASSESSMENT.md) 为准：最小
+Application Tool Contract 已实现，下一步为独立评审。驾驶舱是按业务使用需要安排的可选投影，不是
 Agent 接入的前置条件。下文的阶段记录保留历史上下文。
 
 Business Execution Ledger (BEL) is being built as a deterministic
@@ -380,12 +380,15 @@ owner explicitly accepted the result and declared BEL the first-stage
 System of Record. The declaration is recorded in
 [docs/FIRST-STAGE-SOR-DECLARATION.md](docs/FIRST-STAGE-SOR-DECLARATION.md).
 
-## Next — Minimal Application Tool Contract
+## Implemented — Minimal Application Tool Contract (pending independent review)
 
-Now that BEL owns first-stage authoritative contract-execution state, the
-next capability is a minimal, stable Application Tool Contract through
-which an Agent Runtime can read and operate BEL without direct database
-access or prompt-owned business rules.
+The minimal v1 boundary is implemented: procurement invoice work discovery,
+Fact/Evidence/Allocation inspection, and the existing deterministic invoice
+matching batch, with host-controlled write authorization and explicit retry
+semantics. Synthetic contract tests and PostgreSQL transaction/concurrency
+checks prove the first operator workflow, including human-confirmation handoff.
+See [Application Tool Contract](docs/APPLICATION-TOOL-CONTRACT.md).
+Independent review is the next gate; no Agent Runtime is introduced.
 
 The contract should expose only deliberate Application capabilities,
 preserve the Evidence → Fact → Decision boundary, make uncertainty and

@@ -161,3 +161,8 @@ Implementation decisions and acceptance criteria for each phase are kept in `doc
 ## Open source
 
 BEL is licensed under the [Apache License 2.0](LICENSE). Contributions, architecture discussions, synthetic business scenarios and adapter ideas are welcome, provided they preserve the deterministic Business Core and public-data boundary.
+
+## Application Tool Contract
+
+最小 v1 接口及采购发票匹配纵向流程已实现，待独立评审。能力、授权、重试和人工待办边界见
+[Application Tool Contract](docs/APPLICATION-TOOL-CONTRACT.md)。
