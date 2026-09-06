@@ -1,9 +1,10 @@
 # Roadmap
 
-当前阶段顺序以 [项目再评估](docs/PROJECT-REASSESSMENT.md) 为准：先完成
-可复核的第一阶段切换验收闭环，再推进最小 Application Tool Contract。
-驾驶舱是按业务使用需要安排的可选投影，不是 Agent 接入的前置条件。
-下文的阶段记录保留历史上下文；功能完成不代表业务已经接受切换。
+第一阶段切换验收与 System of Record 宣告已于 2026-09-06 完成，并以
+`v0.3.0 — First-stage System of Record` 标记。当前阶段顺序以
+[项目再评估](docs/PROJECT-REASSESSMENT.md) 为准：下一步推进最小
+Application Tool Contract。驾驶舱是按业务使用需要安排的可选投影，不是
+Agent 接入的前置条件。下文的阶段记录保留历史上下文。
 
 Business Execution Ledger (BEL) is being built as a deterministic
 business execution layer for agentic systems. The roadmap is
@@ -13,10 +14,28 @@ authoritative business state into prompts.
 
 As of Phase 2D.0, V1's Definition of Done is a product outcome —
 replacing the manually-maintained contract ledger spreadsheet as the
-System of Record — rather than a checklist of technical phases. Reaching
-it requires a cutover, not only feature completion. See
-[docs/V1-SCOPE.md](docs/V1-SCOPE.md) and
+System of Record — rather than a checklist of technical phases. That
+product outcome was achieved at the first-stage SoR milestone recorded in
+[docs/FIRST-STAGE-SOR-DECLARATION.md](docs/FIRST-STAGE-SOR-DECLARATION.md).
+See also [docs/V1-SCOPE.md](docs/V1-SCOPE.md) and
 [docs/PHASE2D0-DECISIONS.md](docs/PHASE2D0-DECISIONS.md).
+
+## Done — v0.3.0 / First-stage System of Record
+
+On 2026-09-06, BEL completed a fresh PostgreSQL cutover replay from
+approved source Evidence, passed the independently-rebuilt Cutover
+Baseline reconciliation with zero unresolved cutover discrepancy,
+verified the required first-stage work surfaces and Data Products, and
+passed the REAL First-stage Cutover Gate with read-only/privacy checks.
+The business owner then explicitly declared BEL the System of Record for
+first-stage contract-execution facts and deterministic business state.
+
+`v0.3.0` points to the cutover-validated implementation
+`c2ad184115a8a6db37b7f7927a7c89d16303733d`. From this milestone forward,
+the legacy contract-ledger Excel is no longer authoritative business
+state; it remains historical/source material and a Data Product/import-
+export carrier. See
+[docs/FIRST-STAGE-SOR-DECLARATION.md](docs/FIRST-STAGE-SOR-DECLARATION.md).
 
 ## Done — v0.1.1 / Phase 2C.2 (Human Workbench)
 
@@ -330,10 +349,9 @@ determinism, formula-injection neutralization and the no-generated_at
 rule reuse the proven Period Close / Invoice Preparation export
 techniques. No schema/migration change, nothing persisted.
 
-## FIRST-STAGE CUTOVER GATE
+## FIRST-STAGE CUTOVER GATE — COMPLETED
 
-The point at which BEL may be declared the System of Record. Requires at
-minimum:
+The final technical gate for first-stage SoR readiness required:
 
 - required business fact flows operational
 - first-stage work surfaces operational
@@ -342,35 +360,45 @@ minimum:
 - private cutover reconciliation PASS
 - unresolved cutover discrepancy = 0
 
-Reconciliation is against a business-confirmed **Cutover Baseline**, not
-against the raw legacy spreadsheet — the legacy ledger is not Golden
-Truth. See [docs/V1-SCOPE.md](docs/V1-SCOPE.md) section 7 and
+Reconciliation was performed against a business-confirmed,
+source-independent **Cutover Baseline**, not against the raw legacy
+spreadsheet — the legacy ledger is not Golden Truth. See
+[docs/V1-SCOPE.md](docs/V1-SCOPE.md) section 7 and
 [docs/FIRST-STAGE-CUTOVER-GATE.md](docs/FIRST-STAGE-CUTOVER-GATE.md).
 
-**The FIRST-STAGE CUTOVER GATE harness is implemented** (`bel cutover gate
---period YYYY-MM`, application seam
-`bel.application.first_stage_cutover_gate`, contract in
-[docs/FIRST-STAGE-CUTOVER-GATE.md](docs/FIRST-STAGE-CUTOVER-GATE.md)):
-PostgreSQL-only, schema-at-head verified, canonical reconciliation with
-UNRESOLVED = 0, all first-stage work surfaces and Data Products verified
-(byte-deterministic), privacy-boundary enforced, and strictly read-only.
-**The actual private Gate is still pending** — a PASS has NOT been
-claimed, and BEL is NOT yet declared System of Record. The Gate is a
-judge, never a switch: it performs no backfill, no baseline synthesis, no
-discrepancy repair, no Task auto-resolution, and no System-of-Record
-declaration. A Gate PASS means BEL MAY be declared System of Record; the
-declaration is a separate human/business acceptance step after the REAL
-private Gate PASS.
+**Completed — REAL private Gate PASS.** The final replay used a brand-new
+PostgreSQL candidate at schema head, the canonical dependency-aware
+cutover preparation path, frozen procurement matching semantics, the
+independently rebuilt baseline, and the required work surfaces/Data
+Products. Canonical reconciliation passed with `unresolved_count = 0`;
+the REAL Gate then passed with read-only and privacy-boundary checks.
 
-**Gate PASS 是技术就绪判断；只有后续业务负责人的明确接受与宣告，才能使
-BEL 成为 System of Record，并将旧 Excel 降为参考资料 / Data Product。**
+The Gate remains a judge, never a switch: it performs no backfill, no
+baseline synthesis, no discrepancy repair, no Task auto-resolution, and
+no System-of-Record declaration. After that technical PASS, the business
+owner explicitly accepted the result and declared BEL the first-stage
+System of Record. The declaration is recorded in
+[docs/FIRST-STAGE-SOR-DECLARATION.md](docs/FIRST-STAGE-SOR-DECLARATION.md).
 
-## Post first-stage — Business Cockpit
+## Next — Minimal Application Tool Contract
 
-业务驾驶舱 returns to scope only after fact completeness, the Contract
-Ledger, Period Close, Invoice Preparation, exception handling, and
-cutover are complete. Deferred, not cancelled, and not to be pulled
-forward.
+Now that BEL owns first-stage authoritative contract-execution state, the
+next capability is a minimal, stable Application Tool Contract through
+which an Agent Runtime can read and operate BEL without direct database
+access or prompt-owned business rules.
+
+The contract should expose only deliberate Application capabilities,
+preserve the Evidence → Fact → Decision boundary, make uncertainty and
+human-confirmation requirements explicit, and remain independent of any
+specific model/runtime. The first Agent Runtime comes only after this
+boundary is defined and contract-tested.
+
+## Optional post-first-stage projection — Business Cockpit
+
+The Business Cockpit is still in scope as a business-facing projection,
+but it is no longer a prerequisite for Agent access. Schedule it when
+real business use justifies it; do not pull it forward merely to provide
+a UI shell for Agent work.
 
 ## Then — Agent Runtime
 
