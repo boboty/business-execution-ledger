@@ -747,9 +747,10 @@ class InvoiceAllocationModel(Base):
     automatic procurement match (either a unique-candidate decision,
     `EXACT_COUNTERPARTY_AMOUNT_UNIQUE`, or a deterministic chronological
     decision between equivalent candidates,
-    `EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL`) or a manual/human
-    confirmation. See docs/PHASE2A-DECISIONS.md for the confirmed
-    explicit -> chronological -> human procurement rule."""
+    `EXACT_COUNTERPARTY_AMOUNT_CHRONOLOGICAL`, or a proven
+    equivalent-permutation canonical decision,
+    `EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL`) or a manual/human
+    confirmation. See docs/PHASE2A-DECISIONS.md for the confirmed rule."""
 
     __tablename__ = "invoice_allocations"
 
@@ -769,7 +770,8 @@ class InvoiceAllocationModel(Base):
 class PaymentAllocationModel(Base):
     """Same allocation semantics as InvoiceAllocationModel — each row is a
     unique-candidate (`..._UNIQUE`) or chronological (`..._CHRONOLOGICAL`)
-    automatic procurement decision, or a manual/human confirmation."""
+    or equivalent-canonical (`..._EQUIVALENT_CANONICAL`) automatic
+    procurement decision, or a manual/human confirmation."""
 
     __tablename__ = "payment_allocations"
 

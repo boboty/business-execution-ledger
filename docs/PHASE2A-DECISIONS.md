@@ -212,7 +212,15 @@ New frozen procurement rule — *explicit, then chronological, then human*:
    the same complete viable Contract set, subject and Contract counts match,
    every Contract has exactly one subject's required capacity, stable business
    identities are complete and unique, no prior decision distinguishes an
-   edge, and the affected Contract-level state is otherwise identical. BEL
+   edge, the affected Contract-level state is otherwise identical, and every
+   subject has the same allocation-relevant business state. For PURCHASE
+   Invoices that state is direction/type/date, exact parties and monetary/tax
+   fields, status/currency, and the complete line-item state. For OUT Payments
+   it is date/direction, exact counterparty and amount, source account,
+   business type and description. Statement running balance is excluded: it is
+   account-level context and is not consumed by any current V1 Contract edge,
+   projection or allocation rule. Identity fields used only for canonical
+   ordering may differ; all business-effect fields may not. BEL
    then pairs stable subject and Contract business identities positionally and
    records `EXACT_COUNTERPARTY_AMOUNT_EQUIVALENT_CANONICAL`.
 

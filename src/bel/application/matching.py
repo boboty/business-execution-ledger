@@ -102,6 +102,7 @@ from bel.infrastructure.persistence.repositories import (
     EventRepository,
     ExceptionRepository,
     InvoiceAllocationRepository,
+    InvoiceItemRepository,
     InvoiceRepository,
     MatchCandidateRepository,
     MatchCaseRepository,
@@ -233,6 +234,7 @@ def _run_match_pass(
     get_counterparty: Callable[[object], str | None],
     get_subject_date: Callable[[object], date | None],
     get_subject_canonical_identity: Callable[[object], Hashable | None],
+    get_subject_equivalence_state: Callable[[object], Hashable],
     contracts: Sequence[Contract],
     match_case_repo: MatchCaseRepository,
     candidate_repo: MatchCandidateRepository,
@@ -374,6 +376,8 @@ def _run_match_pass(
 
         subject_identities = [get_subject_canonical_identity(s) for s in members]
         if any(identity is None for identity in subject_identities) or len(set(subject_identities)) != len(subject_identities):
+            continue
+        if len({get_subject_equivalence_state(s) for s in members}) != 1:
             continue
         ordered_subjects = sorted(zip(subject_identities, members), key=lambda pair: pair[0])
         ordered_contracts = sorted(candidate_contracts, key=lambda c: (c.contract_no, c.counterparty))
@@ -593,6 +597,7 @@ def match_invoices(session: Session) -> MatchRunSummary:
     match_case_repo = MatchCaseRepository(session)
     candidate_repo = MatchCandidateRepository(session)
     allocation_repo = InvoiceAllocationRepository(session)
+    item_repo = InvoiceItemRepository(session)
     exception_repo = ExceptionRepository(session)
     event_repo = EventRepository(session)
 
@@ -622,6 +627,23 @@ def match_invoices(session: Session) -> MatchRunSummary:
             )
         )
 
+    def invoice_equivalence_state(invoice) -> tuple:
+        items = item_repo.list_for_invoice(invoice.id)
+        item_state = tuple(sorted(
+            (
+                item.line_no, item.product_name, item.specification, item.unit,
+                item.quantity, item.unit_price, item.net_amount, item.tax_rate,
+                item.tax_amount, item.gross_amount,
+            )
+            for item in items
+        ))
+        return (
+            invoice.direction, invoice.invoice_type, invoice.issue_date,
+            invoice.seller, invoice.buyer, invoice.net_amount,
+            invoice.tax_amount, invoice.gross_amount, invoice.invoice_status,
+            invoice.currency, item_state,
+        )
+
     return _run_match_pass(
         session=session,
         subject_type=SubjectType.INVOICE,
@@ -630,6 +652,7 @@ def match_invoices(session: Session) -> MatchRunSummary:
         get_counterparty=lambda inv: inv.seller,
         get_subject_date=lambda inv: inv.issue_date,
         get_subject_canonical_identity=_invoice_canonical_identity,
+        get_subject_equivalence_state=invoice_equivalence_state,
         contracts=contracts,
         match_case_repo=match_case_repo,
         candidate_repo=candidate_repo,
@@ -685,6 +708,13 @@ def match_payments(session: Session) -> MatchRunSummary:
             )
         )
 
+    def payment_equivalence_state(payment) -> tuple:
+        return (
+            payment.transaction_date, payment.direction, payment.counterparty,
+            payment.amount, payment.source_account_id, payment.business_type,
+            payment.description,
+        )
+
     return _run_match_pass(
         session=session,
         subject_type=SubjectType.PAYMENT,
@@ -693,6 +723,7 @@ def match_payments(session: Session) -> MatchRunSummary:
         get_counterparty=lambda p: p.counterparty,
         get_subject_date=lambda p: p.transaction_date,
         get_subject_canonical_identity=_payment_canonical_identity,
+        get_subject_equivalence_state=payment_equivalence_state,
         contracts=contracts,
         match_case_repo=match_case_repo,
         candidate_repo=candidate_repo,

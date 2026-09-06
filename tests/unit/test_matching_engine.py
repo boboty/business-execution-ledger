@@ -66,13 +66,13 @@ def _make_contract(
 
 def _make_invoice(
     session, fragment_id, seller, gross_amount, *, direction=InvoiceDirection.PURCHASE, issue_date=None,
-    external_invoice_key=None, digital_invoice_no=None, invoice_no=None, invoice_id=None,
+    external_invoice_key=None, digital_invoice_no=None, invoice_no=None, invoice_id=None, invoice_type=None,
 ):
     now = datetime.now(timezone.utc)
     inv = Invoice(
         id=invoice_id or uuid.uuid4(),
         direction=direction,
-        invoice_type=None,
+        invoice_type=invoice_type,
         invoice_no=invoice_no,
         digital_invoice_no=digital_invoice_no,
         external_invoice_key=external_invoice_key,
@@ -128,10 +128,12 @@ def test_two_by_two_undated_equivalent_cohort_uses_canonical_pairing(db_session)
     )
     ib = _make_invoice(
         db_session, frag.id, "Seller A", "1000.00", external_invoice_key="I-B",
+        issue_date=date(2026, 8, 1),
         invoice_id=uuid.UUID("0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b"),
     )
     ia = _make_invoice(
         db_session, frag.id, "Seller A", "1000.00", external_invoice_key="I-A",
+        issue_date=date(2026, 8, 1),
         invoice_id=uuid.UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"),
     )
     db_session.flush()
@@ -193,6 +195,20 @@ def test_equivalent_canonicalization_requires_complete_subject_identity(db_sessi
     assert summary.human_confirmation_required == 2
 
 
+def test_equivalent_canonicalization_requires_unique_subject_identity(db_session):
+    frag = _make_fragment(db_session)
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-A")
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-B")
+    _make_invoice(db_session, frag.id, "Seller A", "900.00", digital_invoice_no="I-SAME")
+    _make_invoice(db_session, frag.id, "Seller A", "900.00", digital_invoice_no="I-SAME")
+    db_session.flush()
+
+    summary = match_invoices(db_session)
+
+    assert summary.auto_confirmed == 0
+    assert summary.human_confirmation_required == 2
+
+
 def test_equivalent_canonicalization_rejects_different_contract_state(db_session):
     frag = _make_fragment(db_session)
     _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-A", buyer="Buyer A")
@@ -202,6 +218,83 @@ def test_equivalent_canonicalization_rejects_different_contract_state(db_session
     db_session.flush()
 
     summary = match_invoices(db_session)
+
+    assert summary.auto_confirmed == 0
+    assert summary.human_confirmation_required == 2
+
+
+def test_equivalent_canonicalization_rejects_different_invoice_dates(db_session):
+    frag = _make_fragment(db_session)
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-A")
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-B")
+    _make_invoice(
+        db_session, frag.id, "Seller A", "900.00", external_invoice_key="I-A",
+        issue_date=date(2026, 7, 5),
+    )
+    _make_invoice(
+        db_session, frag.id, "Seller A", "900.00", external_invoice_key="I-B",
+        issue_date=date(2026, 8, 20),
+    )
+    db_session.flush()
+
+    summary = match_invoices(db_session)
+
+    assert summary.auto_confirmed == 0
+    assert summary.human_confirmation_required == 2
+
+
+def test_equivalent_canonicalization_rejects_mixed_missing_invoice_date(db_session):
+    frag = _make_fragment(db_session)
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-A")
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-B")
+    _make_invoice(db_session, frag.id, "Seller A", "900.00", external_invoice_key="I-A", issue_date=None)
+    _make_invoice(
+        db_session, frag.id, "Seller A", "900.00", external_invoice_key="I-B",
+        issue_date=date(2026, 7, 5),
+    )
+    db_session.flush()
+
+    summary = match_invoices(db_session)
+
+    assert summary.auto_confirmed == 0
+    assert summary.human_confirmation_required == 2
+
+
+def test_equivalent_canonicalization_rejects_different_invoice_business_state(db_session):
+    frag = _make_fragment(db_session)
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-A")
+    _make_contract(db_session, frag.id, "Seller A", "900.00", contract_no="C-B")
+    _make_invoice(
+        db_session, frag.id, "Seller A", "900.00", external_invoice_key="I-A",
+        invoice_type="TYPE-A",
+    )
+    _make_invoice(
+        db_session, frag.id, "Seller A", "900.00", external_invoice_key="I-B",
+        invoice_type="TYPE-B",
+    )
+    db_session.flush()
+
+    summary = match_invoices(db_session)
+
+    assert summary.auto_confirmed == 0
+    assert summary.human_confirmation_required == 2
+
+
+def test_equivalent_canonicalization_rejects_different_payment_dates(db_session):
+    frag = _make_fragment(db_session)
+    _make_contract(db_session, frag.id, "Seller A", "700.00", contract_no="C-A")
+    _make_contract(db_session, frag.id, "Seller A", "700.00", contract_no="C-B")
+    _make_payment(
+        db_session, frag.id, "Seller A", "700.00", transaction_date=date(2026, 7, 5),
+        bank_reference="R-A", source_account_id="ACCOUNT-A",
+    )
+    _make_payment(
+        db_session, frag.id, "Seller A", "700.00", transaction_date=date(2026, 8, 20),
+        bank_reference="R-B", source_account_id="ACCOUNT-A",
+    )
+    db_session.flush()
+
+    summary = match_payments(db_session)
 
     assert summary.auto_confirmed == 0
     assert summary.human_confirmation_required == 2
