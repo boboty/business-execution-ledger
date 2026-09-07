@@ -8,7 +8,7 @@ this document — never a silent contradiction in code.
 ## A01 — Agent is an operator, not the system
 
 ```
-Agent Runtime
+Operator / Agent Runtime
       ↓
 Tool / Application API
       ↓
@@ -20,10 +20,10 @@ Business Domain
 Forbidden:
 
 ```
-Agent → Database
+Operator / Agent → Database
 ```
 
-An Agent never talks to storage directly, and never bypasses the
+An Operator never talks to storage directly, and never bypasses the
 Application API to reach the Business Domain. Just as important: a
 **Prompt must never become a business rule**. If a decision needs to be
 made consistently and defensibly, it is code — not instructions to a
@@ -66,12 +66,17 @@ Decision → Fact → Evidence
 This traceability is a system requirement, not a nice-to-have — it is
 what makes a business state defensible when questioned later.
 
-## A03 — AI understands facts, rules decide state
+## A03 — AI interprets; deterministic rules decide state
 
-AI (via the Agent) may:
+AI capability is **outside the Business Core**. It may appear in a future
+Intake module or in an Operator / Agent Runtime, but the Business Core
+must not depend on a model provider, model SDK, prompt template, or agent
+framework.
 
-- classify documents
-- extract information
+AI may:
+
+- classify or interpret external business material
+- extract and normalize candidate information
 - propose candidate associations (matches)
 - judge whether two subjects are likely the same entity
 - explain an exception in natural language
@@ -83,10 +88,13 @@ AI may **not** make the final call on:
 - whether to reverse (红冲)
 - whether an accrual is a duplicate
 - period-close status
+- any other authoritative business state governed by deterministic rules
 
-These are always executed by deterministic code. AI output that feeds
-these decisions enters the system as a *proposal*, subject to the
-confidence-state machine in A05 — never as a silent, final write.
+A model response is never authoritative merely because it is structured or
+confident. Any AI-derived candidate that is eventually admitted into BEL
+must cross an explicit validation / confirmation boundary. Deterministic
+business rules continue to consume governed Facts, not prompt-owned
+judgments.
 
 ## A04 — Canonical Business Model
 
@@ -120,10 +128,10 @@ A future Finance Adapter is responsible for translating, e.g.,
 `AccrualRequired` + `cost_amount` into an accounting entry. The Business
 Core never knows that translation exists.
 
-## A05 — When uncertain, generate a Task
+## A05 — When uncertain, do not silently guess
 
-The system never silently guesses. Every fact or proposal that a rule or
-an Agent produces carries a confidence state:
+Uncertainty must remain explicit. Where a proposal / confirmation workflow
+exists, it may use states such as:
 
 ```
 AUTO_CONFIRMED
@@ -132,35 +140,55 @@ HUMAN_CONFIRMATION_REQUIRED
 REJECTED
 ```
 
-Anything below auto-confirmation threshold becomes a `Task / Exception`
-for a human to resolve — it does not get silently applied, and it does
-not get silently dropped.
+A result that is not authorized for automatic application must not be
+silently promoted into authoritative state. It is either left as a
+non-authoritative finding/proposal, routed into the existing domain-specific
+human-work mechanism, or rejected according to that capability's frozen
+semantics.
+
+This principle does **not** require every advisory, missing value, computed
+blocker, or future AI result to be persisted as one generic Task. BEL keeps
+distinct unresolved-work semantics distinct rather than inventing a universal
+workflow object.
 
 ---
 
-## Agent Runtime Boundary (Frozen)
+## Operator Runtime Boundary
+
+The stable architecture boundary is the Application / Tool Contract, not a
+particular runtime framework and not a prematurely frozen `AgentRuntime`
+interface.
 
 ```
 Business Core
        ↑
 Application API / Tool Contract
        ↑
-AgentRuntime Interface
-      ↙  ↓  ↘
-     Pi  Pydantic  OpenAI...
+Operator / Runtime
 ```
 
-- **V1 first implementation:** Pi Agent Core
-- **V1.1 second implementation:** PydanticAI
+**Frozen rule:** `Business Core` must never import Pi, PydanticAI, the OpenAI
+Agents SDK, or any other agent-runtime package. The dependency direction only
+ever points from an Operator / Runtime toward the Application API — never the
+reverse.
 
-**Rule:** `Business Core` must never `import` Pi, PydanticAI, the OpenAI
-Agents SDK, or any other agent-runtime package. The dependency direction
-only ever points from an Agent Runtime toward the Application API — never
-the reverse, and the Business Core has zero awareness that any particular
-runtime exists.
+Framework brand, implementation language, process count, transport choice and
+runtime ordering are **implementation decisions, not architecture law**.
+Pi remains a candidate for the first restricted operator runtime, but it is not
+hard-coded into the Business Core or into a mandatory framework sequence.
 
-This is what makes the runtime swappable later. When the Agent Runtime is
-replaced:
+The current post-Tool-Contract sequence is deliberately narrower:
+
+1. close the single-response consistency gap in operator-facing reads;
+2. establish an executable delegation boundary with a trusted host;
+3. prove that boundary with a model-free independent client over a private JSON
+   transport;
+4. freeze authorization, retry/reconciliation and stop/residual-work semantics;
+5. only then attach the first restricted Operator / Agent Runtime;
+6. later use a second real consumer/runtime to prove substitutability before
+   extracting any broader common runtime abstraction.
+
+When the Operator / Runtime is replaced:
 
 - the database does not change
 - the Domain does not change
@@ -168,8 +196,42 @@ replaced:
 - Period Close does not change
 - the Tool Contract, in principle, does not change
 
-This must eventually be provable by an automated test (e.g., a
-dependency/import check that fails the build if `Business Core` imports
-an agent-runtime package, or a contract test that runs the same Tool
-Contract suite against more than one runtime). Phase 0 freezes the
-requirement; it does not implement the test.
+This substitutability must eventually be demonstrated by automated boundary
+and contract tests, not assumed from an interface name.
+
+## Future Intelligent Intake Boundary (Deferred)
+
+BEL does **not** currently embed a semantic-understanding or semantic-
+normalization layer inside the Business Core.
+
+For local development and current private use, new Excel/PDF/source material
+may continue to be understood and normalized outside BEL with Codex-assisted
+preprocessing, human review of material ambiguities, and then the existing
+BEL import/backfill paths. This is a development/operations workflow, not a
+productized Intake subsystem.
+
+If repeated source onboarding, multi-user operation, or ongoing normalization
+cost later justifies productization, introduce a separate `bel-intake`
+capability outside the Core:
+
+```
+Raw business material
+        ↓
+future bel-intake
+(parse / interpret / normalize / propose)
+        ↓
+BEL Intake Contract
+        ↓
+Application Service / Business Core
+```
+
+The future Intake module may own parsers, OCR/model providers, prompts,
+normalization strategies and proposal/evaluation machinery. It does **not** own
+authoritative business state, and its output does not become a Fact merely by
+being produced by a model. The stable seam to protect is the business input
+contract BEL is willing to validate and admit — not a model-specific semantic
+API.
+
+The long-term responsibility split is therefore:
+
+> **Intake interprets. Core decides. Operator acts.**
