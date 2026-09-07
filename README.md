@@ -2,9 +2,9 @@
 
 **A deterministic business execution layer for agentic systems.**
 
-BEL turns fragmented operational evidence into traceable business facts, deterministic business states, actionable exceptions, and downstream data products. It explores a simple boundary for the agentic era: **agents may understand evidence and operate the system; authoritative business state must remain explainable, testable, and governed by structured data and deterministic rules.**
+BEL turns fragmented operational evidence into traceable business facts, deterministic business states, actionable exceptions, and downstream data products. It explores a simple boundary for the agentic era: **AI may interpret inputs or operate the system at explicit boundaries; authoritative business state must remain explainable, testable, and governed by structured data and deterministic rules.**
 
-业务执行账是一套面向 Agent 时代的业务事实与执行系统：将散落的合同、商品、发票、付款、出口等证据持续组织成可信业务事实，通过确定性规则形成业务状态、异常任务和下游数据产品。
+业务执行账是一套面向 Agent 时代的业务事实与执行系统：将合同、商品、发票、付款、出口等业务事实和关系组织成可信业务状态，通过确定性规则形成执行判断、异常任务和下游数据产品。
 
 ## Why BEL exists
 
@@ -15,7 +15,9 @@ BEL separates four responsibilities:
 - **Evidence** preserves what source systems and documents actually said.
 - **Facts** promote trustworthy business information with traceability back to evidence.
 - **Rules** compute authoritative business state deterministically.
-- **Agents** interpret, propose, explain and operate through explicit application/tool contracts.
+- **Operators** inspect, propose, explain and operate through explicit application/tool contracts.
+
+Future AI-assisted intake is deliberately separate from the Business Core: it may interpret and normalize external material, but it does not own authoritative business state.
 
 This makes agentic business automation auditable without reducing the agent to a chatbot or turning prompts into an unofficial rule engine.
 
@@ -23,14 +25,27 @@ This makes agentic business automation auditable without reducing the agent to a
 
 > **Agent operates the system. Agent is not the system.**
 
-An Agent may read source material, extract candidate facts, call tools, propose matches, and work tasks. But business facts, business state, and period-close conclusions are maintained by structured data and deterministic rules — never by a prompt's judgment call.
+An Operator / Agent may inspect BEL state, call tools, propose work and hand unresolved work back to a human. But business facts, business state, and period-close conclusions are maintained by structured data and deterministic rules — never by a prompt's judgment call.
 
 The architecture enforces:
 
 - `Decision → Fact → Evidence` traceability
 - deterministic rules for authoritative business state
-- explicit `Task / Exception` creation when the system is uncertain
+- explicit unresolved-work semantics instead of silent guessing
 - a runtime-agnostic Business Core that does not depend on Pi, PydanticAI, OpenAI Agents SDK, or another agent framework
+- no embedded semantic-normalization/model layer inside the Business Core
+
+The long-term split is:
+
+```text
+future bel-intake
+      ↓  BEL Intake Contract
+Business Core
+      ↓  Application / Tool Contract
+Operator / Runtime
+```
+
+> **Intake interprets. Core decides. Operator acts.**
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the frozen principles.
 
@@ -43,6 +58,7 @@ Based on contracts, goods, invoices, payments, exports, and other business evide
 - **Not a finance/accounting system.** It does not produce accounting entries, ledger postings, or subject codes.
 - **Not a tax-rebate system.** It does not file or track export tax rebates.
 - **Not a BI system.** It does not own dashboards or reporting for other teams.
+- **Not a document-AI / semantic-normalization platform.** Future source understanding belongs to a separate Intake boundary when productization is justified.
 
 Finance, tax-rebate, ERP and BI systems are consumers of BEL output. Future integrations happen through Adapters / MCP, translating BEL's canonical business vocabulary into each consumer's own vocabulary without leaking those external concepts into the Business Core.
 
@@ -54,7 +70,7 @@ Excel is no longer the System of Record. It remains supported as import and back
 
 See the [First-stage System of Record Declaration](docs/FIRST-STAGE-SOR-DECLARATION.md) for the frozen milestone and the [Roadmap](ROADMAP.md) for the capability sequence.
 
-## Current capabilities — v0.3.0
+## Current capabilities — v0.3.0+
 
 The first-stage capability sequence is complete:
 
@@ -64,6 +80,7 @@ The first-stage capability sequence is complete:
 - **Phase 2D.3 — Invoice Preparation Workbench & Data Product:** separate sales invoice preparation and supplier invoice request views, with factual comparisons and management attention signals; BEL does not perform legal invoicing.
 - **Phase 2D.4 — Exception & Task Center & Data Product:** one read-only center over authoritative unresolved-work sources without collapsing their distinct semantics.
 - **Real First-stage Cutover Gate and SoR declaration:** source-driven cutover, independent reconciliation, final Gate PASS, and explicit business declaration completed for `v0.3.0`.
+- **Minimal Application Tool Contract v1:** procurement invoice work discovery, Fact/Evidence/Allocation inspection and deterministic procurement matching through an explicit capability boundary, including host-controlled write authorization and retry semantics.
 
 The five first-stage work surfaces are:
 
@@ -84,11 +101,25 @@ PostgreSQL runtime state remains rebuildable from authoritative source Evidence 
 
 ## Next up
 
-**Minimal Application Tool Contract.**
+**Executable Delegation Boundary.**
 
-The next capability is a small, stable Application boundary through which an Agent Runtime can read and operate BEL without direct database access or prompt-owned business rules. It will make read, proposal, validation, write, retry, uncertainty, and human-confirmation semantics explicit while remaining independent of any particular model or runtime.
+The minimal Application Tool Contract is implemented and independently reviewed. Before attaching an Agent Runtime, BEL will harden the boundary that makes those capabilities safely delegable:
 
-The **Agent Runtime is not implemented** and comes only after this contract is defined and tested. The **Business Cockpit** remains an optional later business-facing projection; it is not a prerequisite for Agent access.
+1. fix the single-response consistency gap in operator-facing reads;
+2. introduce a trusted host with a narrow private JSON transport;
+3. prove the boundary first with a model-free independent client;
+4. freeze authorization, retry/reconciliation, stop and residual-work semantics;
+5. only then attach the first restricted Operator / Agent Runtime.
+
+Pi remains a candidate for that first restricted runtime, but framework brand, language, process count and runtime ordering are implementation choices rather than architecture law. Runtime substitutability is demonstrated later with a second real consumer/runtime rather than assumed from a premature common interface.
+
+The **Business Cockpit** remains an optional business-facing projection, not a prerequisite for Agent access.
+
+### Deferred intelligent intake
+
+BEL does not currently build an internal Semantic Understanding / Semantic Normalization Layer. For present local use, new Excel/PDF/source material can continue through Codex-assisted preprocessing, human review of material ambiguities, and the existing BEL import/backfill paths.
+
+A separate `bel-intake` capability is deferred until repeated source onboarding, multi-user use or normalization cost justifies productization. Its future stable seam is a **BEL Intake Contract**; model providers, prompts, OCR/parsers and normalization strategies remain outside the Core.
 
 Other deliberately deferred capabilities include MCP/external-agent ecosystem contracts, downstream finance/tax/ERP/BI adapters, automatic sales-side amount matching, and procurement/sales bridge apportionment.
 
@@ -140,10 +171,12 @@ Cutover/backfill acceptance uses a private data root outside the repository. Exp
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — frozen architecture principles
+- [Project reassessment](docs/PROJECT-REASSESSMENT.md) — current post-SoR capability sequence
 - [V1 Scope](docs/V1-SCOPE.md) — V1 product boundary and Definition of Done
 - [Domain](docs/DOMAIN.md) — canonical business objects and semantics
 - [Rules](docs/RULES.md) — numbered deterministic business rules
 - [Roadmap](ROADMAP.md) — capability sequence through first-stage cutover and beyond
+- [Application Tool Contract](docs/APPLICATION-TOOL-CONTRACT.md) — current operator-facing capability boundary
 - [First-stage SoR Declaration](docs/FIRST-STAGE-SOR-DECLARATION.md) — frozen `v0.3.0` System-of-Record milestone
 - [First-stage Cutover Gate](docs/FIRST-STAGE-CUTOVER-GATE.md) — final technical cutover contract
 - [Golden Tests](docs/GOLDEN-TEST.md) — verification methodology
@@ -161,8 +194,3 @@ Implementation decisions and acceptance criteria for each phase are kept in `doc
 ## Open source
 
 BEL is licensed under the [Apache License 2.0](LICENSE). Contributions, architecture discussions, synthetic business scenarios and adapter ideas are welcome, provided they preserve the deterministic Business Core and public-data boundary.
-
-## Application Tool Contract
-
-最小 v1 接口及采购发票匹配纵向流程已实现，待独立评审。能力、授权、重试和人工待办边界见
-[Application Tool Contract](docs/APPLICATION-TOOL-CONTRACT.md)。
