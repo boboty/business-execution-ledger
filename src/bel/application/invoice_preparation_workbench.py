@@ -71,10 +71,20 @@ def get_invoice_preparation_workbench_from_context(
     )
 
 
-def get_invoice_preparation_workbench(session: Session) -> InvoicePreparationWorkbench:
+def get_invoice_preparation_workbench(
+    session: Session,
+    *,
+    invoice_month=None,
+    fx_rate_evidence=(),
+) -> InvoicePreparationWorkbench:
     """Compose the complete read-only Workbench over the session. The F0
     context is built UNFILTERED (an axis filter must never blind either
     F1 report), exactly as the F1 session entry points do. Strictly
     read-only."""
-    context = get_invoice_preparation_context(session)
+    # The reporting month and FX evidence are explicit inputs to the
+    # shared Application context.  This keeps Web, CLI and exports on one
+    # deterministic snapshot and prevents a wall-clock fallback.
+    context = get_invoice_preparation_context(
+        session, invoice_month=invoice_month, fx_rate_evidence=fx_rate_evidence
+    )
     return get_invoice_preparation_workbench_from_context(context)

@@ -183,6 +183,7 @@ def _contract_item_revision_to_domain(m: ContractItemRevisionModel) -> ContractI
         superseded_by_revision_id=m.superseded_by_revision_id,
         created_at=m.created_at,
         asserted_field_names=m.asserted_field_names,
+        tax_classification_code=m.tax_classification_code,
     )
 
 
@@ -210,6 +211,7 @@ def _assemble_contract_item(anchor: ContractItemModel, current_revision: Contrac
         net_amount=current_revision.net_amount,
         current_source_fragment_id=current_revision.source_fragment_id,
         created_at=anchor.created_at,
+        tax_classification_code=current_revision.tax_classification_code,
     )
 
 
@@ -262,6 +264,8 @@ def _sales_contract_revision_to_domain(m: SalesContractRevisionModel) -> SalesCo
         superseded_by_revision_id=m.superseded_by_revision_id,
         created_at=m.created_at,
         asserted_field_names=m.asserted_field_names,
+        quantity=m.quantity,
+        unit=m.unit,
     )
 
 
@@ -280,6 +284,8 @@ def _assemble_sales_contract(anchor: SalesContractModel, current_revision: Sales
         contract_date=current_revision.contract_date,
         current_source_fragment_id=current_revision.source_fragment_id,
         created_at=anchor.created_at,
+        quantity=current_revision.quantity,
+        unit=current_revision.unit,
     )
 
 
@@ -717,6 +723,7 @@ class ContractItemRepository:
                 gross_amount=item.gross_amount,
                 tax_rate=item.tax_rate,
                 net_amount=item.net_amount,
+                tax_classification_code=item.tax_classification_code,
                 source_fragment_id=item.current_source_fragment_id,
                 superseded_by_revision_id=None,
                 created_at=item.created_at,
@@ -840,6 +847,7 @@ class ContractItemRepository:
             superseded_by_revision_id=revision.superseded_by_revision_id,
             created_at=revision.created_at,
             asserted_field_names=revision.asserted_field_names,
+            tax_classification_code=revision.tax_classification_code,
         )
 
     def get_current_revision(self, contract_item_id: uuid.UUID) -> ContractItemRevision | None:
@@ -1323,6 +1331,8 @@ class SalesContractRepository:
             currency=revision.currency,
             gross_amount=revision.gross_amount,
             contract_date=revision.contract_date,
+            quantity=revision.quantity,
+            unit=revision.unit,
             source_fragment_id=revision.source_fragment_id,
             superseded_by_revision_id=revision.superseded_by_revision_id,
             created_at=revision.created_at,

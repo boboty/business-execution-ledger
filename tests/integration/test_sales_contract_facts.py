@@ -135,6 +135,24 @@ def test_create_sales_contract_from_evidence(db_session):
     assert history[0].superseded_by_revision_id is None
 
 
+def test_sales_contract_quantity_and_unit_are_evidence_backed_facts(db_session):
+    result = _create(
+        db_session,
+        fields={"quantity": Decimal("12.5000"), "unit": "PCS"},
+    )
+    assert result.sales_contract.quantity == Decimal("12.5000")
+    assert result.sales_contract.unit == "PCS"
+    current = get_sales_contract_history(db_session, result.sales_contract.id)[-1]
+    assert current.quantity == Decimal("12.5000")
+    assert current.unit == "PCS"
+
+
+@pytest.mark.parametrize("quantity", [Decimal("-1"), Decimal("NaN"), Decimal("Infinity"), Decimal("1.00001")])
+def test_sales_contract_quantity_rejects_unrepresentable_or_invalid_decimal(db_session, quantity):
+    with pytest.raises(SalesContractFactError):
+        _create(db_session, fields={"quantity": quantity})
+
+
 def test_create_exact_replay_same_identity_same_evidence_same_assertion(db_session):
     result = _create(db_session, fields={"customer": "Customer Co"})
     frag = SalesContractRepository(db_session).get_initial_revision(result.sales_contract.id).source_fragment_id
@@ -967,7 +985,9 @@ def test_sales_contract_fact_fields_excludes_identity_and_party_role_sources():
     customs/shipping receiving party are never among the accepted field
     names — there is no field name through which any of them could be
     mistaken for `customer`."""
-    assert set(SALES_CONTRACT_FACT_FIELDS) == {"customer", "currency", "gross_amount", "contract_date"}
+    assert set(SALES_CONTRACT_FACT_FIELDS) == {
+        "customer", "currency", "gross_amount", "contract_date", "quantity", "unit"
+    }
     forbidden_names = {
         "buyer", "counterparty", "our_entity", "sales_contract_no",
         "external_reference", "customs_receiving_party", "接收报关单位",

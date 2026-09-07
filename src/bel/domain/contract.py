@@ -104,6 +104,10 @@ class ContractItem:
     net_amount: Decimal | None
     current_source_fragment_id: UUID | None
     created_at: datetime
+    # IP-P08: a confirmed tax classification code is a versioned,
+    # evidence-backed item Fact.  ``None`` remains an explicit unknown;
+    # consumers must request human confirmation rather than infer one.
+    tax_classification_code: str | None = None
 
 
 class ContractItemRevisionType:
@@ -130,6 +134,7 @@ CONTRACT_ITEM_FACT_FIELDS: tuple[str, ...] = (
     "gross_amount",
     "tax_rate",
     "net_amount",
+    "tax_classification_code",
 )
 
 
@@ -180,3 +185,4 @@ class ContractItemRevision:
     superseded_by_revision_id: UUID | None
     created_at: datetime
     asserted_field_names: list[str] | None = None
+    tax_classification_code: str | None = None

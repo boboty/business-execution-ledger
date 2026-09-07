@@ -63,6 +63,8 @@ sales_contract_no
 customer
 currency
 gross_amount
+quantity (nullable)
+unit (nullable)
 contract_date
 status
 ```
@@ -113,6 +115,12 @@ is structural rather than a matter of discipline.
 Like every other fact object, a `SalesContract` links to the `Evidence`
 it was extracted from, and an uncertain case surfaces as a `Task` rather
 than a silently assumed customer.
+
+Core Completion adds only nullable `quantity` and `unit` to the existing
+SalesContract revision model. These are sales Evidence assertions, never
+inferred from procurement, Shipment or customs. INITIAL / SUPPLEMENT /
+CORRECTION preserve the same identity and immutable revision history.
+There is no SalesContractItem subsystem.
 
 ## ProcurementSalesLink
 
@@ -347,3 +355,15 @@ low-confidence match proposals, etc. Phase 0 does not fix its schema
 beyond: it must carry a reference back to the Fact/Evidence in question
 and a resolvable status, so it can drive the 异常与任务中心 (Exception &
 Task Center) page.
+
+## Core Completion preparation inputs
+
+`ContractItem.tax_classification_code` is a nullable, Evidence-backed
+revision value. Its confirmation and correction use existing ContractItem
+Fact maintenance. It is reused within that confirmed item scope; BEL does
+not infer product-category equivalence or build a universal catalogue.
+
+Authoritative FX input contains source, publication date, USD/CNY currency
+pair, positive finite Decimal rate and Evidence provenance. It is explicit
+preparation input, not a network service or a fabricated persisted Fact.
+Preparation month belongs to the calculation context, not the wall clock.

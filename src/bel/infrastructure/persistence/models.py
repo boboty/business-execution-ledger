@@ -237,6 +237,9 @@ class ContractItemRevisionModel(Base):
     gross_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     tax_rate: Mapped[Decimal | None] = mapped_column(Numeric(9, 6), nullable=True)
     net_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    # IP-P08 confirmed tax classification code.  Unknown is represented
+    # by NULL; this field is never populated by inference.
+    tax_classification_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Provenance reference — the exact Evidence for THIS revision. Never
     # re-pointed. See docs/PHASE2D1-R0-DECISIONS.md section 1.3.
     # Nullable at the schema level for the same reason the pre-R1
@@ -438,6 +441,8 @@ class SalesContractRevisionModel(Base):
     currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
     gross_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     contract_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Provenance reference — the exact Evidence for THIS revision. Never
     # re-pointed. See docs/PHASE2D1-R0-DECISIONS.md sections 1.3 and 2.2.
     source_fragment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("evidence_fragments.id"), nullable=False)

@@ -212,6 +212,11 @@ class SupplierRequestAdvisoryCode:
     # ContractItem both have confirmed product names and they are not
     # exactly equal. A management review signal, not a violation.
     PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION = "PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION"
+    # The contract item quantity remains the expected quantity.  A
+    # comparable confirmed invoice-item allocation that differs is only a
+    # management review signal; no expected value is replaced or prorated.
+    PURCHASE_INVOICE_QUANTITY_DEVIATION = "PURCHASE_INVOICE_QUANTITY_DEVIATION"
+    PROCUREMENT_CONTRACT_SHIPMENT_QUANTITY_DEVIATION = "PROCUREMENT_CONTRACT_SHIPMENT_QUANTITY_DEVIATION"
     # IP-P09 follow-up: at least one confirmed OUT Payment Fact is
     # currently allocated but NO confirmed PURCHASE Invoice Fact is
     # associated — paid, no invoice, recommend supplier invoice follow-up
@@ -237,6 +242,8 @@ NON_BLOCKING_ADVISORY_CODES: frozenset[str] = frozenset(
         SupplierRequestAdvisoryCode.PURCHASE_INVOICE_AMOUNT_DEVIATION,
         SupplierRequestAdvisoryCode.PURCHASE_INVOICE_CURRENCY_DEVIATION,
         SupplierRequestAdvisoryCode.PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION,
+        SupplierRequestAdvisoryCode.PURCHASE_INVOICE_QUANTITY_DEVIATION,
+        SupplierRequestAdvisoryCode.PROCUREMENT_CONTRACT_SHIPMENT_QUANTITY_DEVIATION,
         SupplierRequestAdvisoryCode.SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED,
     }
 )
@@ -278,6 +285,8 @@ class SupplierRequestCheckOutcome:
 # rule and requires its own freeze.
 AMOUNT_CONSISTENCY_CHECK_NAME = "PURCHASE_INVOICE_GROSS_AMOUNT_VS_CONTRACT_GROSS_AMOUNT"
 ITEM_NAME_CONSISTENCY_CHECK_NAME = "INVOICE_ITEM_PRODUCT_NAME_VS_CONTRACT_ITEM_PRODUCT_NAME"
+QUANTITY_CONSISTENCY_CHECK_NAME = "PURCHASE_INVOICE_ITEM_ALLOCATION_QUANTITY_VS_CONTRACT_ITEM_QUANTITY"
+SHIPMENT_QUANTITY_CONSISTENCY_CHECK_NAME = "SHIPMENT_QUANTITY_VS_CONTRACT_ITEM_QUANTITY"
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +336,7 @@ class SupplierRequestAdvisory:
     related_contract_ids: tuple[uuid.UUID, ...] = ()
     # InvoiceItem ids the advisory is about (IP-P05 deviation).
     related_invoice_item_ids: tuple[uuid.UUID, ...] = ()
+    related_contract_item_ids: tuple[uuid.UUID, ...] = ()
     note: str | None = None
 
 
@@ -374,6 +384,74 @@ class SupplierRequestItemNameCheck:
     outcome: str
 
 
+class SupplierRequestQuantityCheckOutcome:
+    """A unit-safe quantity comparison result.  Quantity is never
+    aggregated across ContractItems, InvoiceItems, or Shipments: such an
+    aggregation would manufacture a basis where units or cardinality are
+    incomplete.  Incomplete comparisons explicitly require human
+    confirmation instead of choosing a substitute quantity."""
+
+    MATCH = "MATCH"
+    DEVIATION = "DEVIATION"
+    HUMAN_CONFIRMATION_REQUIRED = "HUMAN_CONFIRMATION_REQUIRED"
+
+
+class SupplierRequestItemPreparationStatus:
+    QUANTITY_DETERMINABLE = "QUANTITY_DETERMINABLE"
+    HUMAN_CONFIRMATION_REQUIRED = "HUMAN_CONFIRMATION_REQUIRED"
+
+
+class SupplierRequestTaxClassificationCodeStatus:
+    CONFIRMED = "CONFIRMED"
+    HUMAN_CONFIRMATION_REQUIRED = "HUMAN_CONFIRMATION_REQUIRED"
+
+
+@dataclass(frozen=True)
+class SupplierRequestItemPreparation:
+    """The per-ContractItem preparation facts.  ContractItem quantity is
+    the only expected purchase-invoice quantity authority.  The list is
+    intentionally never collapsed to a contract-level total, because
+    ContractItems can carry distinct units."""
+
+    contract_item_id: uuid.UUID
+    product_name: str | None
+    expected_purchase_invoice_quantity: Decimal | None
+    unit: str | None
+    tax_classification_code: str | None
+    tax_classification_code_status: str
+    quantity_status: str
+
+
+@dataclass(frozen=True)
+class SupplierRequestQuantityCheck:
+    """One non-substitutive quantity consistency check.  ``actual`` is
+    context only; it never changes the expected contract quantity."""
+
+    check_name: str
+    contract_id: uuid.UUID
+    contract_item_id: uuid.UUID | None
+    source_id: uuid.UUID
+    expected_quantity: Decimal | None
+    expected_unit: str | None
+    actual_quantity: Decimal | None
+    actual_unit: str | None
+    outcome: str
+
+
+@dataclass(frozen=True)
+class SupplierRequestHumanConfirmationRequirement:
+    """A non-persisted projection of a Fact gap or ambiguity that BEL
+    must not guess through.  This is deliberately distinct from a
+    preparation blocker: amount preparation may remain determinable while
+    an invoice-line tax code or quantity comparison needs confirmation."""
+
+    code: str
+    contract_id: uuid.UUID
+    related_contract_item_ids: tuple[uuid.UUID, ...] = ()
+    related_invoice_item_ids: tuple[uuid.UUID, ...] = ()
+    related_shipment_ids: tuple[uuid.UUID, ...] = ()
+
+
 @dataclass(frozen=True)
 class PurchaseInvoiceContractAssociation:
     """One confirmed PURCHASE Invoice Fact's current footprint — the
@@ -419,11 +497,14 @@ class SupplierInvoiceRequestDecision:
     # (the pair moves together: no reference currency is presented for an
     # amount that cannot be prepared).
     expected_purchase_invoice_currency: str | None
+    item_preparations: tuple[SupplierRequestItemPreparation, ...]
     invoice_allocations: tuple[SupplierScopeInvoiceAllocation, ...]
     invoice_item_allocations: tuple[SupplierScopeInvoiceItemAllocation, ...]
     payment_allocations: tuple[SupplierScopePaymentAllocation, ...]
     amount_checks: tuple[SupplierRequestAmountCheck, ...] = ()
     item_name_checks: tuple[SupplierRequestItemNameCheck, ...] = ()
+    quantity_checks: tuple[SupplierRequestQuantityCheck, ...] = ()
+    human_confirmation_requirements: tuple[SupplierRequestHumanConfirmationRequirement, ...] = ()
     blockers: tuple[SupplierRequestBlocker, ...] = ()
     # Explicit NON-BLOCKING management findings (IP-P09 / IP-P02 /
     # IP-P05 deviation, IP-P03 / IP-P04 cardinality). Never affect
@@ -460,9 +541,11 @@ def evaluate_supplier_invoice_request_from_context(
     """Pure decision function over the F0 context — no session, no I/O,
     no mutation."""
     invoice_contract_map = _build_invoice_contract_map(context)
+    invoice_item_contract_item_map = _build_invoice_item_contract_item_map(context)
     return SupplierInvoiceRequestReport(
         decisions=tuple(
-            _evaluate_scope(scope, invoice_contract_map) for scope in context.supplier_scopes
+            _evaluate_scope(scope, invoice_contract_map, invoice_item_contract_item_map)
+            for scope in context.supplier_scopes
         ),
         purchase_invoice_contract_map=tuple(
             PurchaseInvoiceContractAssociation(
@@ -495,13 +578,35 @@ def _build_invoice_contract_map(
     return mapping
 
 
+def _build_invoice_item_contract_item_map(
+    context: InvoicePreparationContext,
+) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """Current confirmed PURCHASE InvoiceItem allocation footprint over
+    the complete F0 context.  M:N must be found globally: a local supplier
+    scope can otherwise look one-to-one while the same InvoiceItem is
+    allocated to a ContractItem on another Contract."""
+    mapping: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for scope in context.supplier_scopes:
+        for entry in scope.invoice_item_allocations:
+            if (
+                entry.invoice is None
+                or entry.invoice.direction != InvoiceDirection.PURCHASE
+                or entry.invoice_item is None
+            ):
+                continue
+            mapping.setdefault(entry.allocation.invoice_item_id, set()).add(entry.allocation.contract_item_id)
+    return mapping
+
+
 def _evaluate_scope(
     scope: SupplierScopeContext,
     invoice_contract_map: dict[uuid.UUID, list[uuid.UUID]],
+    invoice_item_contract_item_map: dict[uuid.UUID, set[uuid.UUID]],
 ) -> SupplierInvoiceRequestDecision:
     contract = scope.contract
     blockers: list[SupplierRequestBlocker] = []
     advisories: list[SupplierRequestAdvisory] = []
+    human_confirmation_requirements: list[SupplierRequestHumanConfirmationRequirement] = []
 
     # A. IP-P02 — the expected purchase invoice gross amount is the
     # Contract's own gross amount. Unknown amount => explicit
@@ -524,6 +629,216 @@ def _evaluate_scope(
     else:
         expected_amount = contract.gross_amount
         expected_currency = contract.currency
+
+    # IP-P07 / IP-P08 (Core Completion): expected quantities are asserted
+    # per procurement ContractItem, and a confirmed tax classification
+    # code is reused from that same versioned Fact.  Neither product name,
+    # tax rate, invoice allocation, nor Shipment may fill a missing value.
+    # There is deliberately no contract-level quantity total: mixed units
+    # make any such total semantically undefined.
+    items = tuple(sorted(scope.items, key=lambda item: (item.source_item_key or "", str(item.id))))
+    item_by_id = {item.id: item for item in items}
+    item_preparations: list[SupplierRequestItemPreparation] = []
+    quantity_checks: list[SupplierRequestQuantityCheck] = []
+    if not items:
+        human_confirmation_requirements.append(
+            SupplierRequestHumanConfirmationRequirement(
+                code="MISSING_CONTRACT_ITEM_FACTS",
+                contract_id=contract.id,
+            )
+        )
+
+    allocations_by_item: dict[uuid.UUID, list[SupplierScopeInvoiceItemAllocation]] = {}
+    for entry in scope.invoice_item_allocations:
+        allocations_by_item.setdefault(entry.allocation.contract_item_id, []).append(entry)
+
+    for item in items:
+        quantity_status = (
+            SupplierRequestItemPreparationStatus.QUANTITY_DETERMINABLE
+            if item.quantity is not None and item.unit is not None
+            else SupplierRequestItemPreparationStatus.HUMAN_CONFIRMATION_REQUIRED
+        )
+        tax_status = (
+            SupplierRequestTaxClassificationCodeStatus.CONFIRMED
+            if item.tax_classification_code is not None
+            else SupplierRequestTaxClassificationCodeStatus.HUMAN_CONFIRMATION_REQUIRED
+        )
+        item_preparations.append(
+            SupplierRequestItemPreparation(
+                contract_item_id=item.id,
+                product_name=item.product_name,
+                expected_purchase_invoice_quantity=item.quantity,
+                unit=item.unit,
+                tax_classification_code=item.tax_classification_code,
+                tax_classification_code_status=tax_status,
+                quantity_status=quantity_status,
+            )
+        )
+        if item.tax_classification_code is None:
+            human_confirmation_requirements.append(
+                SupplierRequestHumanConfirmationRequirement(
+                    code="MISSING_TAX_CLASSIFICATION_CODE",
+                    contract_id=contract.id,
+                    related_contract_item_ids=(item.id,),
+                )
+            )
+        if item.quantity is None or item.unit is None:
+            human_confirmation_requirements.append(
+                SupplierRequestHumanConfirmationRequirement(
+                    code="MISSING_CONTRACT_ITEM_QUANTITY_OR_UNIT",
+                    contract_id=contract.id,
+                    related_contract_item_ids=(item.id,),
+                )
+            )
+
+        item_allocations = allocations_by_item.get(item.id, [])
+        if len(item_allocations) > 1:
+            human_confirmation_requirements.append(
+                SupplierRequestHumanConfirmationRequirement(
+                    code="MANY_TO_MANY_INVOICE_ITEM_ALLOCATION",
+                    contract_id=contract.id,
+                    related_contract_item_ids=(item.id,),
+                    related_invoice_item_ids=tuple(
+                        sorted({entry.allocation.invoice_item_id for entry in item_allocations}, key=str)
+                    ),
+                )
+            )
+            continue
+        if len(item_allocations) != 1:
+            continue
+
+        entry = item_allocations[0]
+        if len(invoice_item_contract_item_map.get(entry.allocation.invoice_item_id, set())) > 1:
+            human_confirmation_requirements.append(
+                SupplierRequestHumanConfirmationRequirement(
+                    code="MANY_TO_MANY_INVOICE_ITEM_ALLOCATION",
+                    contract_id=contract.id,
+                    related_contract_item_ids=(item.id,),
+                    related_invoice_item_ids=(entry.allocation.invoice_item_id,),
+                )
+            )
+            continue
+        confirmed_candidate = (
+            entry.invoice is not None
+            and entry.invoice.direction == InvoiceDirection.PURCHASE
+            and entry.invoice_item is not None
+        )
+        actual_unit = entry.invoice_item.unit if confirmed_candidate else None
+        actual_quantity = entry.invoice_item.quantity if confirmed_candidate else None
+        if (
+            not confirmed_candidate
+            or item.quantity is None
+            or item.unit is None
+            or actual_quantity is None
+            or actual_unit is None
+            or actual_unit != item.unit
+        ):
+            outcome = SupplierRequestQuantityCheckOutcome.HUMAN_CONFIRMATION_REQUIRED
+            human_confirmation_requirements.append(
+                SupplierRequestHumanConfirmationRequirement(
+                    code="QUANTITY_COMPARISON_NOT_COMPARABLE",
+                    contract_id=contract.id,
+                    related_contract_item_ids=(item.id,),
+                    related_invoice_item_ids=(entry.allocation.invoice_item_id,),
+                )
+            )
+        else:
+            outcome = (
+                SupplierRequestQuantityCheckOutcome.MATCH
+                if actual_quantity == item.quantity
+                else SupplierRequestQuantityCheckOutcome.DEVIATION
+            )
+            if outcome == SupplierRequestQuantityCheckOutcome.DEVIATION:
+                advisories.append(
+                    SupplierRequestAdvisory(
+                        code=SupplierRequestAdvisoryCode.PURCHASE_INVOICE_QUANTITY_DEVIATION,
+                        contract_id=contract.id,
+                        related_invoice_ids=(entry.invoice.id,),
+                        related_invoice_item_ids=(entry.allocation.invoice_item_id,),
+                        note="PURCHASE invoice allocation quantity deviates from the ContractItem quantity — management review",
+                    )
+                )
+        quantity_checks.append(
+            SupplierRequestQuantityCheck(
+                check_name=QUANTITY_CONSISTENCY_CHECK_NAME,
+                contract_id=contract.id,
+                contract_item_id=item.id,
+                source_id=entry.allocation.invoice_item_id,
+                expected_quantity=item.quantity,
+                expected_unit=item.unit,
+                actual_quantity=actual_quantity,
+                actual_unit=actual_unit,
+                outcome=outcome,
+            )
+        )
+
+    # Shipment values are secondary consistency context.  A Shipment
+    # explicitly attached to exactly one ContractItem shares that item's
+    # quantity scope; only that direct 1:1 association can be compared.
+    # There is no cross-item total or unit conversion.
+    shipments_by_item: dict[uuid.UUID, list] = {}
+    for shipment in scope.shipments:
+        if shipment.contract_item_id is None or shipment.contract_item_id not in item_by_id:
+            human_confirmation_requirements.append(
+                SupplierRequestHumanConfirmationRequirement(
+                    code="SHIPMENT_CONTRACT_ITEM_ASSOCIATION_UNKNOWN",
+                    contract_id=contract.id,
+                    related_shipment_ids=(shipment.id,),
+                )
+            )
+            continue
+        shipments_by_item.setdefault(shipment.contract_item_id, []).append(shipment)
+    for contract_item_id, shipments in shipments_by_item.items():
+        if len(shipments) != 1:
+            human_confirmation_requirements.append(
+                SupplierRequestHumanConfirmationRequirement(
+                    code="MANY_TO_MANY_SHIPMENT_QUANTITY_SCOPE",
+                    contract_id=contract.id,
+                    related_contract_item_ids=(contract_item_id,),
+                    related_shipment_ids=tuple(sorted((shipment.id for shipment in shipments), key=str)),
+                )
+            )
+            continue
+        shipment = shipments[0]
+        item = item_by_id[contract_item_id]
+        if item.quantity is None or shipment.quantity is None:
+            outcome = SupplierRequestQuantityCheckOutcome.HUMAN_CONFIRMATION_REQUIRED
+            human_confirmation_requirements.append(
+                SupplierRequestHumanConfirmationRequirement(
+                    code="SHIPMENT_QUANTITY_COMPARISON_NOT_COMPARABLE",
+                    contract_id=contract.id,
+                    related_contract_item_ids=(contract_item_id,),
+                    related_shipment_ids=(shipment.id,),
+                )
+            )
+        else:
+            outcome = (
+                SupplierRequestQuantityCheckOutcome.MATCH
+                if shipment.quantity == item.quantity
+                else SupplierRequestQuantityCheckOutcome.DEVIATION
+            )
+            if outcome == SupplierRequestQuantityCheckOutcome.DEVIATION:
+                advisories.append(
+                    SupplierRequestAdvisory(
+                        code=SupplierRequestAdvisoryCode.PROCUREMENT_CONTRACT_SHIPMENT_QUANTITY_DEVIATION,
+                        contract_id=contract.id,
+                        related_contract_item_ids=(contract_item_id,),
+                        note="Shipment quantity deviates from the directly linked ContractItem quantity — management review",
+                    )
+                )
+        quantity_checks.append(
+            SupplierRequestQuantityCheck(
+                check_name=SHIPMENT_QUANTITY_CONSISTENCY_CHECK_NAME,
+                contract_id=contract.id,
+                contract_item_id=contract_item_id,
+                source_id=shipment.id,
+                expected_quantity=item.quantity,
+                expected_unit=item.unit,
+                actual_quantity=shipment.quantity,
+                actual_unit=item.unit,
+                outcome=outcome,
+            )
+        )
 
     # B. IP-P03 — PURCHASE invoice cardinality on this Contract, from the
     # F0 associations (which preserve every association, missing or
@@ -758,7 +1073,6 @@ def _evaluate_scope(
     # NOT_COMPARABLE_MISSING_FACT — a check result ONLY: the optional
     # management comparison is unavailable and does NOT block
     # preparation.
-    item_by_id = {item.id: item for item in scope.items}
     item_name_checks: list[SupplierRequestItemNameCheck] = []
     deviation_items_by_invoice: dict[uuid.UUID, list[uuid.UUID]] = {}
     for entry in scope.invoice_item_allocations:
@@ -870,11 +1184,14 @@ def _evaluate_scope(
         status=status,
         expected_purchase_invoice_gross_amount=expected_amount,
         expected_purchase_invoice_currency=expected_currency,
+        item_preparations=tuple(item_preparations),
         invoice_allocations=tuple(scope.invoice_allocations),
         invoice_item_allocations=tuple(scope.invoice_item_allocations),
         payment_allocations=tuple(scope.payment_allocations),
         amount_checks=tuple(amount_checks),
         item_name_checks=tuple(item_name_checks),
+        quantity_checks=tuple(quantity_checks),
+        human_confirmation_requirements=tuple(human_confirmation_requirements),
         blockers=tuple(blockers),
         advisories=tuple(advisories),
     )

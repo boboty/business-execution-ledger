@@ -10,6 +10,7 @@
 
 <section class="panel">
   <p class="section-note">{{ vm.page_note }}</p>
+  <p class="section-note section-note-muted">拟开票月份：{{ vm.invoice_month or "未提供（FX 结果显示为缺失）" }}</p>
   <p class="section-note section-note-muted">
     <a href="#sales-section">向客户开票（{{ vm.sales_scope_count }} 个销售范围）</a>
     ·
@@ -37,6 +38,7 @@
         <div class="kv"><dt>客户</dt><dd>{{ scope.customer }}{% if not scope.customer_known %} <span class="tag tag-none">客户待补充</span>{% endif %}</dd></div>
         <div class="kv"><dt>合同金额</dt><dd class="num">{{ scope.gross_amount }} {{ scope.currency }}</dd></div>
         <div class="kv"><dt>合同日期</dt><dd>{{ scope.contract_date }}</dd></div>
+        <div class="kv"><dt>应开数量（销售合同）</dt><dd class="num">{{ scope.expected_quantity }}</dd></div>
       </dl>
 
       <p class="wb-sub">已关联采购合同（当前关联）</p>
@@ -75,6 +77,13 @@
 
     <div class="wb-block">
       <h4 class="wb-block-title">核对结果</h4>
+      <p class="wb-sub">销项准备金额（USD × 适用汇率）</p>
+      <ul class="ledger-nested-list">
+        <li>原始 USD 合同金额：{{ scope.usd_amount }}</li>
+        <li>适用汇率：{{ scope.fx_rate }}{% if scope.fx_rate_date != '—' %}（公告日期 {{ scope.fx_rate_date }}）{% endif %}</li>
+        <li>预计 CNY 开票金额：{{ scope.expected_cny_amount }}</li>
+        <li>备注数据：{{ scope.invoice_note }}</li>
+      </ul>
       {% if scope.amount_control %}
       <p class="wb-sub">金额核对（销售合同金额 / 报关申报金额 / 已确认销项发票金额）</p>
       <p><span class="tag {{ scope.amount_control.outcome_tag }}">{{ scope.amount_control.outcome_label }}</span></p>
@@ -142,6 +151,7 @@
         <div class="kv"><dt>我方主体（买方）</dt><dd>{{ scope.our_entity }}</dd></div>
         <div class="kv"><dt>合同金额</dt><dd class="num">{{ scope.gross_amount }} {{ scope.currency }}</dd></div>
         <div class="kv"><dt>合同日期</dt><dd>{{ scope.contract_date }}</dd></div>
+        <div class="kv"><dt>应开数量（采购合同）</dt><dd class="num">{{ scope.expected_quantity }}</dd></div>
       </dl>
 
       <p class="wb-sub">当前商品明细</p>
@@ -153,6 +163,14 @@
       </ul>
       {% else %}
       <p class="empty-cell">暂无已确认商品明细</p>
+      {% endif %}
+      {% if scope.item_preparations %}
+      <p class="wb-sub">采购准备字段</p>
+      <ul class="ledger-nested-list">
+        {% for item in scope.item_preparations %}
+        <li>{{ item.product_name }} · 数量 {{ item.quantity }} {{ item.unit }} · 税收分类编码 {{ item.tax_classification_code }}{% if item.tax_classification_code_status == 'HUMAN_CONFIRMATION_REQUIRED' %}（待人工确认）{% endif %}</li>
+        {% endfor %}
+      </ul>
       {% endif %}
 
       <p class="wb-sub">已确认出货事实</p>

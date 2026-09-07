@@ -82,6 +82,7 @@ SALES_COMPARISON_MESSAGES = {
     "NOT_COMPARABLE_MISSING_FACT": "当前信息不足，暂无法核对",
     "NOT_COMPARABLE_CURRENCY_MISMATCH": "币种不同，暂不直接比较金额",
     "NOT_COMPARABLE_AMBIGUOUS_SCOPE": "对应范围不唯一，暂无法自动核对",
+    "NOT_COMPARABLE_FX_MISSING": "缺少明确月份或可追溯汇率，暂无法核算",
 }
 
 SUPPLIER_AMOUNT_CHECK_MESSAGES = {
@@ -193,6 +194,16 @@ class InvoicePreparationExportRow:
     related_shipment_ids: str | None = None
     source_id: str | None = None
     allocated_amount: Decimal | None = None
+    # Explicit preparation inputs/results.  These remain projection fields:
+    # absence is preserved as blank/missing and never replaced by a default.
+    quantity: Decimal | None = None
+    product_code: str | None = None
+    tax_classification_code: str | None = None
+    sales_usd_amount: Decimal | None = None
+    fx_rate: Decimal | None = None
+    fx_rate_date: date | None = None
+    expected_sales_invoice_cny: Decimal | None = None
+    invoice_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -343,6 +354,12 @@ def _sales_preparation_row(scope, decision) -> InvoicePreparationExportRow:
         # The F1f comparison's resolved trace identifiers, verbatim.
         comparison_shipment_id=str(check.shipment_id) if check and check.shipment_id else None,
         comparison_sales_invoice_id=str(check.sales_invoice_id) if check and check.sales_invoice_id else None,
+        quantity=getattr(decision, "expected_quantity", getattr(sc, "quantity", None)),
+        sales_usd_amount=getattr(decision, "contract_usd_amount", None),
+        fx_rate=getattr(check, "applicable_fx_rate", None) if check else None,
+        fx_rate_date=getattr(check, "applicable_fx_date", None) if check else None,
+        expected_sales_invoice_cny=getattr(check, "expected_invoice_cny", None) if check else None,
+        invoice_note=("USD金额 + 汇率" if check and check.applicable_fx_rate is not None else None),
     )
 
 
@@ -473,6 +490,8 @@ def _supplier_checks_json(amount_checks, item_name_checks) -> str | None:
 
 def _supplier_request_row(scope, decision) -> InvoicePreparationExportRow:
     contract = scope.contract
+    item_preparations = getattr(decision, "item_preparations", ())
+    first_item = scope.items[0] if len(scope.items) == 1 else None
     return InvoicePreparationExportRow(
         record_type=RECORD_TYPE_SUPPLIER_REQUEST,
         procurement_contract_id=str(contract.id),
@@ -492,6 +511,9 @@ def _supplier_request_row(scope, decision) -> InvoicePreparationExportRow:
             1 for c in decision.item_name_checks if c.outcome == "DEVIATION"
         ),
         supplier_checks_json=_supplier_checks_json(decision.amount_checks, decision.item_name_checks),
+        quantity=(item_preparations[0].expected_purchase_invoice_quantity if len(item_preparations) == 1 else None),
+        product_code=(item_preparations[0].tax_classification_code if len(item_preparations) == 1 else None),
+        tax_classification_code=(item_preparations[0].tax_classification_code if len(item_preparations) == 1 else None),
     )
 
 
@@ -679,6 +701,14 @@ CSV_HEADERS = [
     "related_shipment_ids",
     "source_id",
     "allocated_amount",
+    "quantity",
+    "product_code",
+    "tax_classification_code",
+    "sales_usd_amount",
+    "fx_rate",
+    "fx_rate_date",
+    "expected_sales_invoice_cny",
+    "invoice_note",
 ]
 
 

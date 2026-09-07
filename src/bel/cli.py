@@ -1870,6 +1870,11 @@ def invoice_preparation_group() -> None:
 
 @invoice_preparation_group.command("export")
 @click.option("--format", "fmt", type=click.Choice(["xlsx", "csv"]), required=True, help="Output format.")
+@click.option("--invoice-month", type=click.DateTime(formats=["%Y-%m"]), default=None, help="拟开票月份（YYYY-MM）。")
+@click.option("--fx-rate", type=Decimal, default=None, help="可追溯汇率输入（需同时提供日期和来源）。")
+@click.option("--fx-rate-date", type=click.DateTime(formats=["%Y-%m-%d"]), default=None, help="汇率公告日期。")
+@click.option("--fx-source", type=str, default=None, help="汇率权威来源标识。")
+@click.option("--fx-provenance-fragment-id", type=str, default=None, help="汇率 Evidence fragment UUID。")
 @click.option(
     "--output",
     "output_path",
@@ -1878,14 +1883,25 @@ def invoice_preparation_group() -> None:
     help="File to write the Data Product to.",
 )
 @click.pass_context
-def invoice_preparation_export(ctx: click.Context, fmt: str, output_path: Path) -> None:
+def invoice_preparation_export(ctx: click.Context, fmt: str, invoice_month, fx_rate, fx_rate_date, fx_source, fx_provenance_fragment_id, output_path: Path) -> None:
     """Generate the Invoice Preparation Data Product as XLSX or CSV.
     Strictly read-only: calls the SAME Application Data Product path Web
     uses (get_invoice_preparation_workbench -> data product -> serializer)
     and writes nothing to the database."""
+    from bel.application.invoice_preparation import ApplicableFxRateEvidence
+    from uuid import UUID
+    month = invoice_month.date() if invoice_month else None
+    evidence = ()
+    if any(v is not None for v in (fx_rate, fx_rate_date, fx_source, fx_provenance_fragment_id)):
+        if None in (fx_rate, fx_rate_date, fx_source, fx_provenance_fragment_id):
+            raise click.UsageError("FX 输入必须同时提供 --fx-rate、--fx-rate-date、--fx-source 和 --fx-provenance-fragment-id")
+        try:
+            evidence = (ApplicableFxRateEvidence(source=fx_source, publication_date=fx_rate_date.date(), usd_cny_rate=fx_rate, provenance_fragment_id=UUID(fx_provenance_fragment_id)),)
+        except ValueError as exc:
+            raise click.UsageError("--fx-provenance-fragment-id 必须为 UUID") from exc
     session_factory = _session_factory(ctx.obj["database_url"])
     with session_factory() as session:
-        workbench = get_invoice_preparation_workbench(session)
+        workbench = get_invoice_preparation_workbench(session, invoice_month=month, fx_rate_evidence=evidence)
     product = build_invoice_preparation_data_product(workbench)
     content = export_invoice_preparation_xlsx(product) if fmt == "xlsx" else export_invoice_preparation_csv(product)
     output_path.write_bytes(content)

@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
@@ -184,9 +186,25 @@ class SupplierScopeContext:
 
 
 @dataclass(frozen=True)
+class ApplicableFxRateEvidence:
+    """A caller-supplied, already-confirmed SAFE daily USD/CNY rate.
+
+    Core never fetches rates. The session entry point verifies the Evidence
+    fragment exists; pure evaluation consumes this immutable context.
+    """
+
+    source: str
+    publication_date: date
+    usd_cny_rate: Decimal
+    provenance_fragment_id: uuid.UUID
+
+
+@dataclass(frozen=True)
 class InvoicePreparationContext:
     sales_scopes: tuple[SalesScopeContext, ...]
     supplier_scopes: tuple[SupplierScopeContext, ...]
+    invoice_month: date | None = None
+    fx_rate_evidence: tuple[ApplicableFxRateEvidence, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -217,7 +235,9 @@ class InvoicePreparationFilters:
 
 
 def get_invoice_preparation_context(
-    session: Session, filters: InvoicePreparationFilters | None = None
+    session: Session, filters: InvoicePreparationFilters | None = None,
+    *, invoice_month: date | None = None,
+    fx_rate_evidence: tuple[ApplicableFxRateEvidence, ...] = (),
 ) -> InvoicePreparationContext:
     """Compose the read-only invoice-preparation FACT context. Strictly
     read-only — no Fact, Task, MatchCase or business-state write, and no
@@ -235,7 +255,17 @@ def get_invoice_preparation_context(
         sales_scopes = _build_sales_scopes(session, filters, by_sales_contract_unresolved)
         supplier_scopes = _build_supplier_scopes(session, filters, by_contract_unresolved)
 
-        return InvoicePreparationContext(sales_scopes=sales_scopes, supplier_scopes=supplier_scopes)
+        # Evidence provenance is a hard boundary for session-backed use:
+        # a bare URL/string is not a confirmed Fact.
+        from bel.infrastructure.persistence.repositories import EvidenceRepository
+        evidence_repo = EvidenceRepository(session)
+        for fx in fx_rate_evidence:
+            if evidence_repo.get_fragment(fx.provenance_fragment_id) is None:
+                raise ValueError(f"FX provenance EvidenceFragment {fx.provenance_fragment_id} not found")
+        return InvoicePreparationContext(
+            sales_scopes=sales_scopes, supplier_scopes=supplier_scopes,
+            invoice_month=invoice_month, fx_rate_evidence=fx_rate_evidence,
+        )
 
 
 def _build_sales_scopes(

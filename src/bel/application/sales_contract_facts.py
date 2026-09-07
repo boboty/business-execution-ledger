@@ -154,6 +154,18 @@ def _validate_fields(fields: dict[str, Any]) -> None:
             f"field(s) {none_valued} were passed as None — omit a field entirely if it is not being "
             "asserted this call; None is never a valid asserted value"
         )
+    if "quantity" in fields:
+        quantity = fields["quantity"]
+        if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity < 0:
+            raise SalesContractFactError("quantity must be a finite non-negative Decimal")
+        try:
+            maximum = (Decimal(10) ** 14) - Decimal("0.0001")
+            if quantity.quantize(Decimal("0.0001")) != quantity or quantity > maximum:
+                raise SalesContractFactError("quantity exceeds Numeric(18,4) precision")
+        except (ValueError, ArithmeticError):
+            raise SalesContractFactError("quantity exceeds Numeric(18,4) precision") from None
+    if "unit" in fields and (not isinstance(fields["unit"], str) or not fields["unit"].strip()):
+        raise SalesContractFactError("unit must be a non-empty explicit string")
 
 
 def _revision_values(revision: SalesContractRevision) -> dict[str, Any]:

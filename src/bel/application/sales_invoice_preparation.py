@@ -96,11 +96,13 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from decimal import Decimal
+from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy.orm import Session
 
 from bel.application.invoice_preparation import (
+    ApplicableFxRateEvidence,
     InvoicePreparationContext,
     SalesScopeContext,
     SupplierScopeContext,
@@ -237,6 +239,8 @@ class SalesAmountCheckOutcome:
     NOT_COMPARABLE_MISSING_FACT = "NOT_COMPARABLE_MISSING_FACT"
     NOT_COMPARABLE_CURRENCY_MISMATCH = "NOT_COMPARABLE_CURRENCY_MISMATCH"
     NOT_COMPARABLE_AMBIGUOUS_SCOPE = "NOT_COMPARABLE_AMBIGUOUS_SCOPE"
+    NOT_COMPARABLE_FX_MISSING = "NOT_COMPARABLE_FX_MISSING"
+    NOT_COMPARABLE_FX_AMBIGUOUS = "NOT_COMPARABLE_FX_AMBIGUOUS"
 
 
 # The single three-way check IP-S02 freezes (Phase 2D.3-F1f). Adding
@@ -332,6 +336,20 @@ class SalesInvoiceAmountCheck:
     sales_invoice_id: uuid.UUID | None
     outcome: str
     note: str | None = None
+    expected_invoice_cny: Decimal | None = None
+    applicable_fx_rate: Decimal | None = None
+    applicable_fx_date: object | None = None
+    fx_provenance_fragment_id: uuid.UUID | None = None
+
+
+@dataclass(frozen=True)
+class SalesQuantityCheck:
+    expected_quantity: Decimal | None
+    expected_unit: str | None
+    shipment_quantity: Decimal | None
+    shipment_unit: str | None
+    outcome: str
+    shipment_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -360,6 +378,20 @@ class SalesInvoicePreparationDecision:
     # Explicit NON-BLOCKING management findings (IP-S02 deviation). Never
     # affect ``status`` — status is derived from blockers alone.
     advisories: tuple[SalesInvoiceAdvisory, ...] = ()
+    expected_quantity: Decimal | None = None
+    expected_unit: str | None = None
+    contract_usd_amount: Decimal | None = None
+    invoice_note_data: "SalesInvoiceNoteData | None" = None
+    quantity_check: SalesQuantityCheck | None = None
+
+
+@dataclass(frozen=True)
+class SalesInvoiceNoteData:
+    """Structured downstream data; presentation owns wording/formatting."""
+    contract_usd_amount: Decimal
+    applicable_fx_rate: Decimal
+    applicable_fx_date: object
+    expected_invoice_cny: Decimal
 
 
 @dataclass(frozen=True)
@@ -372,11 +404,16 @@ class SalesInvoicePreparationReport:
 # ---------------------------------------------------------------------------
 
 
-def evaluate_sales_invoice_preparation(session: Session) -> SalesInvoicePreparationReport:
+def evaluate_sales_invoice_preparation(
+    session: Session, *, invoice_month=None,
+    fx_rate_evidence: tuple[ApplicableFxRateEvidence, ...] = (),
+) -> SalesInvoicePreparationReport:
     """Evaluate the SALES_INVOICE_PREPARATION rule foundation over the
     complete F0 fact context (unfiltered — a scope's shipment resolution
     must never be blinded by an axis filter). Strictly read-only."""
-    context = get_invoice_preparation_context(session)
+    context = get_invoice_preparation_context(
+        session, invoice_month=invoice_month, fx_rate_evidence=fx_rate_evidence
+    )
     return evaluate_sales_invoice_preparation_from_context(context)
 
 
@@ -389,7 +426,9 @@ def evaluate_sales_invoice_preparation_from_context(
     supplier_scope_by_contract_id = {scope.contract.id: scope for scope in context.supplier_scopes}
     return SalesInvoicePreparationReport(
         decisions=tuple(
-            _evaluate_scope(scope, supplier_scope_by_contract_id) for scope in context.sales_scopes
+            _evaluate_scope(
+                scope, supplier_scope_by_contract_id, context.invoice_month, context.fx_rate_evidence
+            ) for scope in context.sales_scopes
         )
     )
 
@@ -397,6 +436,8 @@ def evaluate_sales_invoice_preparation_from_context(
 def _evaluate_scope(
     scope: SalesScopeContext,
     supplier_scope_by_contract_id: dict[uuid.UUID, object],
+    invoice_month,
+    fx_rate_evidence: tuple[ApplicableFxRateEvidence, ...],
 ) -> SalesInvoicePreparationDecision:
     sales_contract = scope.sales_contract
     blockers: list[SalesPreparationBlocker] = []
@@ -492,7 +533,17 @@ def _evaluate_scope(
     # Phase 2D.3-F1f — IP-S02 three-way amount comparison (management
     # control). Evaluated independently of status: a NOT_COMPARABLE_*
     # outcome never changes status and never blocks invoice preparation.
-    amount_check, amount_advisories = _evaluate_ip_s02_amount_check(scope, supplier_scope_by_contract_id)
+    amount_check, amount_advisories = _evaluate_ip_s02_amount_check(
+        scope, supplier_scope_by_contract_id, invoice_month, fx_rate_evidence
+    )
+    note_data = None
+    if amount_check.expected_invoice_cny is not None and amount_check.applicable_fx_rate is not None:
+        note_data = SalesInvoiceNoteData(
+            contract_usd_amount=sales_contract.gross_amount,
+            applicable_fx_rate=amount_check.applicable_fx_rate,
+            applicable_fx_date=amount_check.applicable_fx_date,
+            expected_invoice_cny=amount_check.expected_invoice_cny,
+        )
 
     return SalesInvoicePreparationDecision(
         sales_contract_id=sales_contract.id,
@@ -507,6 +558,11 @@ def _evaluate_scope(
         blockers=tuple(blockers),
         amount_check=amount_check,
         advisories=tuple(amount_advisories),
+        expected_quantity=sales_contract.quantity,
+        expected_unit=sales_contract.unit,
+        contract_usd_amount=sales_contract.gross_amount if sales_contract.currency == "USD" else None,
+        invoice_note_data=note_data,
+        quantity_check=_quantity_check(scope, supplier_scope_by_contract_id),
     )
 
 
@@ -521,6 +577,10 @@ def _amount_check(
     sales_invoice_currency: str | None,
     outcome: str,
     note: str | None,
+    expected_invoice_cny: Decimal | None = None,
+    applicable_fx_rate: Decimal | None = None,
+    applicable_fx_date=None,
+    fx_provenance_fragment_id: uuid.UUID | None = None,
 ) -> SalesInvoiceAmountCheck:
     """Build one IP-S02 check from the resolved comparison legs. The
     SalesContract leg is always present (every sales scope has one); the
@@ -541,12 +601,18 @@ def _amount_check(
         sales_invoice_id=invoice.id if invoice is not None else None,
         outcome=outcome,
         note=note,
+        expected_invoice_cny=expected_invoice_cny,
+        applicable_fx_rate=applicable_fx_rate,
+        applicable_fx_date=applicable_fx_date,
+        fx_provenance_fragment_id=fx_provenance_fragment_id,
     )
 
 
 def _evaluate_ip_s02_amount_check(
     scope: SalesScopeContext,
     supplier_scope_by_contract_id: dict[uuid.UUID, SupplierScopeContext],
+    invoice_month,
+    fx_rate_evidence: tuple[ApplicableFxRateEvidence, ...],
 ) -> tuple[SalesInvoiceAmountCheck, tuple[SalesInvoiceAdvisory, ...]]:
     """Phase 2D.3-F1f — the IP-S02 three-way sales amount comparison
     (SalesContract gross amount vs Shipment/Export declared amount vs
@@ -606,150 +672,114 @@ def _evaluate_ip_s02_amount_check(
             None,
         )
 
-    # --- Declaration leg: exactly one current link, exactly one current
-    # Shipment on the linked Contract. ---
-    shipment = None
-    declaration_ambiguous = False
-    declaration_note: str | None
-    link_entries = scope.linked_procurement_contracts
-    if not link_entries:
-        declaration_note = "no current ProcurementSalesLink (IP-S02)"
-    elif len(link_entries) > 1:
-        declaration_ambiguous = True
-        declaration_note = "multiple current ProcurementSalesLinks — no arbitrary choice (IP-S02)"
-    else:
-        linked_contract = link_entries[0].contract
-        if linked_contract is None:
-            declaration_note = "the sole current link names no existing procurement Contract Fact (IP-S02)"
-        else:
-            supplier_scope = supplier_scope_by_contract_id.get(linked_contract.id)
-            shipments = supplier_scope.shipments if supplier_scope is not None else ()
-            if not shipments:
-                declaration_note = "no current Shipment/Export Fact on the linked Contract (IP-S02)"
-            elif len(shipments) > 1:
-                declaration_ambiguous = True
-                declaration_note = "multiple current Shipment/Export Facts — no sum / no arbitrary choice (IP-S02)"
-            else:
-                shipment = shipments[0]
-                declaration_note = None
-
-    # Cardinality ambiguity takes precedence over selecting arbitrary
-    # facts: either leg ambiguous => the whole comparison is
-    # NOT_COMPARABLE_AMBIGUOUS_SCOPE, no candidate is chosen from the
-    # AMBIGUOUS leg, no sum and no apportionment is performed. The OTHER
-    # leg, when it resolved to a single candidate, stays exposed — an
-    # unambiguous Fact is not an arbitrary choice.
-    if invoice_ambiguous or declaration_ambiguous:
-        note = (
-            declaration_note
-            if declaration_ambiguous
-            else "multiple confirmed SALES Invoice Facts — no sum / no arbitrary choice (IP-S02)"
+    # The expected sales invoice is a separate conversion from the
+    # customs/shipment management context.  It is never inferred from a
+    # shipment, a purchase value, wall-clock time, or a default rate.
+    fx, fx_outcome, fx_note = _select_applicable_fx(invoice_month, fx_rate_evidence)
+    if sales_contract.currency != "USD" or sales_contract.gross_amount is None:
+        fx, fx_outcome, fx_note = None, SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT, (
+            "SalesContract USD amount/currency Fact is absent — no conversion"
         )
+    if fx is None:
         return _amount_check(
-            scope,
-            shipment=shipment,
-            declared_amount=shipment.declared_amount if shipment is not None else None,
-            declared_currency=shipment.declared_currency if shipment is not None else None,
+            scope, shipment=None, declared_amount=None, declared_currency=None,
             invoice=sales_invoice,
             sales_invoice_amount=sales_invoice.gross_amount if sales_invoice is not None else None,
             sales_invoice_currency=sales_invoice.currency if sales_invoice is not None else None,
+            outcome=fx_outcome, note=fx_note,
+        ), tuple(advisories)
+    expected_cny = (sales_contract.gross_amount * fx.usd_cny_rate).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    # An actual invoice is compared with the derived CNY expectation.  A
+    # different explicit currency is never converted implicitly.
+    if invoice_ambiguous:
+        return _amount_check(
+            scope, shipment=None, declared_amount=None, declared_currency=None,
+            invoice=None, sales_invoice_amount=None, sales_invoice_currency=None,
             outcome=SalesAmountCheckOutcome.NOT_COMPARABLE_AMBIGUOUS_SCOPE,
-            note=note,
+            note="multiple confirmed SALES Invoice Facts — no sum / no arbitrary choice",
+            expected_invoice_cny=expected_cny, applicable_fx_rate=fx.usd_cny_rate,
+            applicable_fx_date=fx.publication_date, fx_provenance_fragment_id=fx.provenance_fragment_id,
         ), tuple(advisories)
-
-    # Missing invoice Fact or missing declaration scope =>
-    # NOT_COMPARABLE_MISSING_FACT — a check result ONLY (never a blocker,
-    # never a status change, never "may not issue invoice").
-    if sales_invoice is None or shipment is None:
-        note = (
-            declaration_note
-            if shipment is None
-            else "no confirmed SALES Invoice Fact (IP-S02)"
-        )
+    if sales_invoice is None or sales_invoice.gross_amount is None or sales_invoice.currency is None:
         return _amount_check(
-            scope,
-            shipment=shipment,
-            declared_amount=shipment.declared_amount if shipment is not None else None,
-            declared_currency=shipment.declared_currency if shipment is not None else None,
+            scope, shipment=None, declared_amount=None, declared_currency=None,
             invoice=sales_invoice,
             sales_invoice_amount=sales_invoice.gross_amount if sales_invoice is not None else None,
             sales_invoice_currency=sales_invoice.currency if sales_invoice is not None else None,
             outcome=SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT,
-            note=note,
+            note="confirmed SALES invoice amount/currency Fact is absent",
+            expected_invoice_cny=expected_cny, applicable_fx_rate=fx.usd_cny_rate,
+            applicable_fx_date=fx.publication_date, fx_provenance_fragment_id=fx.provenance_fragment_id,
         ), tuple(advisories)
-
-    # All three legs resolved — the six compared values.
-    sc_amount, sc_currency = sales_contract.gross_amount, sales_contract.currency
-    dec_amount, dec_currency = shipment.declared_amount, shipment.declared_currency
-    inv_amount, inv_currency = sales_invoice.gross_amount, sales_invoice.currency
-
-    # Any required amount/currency Fact absent => NOT_COMPARABLE_MISSING_FACT.
-    # No implicit currency and no default is ever invented.
-    if None in (sc_amount, sc_currency, dec_amount, dec_currency, inv_amount, inv_currency):
+    if sales_invoice.currency != "CNY":
         return _amount_check(
-            scope,
-            shipment=shipment,
-            declared_amount=dec_amount,
-            declared_currency=dec_currency,
-            invoice=sales_invoice,
-            sales_invoice_amount=inv_amount,
-            sales_invoice_currency=inv_currency,
-            outcome=SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT,
-            note="a compared amount/currency Fact is absent — no implicit currency, no comparison (IP-S02)",
-        ), tuple(advisories)
-
-    # All three currencies explicit but not all equal =>
-    # NOT_COMPARABLE_CURRENCY_MISMATCH + SALES_INVOICE_CURRENCY_DEVIATION
-    # (no amount comparison is attempted, no FX, no amount deviation).
-    if not (sc_currency == dec_currency == inv_currency):
-        check = _amount_check(
-            scope,
-            shipment=shipment,
-            declared_amount=dec_amount,
-            declared_currency=dec_currency,
-            invoice=sales_invoice,
-            sales_invoice_amount=inv_amount,
-            sales_invoice_currency=inv_currency,
+            scope, shipment=None, declared_amount=None, declared_currency=None,
+            invoice=sales_invoice, sales_invoice_amount=sales_invoice.gross_amount,
+            sales_invoice_currency=sales_invoice.currency,
             outcome=SalesAmountCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH,
-            note="explicit currencies differ — no FX, no amount comparison (IP-S02)",
-        )
-        advisories.append(
-            SalesInvoiceAdvisory(
-                code=SalesInvoiceAdvisoryCode.SALES_INVOICE_CURRENCY_DEVIATION,
-                sales_contract_id=sales_contract.id,
-                related_invoice_ids=(sales_invoice.id,),
-                related_shipment_ids=(shipment.id,),
-                note="SALES invoice explicit currency differs from the SalesContract / declaration reference — "
-                "amount not compared, management review (IP-S02)",
-            )
-        )
-        return check, tuple(advisories)
-
-    # Same explicit currency: exact Decimal equality on all three amounts.
-    if sc_amount == dec_amount == inv_amount:
-        outcome = SalesAmountCheckOutcome.MATCH
-        note = None
-    else:
-        outcome = SalesAmountCheckOutcome.DEVIATION
-        note = None
-        advisories.append(
-            SalesInvoiceAdvisory(
-                code=SalesInvoiceAdvisoryCode.SALES_INVOICE_AMOUNT_DEVIATION,
-                sales_contract_id=sales_contract.id,
-                related_invoice_ids=(sales_invoice.id,),
-                related_shipment_ids=(shipment.id,),
-                note="SALES invoice gross amount deviates from the SalesContract / declaration reference — "
-                "management review (IP-S02)",
-            )
-        )
+            note="actual SALES invoice is not explicitly CNY — no implicit FX",
+            expected_invoice_cny=expected_cny, applicable_fx_rate=fx.usd_cny_rate,
+            applicable_fx_date=fx.publication_date, fx_provenance_fragment_id=fx.provenance_fragment_id,
+        ), tuple(advisories)
+    actual_outcome = SalesAmountCheckOutcome.MATCH if sales_invoice.gross_amount == expected_cny else SalesAmountCheckOutcome.DEVIATION
+    if actual_outcome == SalesAmountCheckOutcome.DEVIATION:
+        advisories.append(SalesInvoiceAdvisory(
+            code=SalesInvoiceAdvisoryCode.SALES_INVOICE_AMOUNT_DEVIATION,
+            sales_contract_id=sales_contract.id, related_invoice_ids=(sales_invoice.id,),
+            note="SALES invoice CNY gross amount deviates from the FX-derived CNY expectation",
+        ))
     return _amount_check(
-        scope,
-        shipment=shipment,
-        declared_amount=dec_amount,
-        declared_currency=dec_currency,
-        invoice=sales_invoice,
-        sales_invoice_amount=inv_amount,
-        sales_invoice_currency=inv_currency,
-        outcome=outcome,
-        note=note,
+        scope, shipment=None, declared_amount=None, declared_currency=None,
+        invoice=sales_invoice, sales_invoice_amount=sales_invoice.gross_amount,
+        sales_invoice_currency=sales_invoice.currency, outcome=actual_outcome, note=None,
+        expected_invoice_cny=expected_cny, applicable_fx_rate=fx.usd_cny_rate,
+        applicable_fx_date=fx.publication_date, fx_provenance_fragment_id=fx.provenance_fragment_id,
     ), tuple(advisories)
+
+
+def _select_applicable_fx(invoice_month, evidence: tuple[ApplicableFxRateEvidence, ...]):
+    if invoice_month is None:
+        return None, SalesAmountCheckOutcome.NOT_COMPARABLE_FX_MISSING, "invoice_month is required explicitly"
+    target = date(invoice_month.year, invoice_month.month, 1)
+    valid = [
+        rate for rate in evidence
+        if rate.source == "SAFE"
+        and isinstance(rate.usd_cny_rate, Decimal)
+        and rate.usd_cny_rate.is_finite()
+        and rate.usd_cny_rate > 0
+        and rate.publication_date <= target
+    ]
+    if not valid:
+        return None, SalesAmountCheckOutcome.NOT_COMPARABLE_FX_MISSING, "no valid confirmed SAFE USD/CNY rate on or before month start"
+    latest_day = max(rate.publication_date for rate in valid)
+    latest = [rate for rate in valid if rate.publication_date == latest_day]
+    if len(latest) != 1:
+        return None, SalesAmountCheckOutcome.NOT_COMPARABLE_FX_AMBIGUOUS, "multiple valid SAFE rates on applicable publication date"
+    return latest[0], None, None
+
+
+def _quantity_check(scope: SalesScopeContext, supplier_scopes: dict[uuid.UUID, SupplierScopeContext]) -> SalesQuantityCheck:
+    """Management consistency only; the SalesContract remains authoritative."""
+    contract = scope.sales_contract
+    if contract.quantity is None or contract.unit is None:
+        return SalesQuantityCheck(None, contract.unit, None, None, "NOT_COMPARABLE_MISSING_FACT")
+    if len(scope.linked_procurement_contracts) != 1:
+        return SalesQuantityCheck(contract.quantity, contract.unit, None, None, "NOT_COMPARABLE_AMBIGUOUS_SCOPE")
+    linked = scope.linked_procurement_contracts[0].contract
+    supplier_scope = supplier_scopes.get(linked.id) if linked is not None else None
+    shipments = supplier_scope.shipments if supplier_scope is not None else ()
+    if len(shipments) != 1:
+        return SalesQuantityCheck(contract.quantity, contract.unit, None, None, "NOT_COMPARABLE_MISSING_FACT")
+    shipment = shipments[0]
+    item = next((item for item in supplier_scope.items if item.id == shipment.contract_item_id), None)
+    unit = item.unit if item is not None else None
+    if shipment.quantity is None or unit is None:
+        return SalesQuantityCheck(contract.quantity, contract.unit, shipment.quantity, unit, "NOT_COMPARABLE_MISSING_FACT", shipment.id)
+    if unit != contract.unit:
+        return SalesQuantityCheck(contract.quantity, contract.unit, shipment.quantity, unit, "NOT_COMPARABLE_UNIT_MISMATCH", shipment.id)
+    return SalesQuantityCheck(
+        contract.quantity, contract.unit, shipment.quantity, unit,
+        "MATCH" if shipment.quantity == contract.quantity else "DEVIATION", shipment.id,
+    )

@@ -150,6 +150,12 @@ def _validate_fields(fields: dict[str, Any]) -> None:
     unknown = sorted(set(fields) - set(CONTRACT_ITEM_FACT_FIELDS))
     if unknown:
         raise ContractItemFactError(f"unknown ContractItem field(s): {unknown}")
+    if "tax_classification_code" in fields and fields["tax_classification_code"] is not None:
+        code = fields["tax_classification_code"]
+        if not isinstance(code, str) or not code or code != code.strip() or len(code) > 64:
+            raise ContractItemFactError(
+                "tax_classification_code must be a non-blank, trimmed string of at most 64 characters"
+            )
 
 
 def _revision_values(revision: ContractItemRevision) -> dict[str, Any]:

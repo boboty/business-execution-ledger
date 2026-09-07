@@ -485,13 +485,12 @@ In both directions:
   does not create a generic workflow eligibility status.
 
 The frozen rule IDs and their provenance live in
-[PHASE2D3-RULE-FREEZE.md](PHASE2D3-RULE-FREEZE.md). `IP-S02`
-(export-sales amount consistency, three-way equality) remains
-`OWNER_CONFIRMED_PROVISIONAL` — exact three-way equality was
-product-owner confirmed and stays subject to later real-data review;
-nothing here upgrades its provenance. The tax-classification-code rule
-(`IP-P08`) is **frozen / register-only** — its implementation remains
-deferred, and no guessed tax code exists anywhere.
+[PHASE2D3-RULE-FREEZE.md](PHASE2D3-RULE-FREEZE.md). Core Completion
+supersedes IP-S02's historical three-way numerical equality with explicit
+USD-to-CNY preparation and separate comparable customs management control.
+IP-P07 uses procurement ContractItem quantity. IP-P08 reuses an
+Evidence-backed code on the current ContractItem revision; absence is
+`HUMAN_CONFIRMATION_REQUIRED`, with no inferred product-category mapping.
 
 V1 does not connect to the e-tax bureau, tax-control systems, or an
 external invoicing API, and does not perform the legal act of issuing an

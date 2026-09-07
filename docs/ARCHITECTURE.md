@@ -235,3 +235,22 @@ API.
 The long-term responsibility split is therefore:
 
 > **Intake interprets. Core decides. Operator acts.**
+
+## Core Completion calculation boundary
+
+Invoice preparation uses current confirmed contract Facts as the authority:
+procurement quantities come from ContractItems; sales quantity comes from
+SalesContract. Shipment/customs Facts are independent consistency context,
+never fallback values or a path for synthesizing a contract Fact.
+
+Sales preparation receives an explicit invoice month and traceable confirmed
+SAFE daily USD/CNY inputs. Core chooses the latest valid publication no later
+than the month's natural first day and computes expected CNY deterministically.
+It does not access a rate website or maintain a holiday calendar. Missing or
+ambiguous inputs remain visible. USD amount, rate, publication date and note
+data remain structured Application outputs; Web/CLI/export only present them.
+
+Tax classification code reuse is scoped to the Evidence-backed current
+ContractItem revision. The existing Fact supplement/correction path is the
+confirmation boundary. No catalogue, inferred category matching or generic
+workflow is introduced.

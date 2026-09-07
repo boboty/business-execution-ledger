@@ -130,6 +130,53 @@ def test_create_contract_item_fact_from_evidence(db_session):
     assert history[0].superseded_by_revision_id is None
 
 
+@pytest.mark.parametrize("code", ["", "   ", " SYNTHETIC-CODE", "SYNTHETIC-CODE ", "X" * 65])
+def test_tax_classification_code_fact_rejects_blank_or_oversized_values(db_session, code):
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id)
+
+    with pytest.raises(ContractItemFactError, match="tax_classification_code"):
+        create_contract_item_fact(
+            db_session,
+            contract_id=contract.id,
+            source_item_key="ITEM-TAX",
+            fields={"tax_classification_code": code},
+            source_fragment_id=frag.id,
+            created_at=NOW,
+        )
+
+
+def test_tax_classification_code_is_versioned_contract_item_fact(db_session):
+    initial_fragment = _make_fragment(db_session)
+    contract = _make_contract(db_session, initial_fragment.id)
+    created = create_contract_item_fact(
+        db_session,
+        contract_id=contract.id,
+        source_item_key="ITEM-TAX",
+        fields={"product_name": "Synthetic Widget"},
+        source_fragment_id=initial_fragment.id,
+        created_at=NOW,
+    )
+    current = ContractItemRepository(db_session).get_current_revision(created.item.id)
+    assert current is not None
+    supplement_fragment = _make_fragment(db_session)
+
+    supplemented = supplement_contract_item_fact(
+        db_session,
+        contract_item_id=created.item.id,
+        based_on_revision_id=current.id,
+        fields={"tax_classification_code": "SYNTHETIC-CODE-A"},
+        source_fragment_id=supplement_fragment.id,
+        created_at=NOW,
+    )
+    db_session.commit()
+
+    assert supplemented.item.tax_classification_code == "SYNTHETIC-CODE-A"
+    history = get_contract_item_history(db_session, created.item.id)
+    assert history[0].tax_classification_code is None
+    assert history[1].tax_classification_code == "SYNTHETIC-CODE-A"
+
+
 def test_create_exact_replay_same_identity_same_evidence_same_assertion(db_session):
     """Test list #1: same identity + same Evidence + same assertion -> exact replay."""
     frag = _make_fragment(db_session)

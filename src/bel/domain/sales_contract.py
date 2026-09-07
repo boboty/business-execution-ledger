@@ -42,6 +42,8 @@ SALES_CONTRACT_FACT_FIELDS: tuple[str, ...] = (
     "currency",
     "gross_amount",
     "contract_date",
+    "quantity",
+    "unit",
 )
 
 
@@ -63,6 +65,8 @@ class SalesContract:
     contract_date: date | None
     current_source_fragment_id: UUID
     created_at: datetime
+    quantity: Decimal | None = None
+    unit: str | None = None
 
 
 @dataclass
@@ -96,3 +100,5 @@ class SalesContractRevision:
     superseded_by_revision_id: UUID | None
     created_at: datetime
     asserted_field_names: list[str] | None = None
+    quantity: Decimal | None = None
+    unit: str | None = None

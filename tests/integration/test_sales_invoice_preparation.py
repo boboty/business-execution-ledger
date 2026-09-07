@@ -577,7 +577,7 @@ def test_status_and_dto_vocabulary_carry_no_eligibility_concept():
     # job is to expose the three compared amount/currency Facts explicitly.
     # The DECISION DTO itself still carries no amount field.
     compared_amount_tokens = ("amount", "quantity", "ratio")
-    compared_amount_dtos = {"SalesInvoiceAmountCheck"}
+    compared_amount_dtos = {"SalesInvoiceAmountCheck", "SalesInvoiceNoteData"}
     import bel.application.sales_invoice_preparation as module
 
     dto_types = [
@@ -597,7 +597,9 @@ def test_status_and_dto_vocabulary_carry_no_eligibility_concept():
             # (a reference to the check DTO, never a should-invoice value);
             # every other field stays free of the amount/quantity/ratio
             # concept.
-            if dto_type.__name__ == "SalesInvoicePreparationDecision" and f.name == "amount_check":
+            if dto_type.__name__ == "SalesInvoicePreparationDecision" and f.name in {
+                "amount_check", "expected_quantity", "contract_usd_amount", "invoice_note_data"
+            }:
                 continue
             for token in compared_amount_tokens:
                 assert token not in f.name.lower(), (

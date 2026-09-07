@@ -123,7 +123,16 @@ def _make_contract(session, fragment_id, contract_no, counterparty="Supplier", g
     return contract
 
 
-def _make_contract_item(session, contract, fragment_id, product_name="Widget Alpha", source_item_key="ITEM-1"):
+def _make_contract_item(
+    session,
+    contract,
+    fragment_id,
+    product_name="Widget Alpha",
+    source_item_key="ITEM-1",
+    quantity=Decimal("10"),
+    unit=None,
+    tax_classification_code=None,
+):
     item = ContractItem(
         id=uuid.uuid4(),
         contract_id=contract.id,
@@ -131,29 +140,38 @@ def _make_contract_item(session, contract, fragment_id, product_name="Widget Alp
         sku=None,
         product_name=product_name,
         specification=None,
-        quantity=Decimal("10"),
-        unit=None,
+        quantity=quantity,
+        unit=unit,
         unit_price=None,
         gross_amount=Decimal("500.00"),
         tax_rate=None,
         net_amount=Decimal("450.00"),
         current_source_fragment_id=fragment_id,
         created_at=NOW,
+        tax_classification_code=tax_classification_code,
     )
     ContractItemRepository(session).add(item)
     session.flush()
     return item
 
 
-def _make_invoice_item(session, invoice, fragment_id, product_name="Widget Alpha", tax_rate=Decimal("0.13")):
+def _make_invoice_item(
+    session,
+    invoice,
+    fragment_id,
+    product_name="Widget Alpha",
+    tax_rate=Decimal("0.13"),
+    unit=None,
+    quantity=Decimal("10"),
+):
     item = InvoiceItem(
         id=uuid.uuid4(),
         invoice_id=invoice.id,
         line_no=1,
         product_name=product_name,
         specification=None,
-        unit=None,
-        quantity=Decimal("10"),
+        unit=unit,
+        quantity=quantity,
         unit_price=None,
         net_amount=invoice.gross_amount,
         tax_rate=tax_rate,
@@ -175,6 +193,8 @@ def _make_purchase_invoice(
     tax_rate=Decimal("0.13"),
     issue_date=date(2031, 1, 10),
     currency="CNY",
+    unit=None,
+    item_quantity=Decimal("10"),
 ):
     """A PURCHASE Invoice Fact with one InvoiceItem Fact. Returns both.
 
@@ -203,7 +223,15 @@ def _make_purchase_invoice(
     )
     InvoiceRepository(session).add(invoice)
     session.flush()
-    item = _make_invoice_item(session, invoice, fragment_id, product_name=product_name, tax_rate=tax_rate)
+    item = _make_invoice_item(
+        session,
+        invoice,
+        fragment_id,
+        product_name=product_name,
+        tax_rate=tax_rate,
+        unit=unit,
+        quantity=item_quantity,
+    )
     return invoice, item
 
 
@@ -241,12 +269,12 @@ def _make_invoice_allocation(session, invoice_id, contract, allocated=Decimal("1
     return allocation
 
 
-def _make_invoice_item_allocation(session, invoice_item, contract_item):
+def _make_invoice_item_allocation(session, invoice_item, contract_item, allocated_quantity=Decimal("2")):
     allocation = InvoiceItemAllocation(
         id=uuid.uuid4(),
         invoice_item_id=invoice_item.id,
         contract_item_id=contract_item.id,
-        allocated_quantity=Decimal("2"),
+        allocated_quantity=allocated_quantity,
         allocated_net_amount=Decimal("80.00"),
         confirmation_type="MANUAL_CONFIRMED",
         source_fragment_id=_make_fragment(session).id,
@@ -932,13 +960,19 @@ def test_payment_and_invoice_any_ordering_no_chronology_finding(db_session, invo
     assert len(decision.invoice_allocations) == 1
 
 
-def test_no_tax_rate_inference_anywhere(db_session):
+def test_tax_rate_is_not_inferred_and_tax_classification_code_is_reused_or_requires_human_confirmation(db_session):
     """IP-P06: an actual InvoiceItem's tax_rate is reachable ONLY as the
     existing Fact it is; no requested/recommended/inferred tax rate
     exists on any check, blocker, or decision field."""
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-F1B-15")
-    item = _make_contract_item(db_session, contract, frag.id, product_name="Widget Alpha")
+    item = _make_contract_item(
+        db_session,
+        contract,
+        frag.id,
+        product_name="Widget Alpha",
+        tax_classification_code="SYNTHETIC-CODE-A",
+    )
     invoice, invoice_item = _make_purchase_invoice(
         db_session, frag.id, product_name="Widget Alpha", tax_rate=Decimal("0.13")
     )
@@ -949,8 +983,11 @@ def test_no_tax_rate_inference_anywhere(db_session):
     decision = _decision_for(db_session, contract.id)
     # The Fact is displayed as it exists (CONTEXT, IP-P06)...
     assert decision.invoice_item_allocations[0].invoice_item.tax_rate == Decimal("0.13")
-    # ...and no check, blocker, or advisory carries any tax concept at all
-    # (no tax advisory is emitted for an existing tax_rate Fact).
+    # The tax rate remains raw invoice-item context.  The separate,
+    # confirmed ContractItem tax-classification Fact is reused verbatim;
+    # neither one is inferred from the other.
+    assert decision.item_preparations[0].tax_classification_code == "SYNTHETIC-CODE-A"
+    assert decision.item_preparations[0].tax_classification_code_status == "CONFIRMED"
     for check in (*decision.amount_checks, *decision.item_name_checks):
         assert not [f for f in dataclasses.fields(check) if "tax" in f.name]
     for blocker in decision.blockers:
@@ -961,20 +998,42 @@ def test_no_tax_rate_inference_anywhere(db_session):
     assert all("tax" not in a.code.lower() for a in decision.advisories)
 
 
-def test_no_quantity_calculation_anywhere(db_session):
-    """IP-P07: the quantity basis is unresolved — no requested quantity
-    exists on any DTO, whatever quantities the underlying Facts carry."""
+def test_contract_item_quantity_is_expected_quantity_and_mixed_or_missing_units_require_confirmation(db_session):
     frag = _make_fragment(db_session)
     contract = _make_contract(db_session, frag.id, "PO-F1B-16")
-    item = _make_contract_item(db_session, contract, frag.id, product_name="Widget Alpha")  # quantity=10
-    invoice, invoice_item = _make_purchase_invoice(db_session, frag.id, product_name="Widget Alpha")
-    _make_invoice_item_allocation(db_session, invoice_item, item)  # allocated_quantity=2
+    item = _make_contract_item(
+        db_session, contract, frag.id, product_name="Widget Alpha", unit="PCS", tax_classification_code="TAX-A"
+    )
+    second_item = _make_contract_item(
+        db_session,
+        contract,
+        frag.id,
+        product_name="Widget Beta",
+        source_item_key="ITEM-2",
+        quantity=None,
+        unit=None,
+    )
+    invoice, invoice_item = _make_purchase_invoice(
+        db_session, frag.id, product_name="Widget Alpha", unit="PCS", item_quantity=Decimal("2")
+    )
+    _make_invoice_item_allocation(db_session, invoice_item, item, allocated_quantity=Decimal("2"))
     db_session.commit()
 
     decision = _decision_for(db_session, contract.id)
-    assert not [f for f in dataclasses.fields(decision) if "quantity" in f.name]
-    for check in (*decision.amount_checks, *decision.item_name_checks):
-        assert not [f for f in dataclasses.fields(check) if "quantity" in f.name]
+    preparations = {preparation.contract_item_id: preparation for preparation in decision.item_preparations}
+    assert preparations[item.id].expected_purchase_invoice_quantity == Decimal("10")
+    assert preparations[item.id].unit == "PCS"
+    assert preparations[item.id].quantity_status == "QUANTITY_DETERMINABLE"
+    assert preparations[second_item.id].expected_purchase_invoice_quantity is None
+    assert preparations[second_item.id].quantity_status == "HUMAN_CONFIRMATION_REQUIRED"
+    assert decision.quantity_checks[0].expected_quantity == Decimal("10")
+    assert decision.quantity_checks[0].actual_quantity == Decimal("2")
+    assert decision.quantity_checks[0].outcome == "DEVIATION"
+    assert SupplierRequestAdvisoryCode.PURCHASE_INVOICE_QUANTITY_DEVIATION in {
+        advisory.code for advisory in decision.advisories
+    }
+    assert "MISSING_TAX_CLASSIFICATION_CODE" in {hcr.code for hcr in decision.human_confirmation_requirements}
+    assert "MISSING_CONTRACT_ITEM_QUANTITY_OR_UNIT" in {hcr.code for hcr in decision.human_confirmation_requirements}
 
 
 # ---------------------------------------------------------------------------
@@ -1014,8 +1073,6 @@ def test_status_and_dto_vocabulary_carry_no_business_judgment():
         "owed",
         "outstanding",
         "unpaid",
-        "quantity",
-        "tax",
     )
     import bel.application.supplier_invoice_request as module
 

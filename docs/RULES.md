@@ -216,3 +216,13 @@ This rule is what G06 in [GOLDEN-TEST.md](GOLDEN-TEST.md) exercises.
 | `EvidenceMissing` | R011 |
 | `AmountMismatch` | R012 |
 | `BusinessKeyConflict` | R004 |
+
+## Invoice preparation — Core Completion revision
+
+The current preparation rules are defined in
+[PHASE2D3-RULE-FREEZE.md](PHASE2D3-RULE-FREEZE.md): IP-P07 now uses
+procurement contract item quantities; IP-P08 reuses confirmed item tax codes
+or exposes human confirmation; IP-S02 uses explicit-month SAFE USD/CNY
+conversion and a separate comparable customs check. The old numerical
+three-way equality and unresolved procurement quantity basis are superseded.
+R001–R015 and Period Close semantics are unchanged by this revision.

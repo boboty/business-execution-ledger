@@ -901,6 +901,7 @@ SALES_AMOUNT_CONTROL_OUTCOME_LABELS = {
     SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT: "当前信息不足，暂无法核对",
     SalesAmountCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH: "币种不同，暂不直接比较金额",
     SalesAmountCheckOutcome.NOT_COMPARABLE_AMBIGUOUS_SCOPE: "对应范围不唯一，暂无法自动核对",
+    "NOT_COMPARABLE_FX_MISSING": "缺少明确月份或可追溯汇率，暂无法核算",
 }
 
 # CSS tag class per comparison outcome — legible at a glance: MATCH is
@@ -912,6 +913,7 @@ SALES_AMOUNT_CONTROL_OUTCOME_TAG = {
     SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT: "tag-unavailable",
     SalesAmountCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH: "tag-deviation",
     SalesAmountCheckOutcome.NOT_COMPARABLE_AMBIGUOUS_SCOPE: "tag-unavailable",
+    "NOT_COMPARABLE_FX_MISSING": "tag-unavailable",
 }
 
 SALES_INVOICE_ADVISORY_LABELS = {
@@ -1039,6 +1041,15 @@ class InvoicePrepSalesScopeVM:
         self.currency = sc.currency or "—"
         self.gross_amount = _fmt(sc.gross_amount)
         self.contract_date = _fmt(sc.contract_date)
+        # Preparation results are supplied by the Application decision;
+        # presentation only exposes explicit values and missing inputs.
+        check = decision.amount_check
+        self.expected_quantity = _fmt(getattr(decision, "expected_quantity", getattr(sc, "quantity", None)))
+        self.usd_amount = _fmt(getattr(decision, "contract_usd_amount", None))
+        self.fx_rate = _fmt(getattr(check, "applicable_fx_rate", None) if check else None)
+        self.fx_rate_date = _fmt(getattr(check, "applicable_fx_date", None) if check else None)
+        self.expected_cny_amount = _fmt(getattr(check, "expected_invoice_cny", None) if check else None)
+        self.invoice_note = "USD金额 + 汇率" if check and getattr(check, "applicable_fx_rate", None) is not None else "—"
         self.linked_procurement_contracts = [
             InvoicePrepLinkedContractVM(entry) for entry in scope.linked_procurement_contracts
         ]
@@ -1142,6 +1153,14 @@ class InvoicePrepSupplierScopeVM:
         self.gross_amount = _fmt(contract.gross_amount)
         self.currency = contract.currency
         self.contract_date = _fmt(contract.contract_date)
+        item_preparations = getattr(decision, "item_preparations", ())
+        self.item_preparations = [
+            {"product_name": p.product_name or "—", "quantity": _fmt(p.expected_purchase_invoice_quantity),
+             "unit": p.unit or "—", "tax_classification_code": p.tax_classification_code or "—",
+             "tax_classification_code_status": p.tax_classification_code_status}
+            for p in item_preparations
+        ]
+        self.expected_quantity = _fmt(item_preparations[0].expected_purchase_invoice_quantity if len(item_preparations) == 1 else None)
 
         item_by_id = {item.id: item for item in scope.items}
         self.items = [ItemPresentationVM(item) for item in scope.items]
@@ -1231,6 +1250,7 @@ class InvoicePreparationVM:
         self.sales_scope_count = len(self.sales_scopes)
         self.supplier_scope_count = len(self.supplier_scopes)
         self.page_note = INVOICE_PREPARATION_PAGE_NOTE
+        self.invoice_month = _fmt(getattr(dto, "invoice_month", None))
 
 
 # ---------------------------------------------------------------------------

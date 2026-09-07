@@ -70,78 +70,42 @@ report comparison availability only; no blocker is emitted by the sales
 rule set, and `INPUTS_PRESENT` is never an eligibility or readiness
 Decision.
 
-### IP-S02 — Export-sales amount consistency (three-way equality)
+### IP-S02 — Sales invoice amount preparation and comparable controls
 
-For export-sales business, amount consistency means:
+**Source: `OWNER_CONFIRMED` — Core Completion rule revision.** This
+supersedes the F1f three-way numerical equality rule: the sales contract
+is USD and the sales invoice is CNY, so their raw numbers are not equal
+amounts in the same currency.
 
 ```
-SalesContract gross amount
-  == export/customs declaration amount
-  == final SALES Invoice gross amount
+expected_sales_invoice_cny = sales_contract_usd_amount × applicable_fx_rate
 ```
 
-ONLY amount equality is required by this rule. It does NOT require — and
-must never be read as requiring — that customer, product, specification,
-or quantity be identical across the three documents. Those are not part
-of IP-S02.
+The preparation month is explicit input. The rate is the latest valid
+SAFE (国家外汇管理局) published USD/CNY rate whose publication date is
+on or before the natural first day of that month. No holiday calendar,
+wall-clock month, default rate, model knowledge, network lookup or
+alternative source is permitted. Core consumes traceable authoritative
+FX Evidence / explicit confirmed input; it does not fetch announcements.
+Missing or ambiguous applicable inputs remain explicit uncertainty.
 
-**Source: `OWNER_CONFIRMED_PROVISIONAL`.**
+The projection retains the original USD amount, selected rate and
+publication date, expected CNY amount and structured note data (USD
+amount + rate). Presentation owns the wording. CNY monetary precision
+uses the existing Decimal cent / ROUND_HALF_UP convention.
 
-**Canonical declaration amount/currency (closed for F1c):** the
-canonical Shipment/Export Fact now carries `declared_amount` and
-`declared_currency` (Phase 2D.3-F1c) — the amount and currency
-explicitly stated by the confirmed export/customs declaration Evidence,
-asserted only with Evidence, never inferred, never FX-converted, and
-never defaulted to CNY/USD. An amount known without its currency remains
-a representable incomplete Fact.
+A confirmed SALES invoice is compared with expected CNY only when its
+currency is explicitly CNY and the invoice scope is unambiguous. Multiple
+invoices are not summed or apportioned. Customs amount/currency remain
+separate management facts: compare with the original contract only when
+currencies and scope are explicit and comparable. Missing customs data
+does not prevent a known USD contract and applicable rate from producing
+expected CNY. Deviation is a review signal, never an invoicing permission.
 
-**Finding level: `ADVISORY` (management control)** — the three-way
-comparison is IMPLEMENTED for the unambiguous scope (Phase 2D.3-F1f). It
-is evaluated as a MANAGEMENT control, NEVER a workflow gate, NEVER a
-`RULE_CONFLICT`, and never a preparation blocker. Only the unambiguous
-1:1:1 comparison scope is compared: exactly ONE confirmed SALES Invoice
-Fact (a `SalesInvoiceAllocation` whose Invoice Fact is missing or not
-direction SALES is NOT a confirmed Invoice Fact), exactly ONE current
-`ProcurementSalesLink`, and exactly ONE current Shipment on the linked
-Contract. Outcome vocabulary:
-
-- `MATCH` — all three currencies explicit and equal, all three amounts
-  exactly equal;
-- `DEVIATION` (amount) — same explicit currency, amounts not all equal ->
-  `SALES_INVOICE_AMOUNT_DEVIATION` ADVISORY;
-- `NOT_COMPARABLE_CURRENCY_MISMATCH` — the relevant explicit currencies
-  are not all equal -> `SALES_INVOICE_CURRENCY_DEVIATION` ADVISORY; no
-  amount comparison is attempted, no FX;
-- `NOT_COMPARABLE_MISSING_FACT` — any compared amount/currency Fact
-  absent (including a scope with no confirmed SALES Invoice Fact or no
-  Shipment/Export Fact); a check result ONLY, never a blocker;
-- `NOT_COMPARABLE_AMBIGUOUS_SCOPE` — invoice/declaration scope ambiguous
-  by cardinality (multiple confirmed SALES invoices, multiple current
-  links, or multiple Shipment/Export declaration candidates): no sum, no
-  apportionment, no arbitrary selection — cardinality ambiguity takes
-  precedence over selecting arbitrary facts.
-
-The comparison is currency-safe by construction: amounts are compared
-ONLY when all three amounts AND all three currencies exist and the three
-currencies are explicitly equal — no FX, no default currency, no
-implicit same-currency assumption. The comparison never blocks invoice
-preparation, never changes the decision `status`, and receipt chronology
-never affects it.
-
-**Remaining limitation (recorded structurally, not worked around):** the
-comparison is implemented ONLY for the unambiguous 1:1:1 scope. Any scope
-with multiple confirmed SALES invoices, multiple current links, or
-multiple Shipment/Export declaration candidates is
-`NOT_COMPARABLE_AMBIGUOUS_SCOPE` — never summed, never apportioned, never
-compared against an arbitrarily chosen candidate. No code path may
-substitute `SalesContract.gross_amount` or an invoice amount for the
-declaration amount, and no legacy sales amount is backfilled as a
-customs-declaration amount: real declaration Evidence or an explicit
-human-confirmed Fact is required. Canonical currency support on all
-three legs — `SalesContract.currency`, Shipment `declared_currency`
-(F1c), and `Invoice.currency` (F1e) — is what makes the equal-currency
-comparison safe; a missing currency is never defaulted or inferred to
-make the rule appear complete.
+Sales expected quantity comes only from current `SalesContract.quantity`
+with its explicit unit. Shipment/customs quantities are consistency
+context, never a fallback or a source for populating SalesContract Facts.
+Missing quantity or incomparable units remain explicit.
 
 ### IP-S03 — Receipt is not a hard prerequisite
 
@@ -279,13 +243,17 @@ Fact it is (Phase 2D.3-F1d removed the earlier
 `EXISTING_INVOICE_ITEM_TAX_RATE_FACT` advisory); no finding is emitted
 for its presence.
 
-### IP-P07 — Quantity basis unresolved
+### IP-P07 — Procurement contract quantity is authoritative
 
-The supplier invoice request quantity basis is not yet frozen: the
-precedence between contract quantity / shipped quantity / declared
-quantity is not established. No quantity calculation may be invented.
+**Source: `OWNER_CONFIRMED` — Core Completion rule revision.**
 
-**Source: `UNRESOLVED`.**
+Expected purchase invoice quantity is the confirmed procurement contract
+quantity, represented by current ContractItem quantities and units.
+Preparation preserves item/product scope; missing quantities and
+incomparable units are explicit and never filled from Shipment/customs.
+Shipment/customs quantities support deterministic consistency checks
+only. A deviation produces a review signal without changing expected
+quantity. Ambiguous M:N associations are never apportioned.
 
 ### IP-P08 — Tax classification code comes from Evidence, never inference
 
@@ -404,7 +372,7 @@ reclassified outcomes appear in the table below.
 | Rule | Provenance | Finding level | Implementation |
 | --- | --- | --- | --- |
 | IP-S01 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Re-leveled (F1a/F1d): three inputs report fact completeness / comparison availability only — link = management linkage, shipment = export-management anchor, no eligibility blocker; `INSUFFICIENT_FACTS` reserved for genuinely-required sales-scope data (unreachable by construction) |
-| IP-S02 | `OWNER_CONFIRMED_PROVISIONAL` | `ADVISORY` (management control; implemented for the unambiguous 1:1:1 scope in Phase 2D.3-F1f — `MATCH`/`DEVIATION`/`NOT_COMPARABLE_MISSING_FACT`/`NOT_COMPARABLE_CURRENCY_MISMATCH`/`NOT_COMPARABLE_AMBIGUOUS_SCOPE`; never conflict, never a preparation blocker) | Canonical currency on all three legs — Shipment `declared_amount`/`declared_currency` (F1c) and `Invoice.currency` (F1e). Three-way comparison implemented for the unambiguous scope (F1f): exactly one confirmed SALES Invoice Fact (a dangling allocation is NOT a confirmed Fact), exactly one current link, exactly one current Shipment; amounts compared only with all three amounts + currencies explicit and equal (no FX, no default, no inference); same-currency inequality → `SALES_INVOICE_AMOUNT_DEVIATION`, explicit currency mismatch → `SALES_INVOICE_CURRENCY_DEVIATION`; multiple invoices / links / declaration candidates → `NOT_COMPARABLE_AMBIGUOUS_SCOPE` — never sum/apportion/choose one; the comparison never blocks preparation |
+| IP-S02 | `OWNER_CONFIRMED` | `ADVISORY` / explicit missing or ambiguous input | USD contract × latest applicable SAFE USD/CNY rate; actual CNY invoice comparison and separate currency-safe customs control; explicit preparation month and provenance; supersedes F1f three-way equality |
 | IP-S03 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Respected by F1a/F1d (receipts never consulted, no chronology finding); invoice-before-receipt is common |
 | IP-S04 | `UNRESOLVED` | `CONTEXT` (unresolved comparison, never a blocker) | Shipment input recorded `NOT_JUDGED_UNDER_MN_UNRESOLVED` (F1a boundary, re-leveled F1d); M:N facts stay visible; future comparison → `NOT_COMPARABLE` / `UNRESOLVED`; never blocks invoice preparation |
 | IP-P01 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Payment exposed as context only (F1b); no status/advisory from payment ordering (F1d removed the `OUT_PAYMENT_PRESENT_CONTEXT_ONLY` advisory) |
@@ -413,7 +381,7 @@ reclassified outcomes appear in the table below.
 | IP-P04 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` | `PURCHASE_INVOICE_SPANS_MULTIPLE_CONTRACTS` advisory (F1d, re-leveled from a conflict) — never apportioned, M:N is not an error |
 | IP-P05 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` | DEVIATION → `PURCHASE_INVOICE_PRODUCT_NAME_DEVIATION` advisory (F1d, re-leveled from a conflict); missing name → `NOT_COMPARABLE_MISSING_FACT` check result only (never blocks preparation) |
 | IP-P06 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Existing InvoiceItem `tax_rate` exposed as the Fact it is (F1b); no advisory (F1d removed `EXISTING_INVOICE_ITEM_TAX_RATE_FACT`) |
-| IP-P07 | `UNRESOLVED` | `NO-FINDING` | No quantity calculation (F1b); guard only |
-| IP-P08 | `ACCOUNTANT_CONFIRMED` | `NO-FINDING` (register-only; eventual outcome class `HUMAN_CONFIRMATION_REQUIRED`) | Frozen as a rule; NO tax-classification-code path exists anywhere yet (no field, no confirmation flow) — register-only; implementation pending a later stage |
+| IP-P07 | `OWNER_CONFIRMED` | `CONTEXT` / `ADVISORY` | ContractItem expected quantity and unit; Shipment consistency only; no fallback or M:N apportionment |
+| IP-P08 | `ACCOUNTANT_CONFIRMED` | `HUMAN_CONFIRMATION_REQUIRED` when code absent | Current evidence-backed ContractItem tax_classification_code is reused; absent code requires confirmation through existing Fact maintenance; never guessed |
 | IP-P09 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` | `SUPPLIER_INVOICE_FOLLOW_UP_RECOMMENDED` (F1d): paid + no PURCHASE invoice → management follow-up; gone on recomputation once an invoice exists; no Task persisted |
-| IP-X01 | `ACCOUNTANT_CONFIRMED` | `ADVISORY` when a frozen same-scope comparison detects deviation; otherwise `CONTEXT` | Customs declaration (`declared_amount`/`declared_currency`, F1c) is the management anchor for reviewing PURCHASE and SALES prep; F1f implements the IP-S02 SALES-side three-way comparison for the unambiguous 1:1:1 scope — same-currency amount deviation → `SALES_INVOICE_AMOUNT_DEVIATION`, explicit currency mismatch → `SALES_INVOICE_CURRENCY_DEVIATION` (both ADVISORY, never a conflict); ambiguous/missing scope stays `NOT_COMPARABLE_AMBIGUOUS_SCOPE`/`NOT_COMPARABLE_MISSING_FACT`, never a preparation blocker; no sum / no apportionment / no arbitrary selection; management control, never workflow eligibility |
+| IP-X01 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` / `ADVISORY` | Customs declared amount and explicit currency remain a separate comparable management check; never replace contract expected amounts/quantities or impose eligibility |
