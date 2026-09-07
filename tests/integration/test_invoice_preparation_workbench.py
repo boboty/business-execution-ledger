@@ -215,7 +215,12 @@ def test_workbench_composes_both_directions_from_one_context(db_session):
     # The sales report equals the standalone F1 sales evaluation.
     assert workbench.sales_report == evaluate_sales_invoice_preparation(db_session)
     sales_decision = workbench.sales_report.decisions[0]
-    assert sales_decision.amount_check.outcome == SalesAmountCheckOutcome.MATCH
+    # No invoice_month is supplied by either call -> the FX-based
+    # amount_check reports its own unavailable reason; the customs_check
+    # (contract vs declared amount) is INDEPENDENT of invoice_month and
+    # MATCHes on this 1:1:1 scope.
+    assert sales_decision.amount_check.outcome == SalesAmountCheckOutcome.NOT_COMPARABLE_FX_MISSING
+    assert sales_decision.customs_check.outcome == SalesAmountCheckOutcome.MATCH
 
     # The supplier report equals the standalone F1 supplier evaluation,
     # and the two directions come from the SAME underlying context (the
@@ -301,9 +306,11 @@ def test_workbench_is_pure_over_a_manually_built_context_no_session():
     assert isinstance(workbench, InvoicePreparationWorkbench)
     assert workbench.context is context
     sales_decision = workbench.sales_report.decisions[0]
-    # No confirmed SALES invoice Fact in the pure context -> the F1 IP-S02
-    # comparison (composed, never re-derived) is missing-fact.
-    assert sales_decision.amount_check.outcome == SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT
+    # No invoice_month in this pure context -> the F1 FX-based amount_check
+    # (composed, never re-derived) reports its own unavailable reason
+    # first. customs_check is INDEPENDENT of the invoice and MATCHes.
+    assert sales_decision.amount_check.outcome == SalesAmountCheckOutcome.NOT_COMPARABLE_FX_MISSING
+    assert sales_decision.customs_check.outcome == SalesAmountCheckOutcome.MATCH
 
 
 def test_workbench_composes_dangling_allocation_as_not_a_confirmed_fact():
@@ -366,11 +373,15 @@ def test_workbench_composes_dangling_allocation_as_not_a_confirmed_fact():
     workbench = get_invoice_preparation_workbench_from_context(context)
     sales_decision = workbench.sales_report.decisions[0]
     check = sales_decision.amount_check
-    assert check.outcome == SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT
+    # No invoice_month -> the FX-based amount_check reports its own
+    # unavailable reason; the dangling allocation is still NOT a
+    # confirmed Invoice Fact (sales_invoice_id stays None either way).
+    assert check.outcome == SalesAmountCheckOutcome.NOT_COMPARABLE_FX_MISSING
     assert check.sales_invoice_id is None
-    # The declaration leg is resolved — only the dangling invoice leg is
-    # missing, exactly as the F1 layer decided it.
-    assert check.shipment_id == shipment_id
+    # customs_check is INDEPENDENT of the invoice — the declaration leg
+    # resolves regardless of the dangling invoice allocation.
+    assert sales_decision.customs_check.outcome == SalesAmountCheckOutcome.MATCH
+    assert sales_decision.customs_check.shipment_id == shipment_id
 
 
 def test_workbench_never_invents_follow_up(db_session):

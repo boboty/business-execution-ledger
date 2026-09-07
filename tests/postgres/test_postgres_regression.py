@@ -926,11 +926,11 @@ def _stamp_alembic_head(engine) -> None:
     rest of the module — not a stamp-as-repair (M5): the schema really is
     the head schema, this only makes the tracking row agree with a fact
     that's already true. The stamped hash must match the current chain
-    head (6aa25aa4e81f after the Phase 2D.3-F1e migration)."""
+    head (a7d1c4e9b2f0 after the Core Completion migration)."""
     with engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)")
         connection.exec_driver_sql("DELETE FROM alembic_version")
-        connection.exec_driver_sql("INSERT INTO alembic_version (version_num) VALUES ('6aa25aa4e81f')")
+        connection.exec_driver_sql("INSERT INTO alembic_version (version_num) VALUES ('a7d1c4e9b2f0')")
 
 
 def _run_bel_cli(database_url: str, *args: str) -> subprocess.CompletedProcess:

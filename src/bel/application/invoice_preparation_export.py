@@ -54,6 +54,7 @@ from bel.application.invoice_preparation_workbench import InvoicePreparationWork
 from bel.infrastructure.deterministic_xlsx import deterministic_xlsx_bytes, set_fixed_workbook_properties
 from bel.domain.invoice import InvoiceDirection
 from bel.domain.payment import PaymentDirection
+from bel.presentation import format_sales_invoice_note
 
 # ---------------------------------------------------------------------------
 # Vocabulary — record types and attention categories (the neutral contract)
@@ -83,6 +84,12 @@ SALES_COMPARISON_MESSAGES = {
     "NOT_COMPARABLE_CURRENCY_MISMATCH": "币种不同，暂不直接比较金额",
     "NOT_COMPARABLE_AMBIGUOUS_SCOPE": "对应范围不唯一，暂无法自动核对",
     "NOT_COMPARABLE_FX_MISSING": "缺少明确月份或可追溯汇率，暂无法核算",
+    "NOT_COMPARABLE_FX_AMBIGUOUS": "适用汇率不唯一，暂无法核算",
+}
+
+SALES_QUANTITY_CHECK_MESSAGES = {
+    **SALES_COMPARISON_MESSAGES,
+    "NOT_COMPARABLE_UNIT_MISMATCH": "计量单位不一致，暂不直接比较数量",
 }
 
 SUPPLIER_AMOUNT_CHECK_MESSAGES = {
@@ -204,6 +211,16 @@ class InvoicePreparationExportRow:
     fx_rate_date: date | None = None
     expected_sales_invoice_cny: Decimal | None = None
     invoice_note: str | None = None
+    # The FX-based amount_check's own outcome/message — INDEPENDENT of
+    # comparison_outcome above, which is now the customs_check (IP-X01).
+    sales_invoice_amount_check_outcome: str | None = None
+    sales_invoice_amount_check_message: str | None = None
+    # invoice_quantity_check — the confirmed SALES invoice's own item
+    # quantity/unit vs SalesContract.quantity/unit.
+    sales_invoice_quantity: Decimal | None = None
+    sales_invoice_quantity_unit: str | None = None
+    sales_invoice_quantity_check_outcome: str | None = None
+    sales_invoice_quantity_check_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -331,7 +348,16 @@ def _incomplete_purchase_item_allocations(scope) -> tuple:
 
 def _sales_preparation_row(scope, decision) -> InvoicePreparationExportRow:
     sc = scope.sales_contract
+    # customs_check (IP-X01) — SalesContract vs Shipment/Export declared
+    # amount, a SEPARATE comparison from the FX-based amount_check below.
+    # comparison_outcome/comparison_message/declared_*/comparison_shipment_id
+    # are this check's fields (restores the pre-FX column semantics).
+    customs = decision.customs_check
+    # amount_check — SalesContract USD amount x applicable SAFE rate vs
+    # the confirmed SALES invoice's own CNY amount. INDEPENDENT of customs.
     check = decision.amount_check
+    quantity_check = decision.invoice_quantity_check
+    note_data = decision.invoice_note_data
     return InvoicePreparationExportRow(
         record_type=RECORD_TYPE_SALES_PREPARATION,
         sales_contract_id=str(sc.id),
@@ -343,23 +369,30 @@ def _sales_preparation_row(scope, decision) -> InvoicePreparationExportRow:
         linked_procurement_contract_count=len(scope.linked_procurement_contracts),
         confirmed_sales_invoice_count=len(_confirmed_sales_invoices(scope)),
         confirmed_receipt_count=len(_confirmed_in_receipts(scope)),
-        comparison_outcome=check.outcome if check else None,
-        comparison_message=SALES_COMPARISON_MESSAGES.get(check.outcome) if check else None,
-        sales_contract_amount=check.sales_contract_amount if check else None,
-        sales_contract_currency=check.sales_contract_currency if check else None,
-        declared_amount=check.declared_amount if check else None,
-        declared_currency=check.declared_currency if check else None,
+        comparison_outcome=customs.outcome if customs else None,
+        comparison_message=SALES_COMPARISON_MESSAGES.get(customs.outcome) if customs else None,
+        sales_contract_amount=customs.sales_contract_amount if customs else None,
+        sales_contract_currency=customs.sales_contract_currency if customs else None,
+        declared_amount=customs.declared_amount if customs else None,
+        declared_currency=customs.declared_currency if customs else None,
         sales_invoice_amount=check.sales_invoice_amount if check else None,
         sales_invoice_currency=check.sales_invoice_currency if check else None,
-        # The F1f comparison's resolved trace identifiers, verbatim.
-        comparison_shipment_id=str(check.shipment_id) if check and check.shipment_id else None,
+        comparison_shipment_id=str(customs.shipment_id) if customs and customs.shipment_id else None,
         comparison_sales_invoice_id=str(check.sales_invoice_id) if check and check.sales_invoice_id else None,
         quantity=getattr(decision, "expected_quantity", getattr(sc, "quantity", None)),
         sales_usd_amount=getattr(decision, "contract_usd_amount", None),
         fx_rate=getattr(check, "applicable_fx_rate", None) if check else None,
         fx_rate_date=getattr(check, "applicable_fx_date", None) if check else None,
         expected_sales_invoice_cny=getattr(check, "expected_invoice_cny", None) if check else None,
-        invoice_note=("USD金额 + 汇率" if check and check.applicable_fx_rate is not None else None),
+        invoice_note=(format_sales_invoice_note(note_data) if note_data is not None else None),
+        sales_invoice_amount_check_outcome=check.outcome if check else None,
+        sales_invoice_amount_check_message=SALES_COMPARISON_MESSAGES.get(check.outcome) if check else None,
+        sales_invoice_quantity=quantity_check.actual_quantity if quantity_check else None,
+        sales_invoice_quantity_unit=quantity_check.actual_unit if quantity_check else None,
+        sales_invoice_quantity_check_outcome=quantity_check.outcome if quantity_check else None,
+        sales_invoice_quantity_check_message=(
+            SALES_QUANTITY_CHECK_MESSAGES.get(quantity_check.outcome) if quantity_check else None
+        ),
     )
 
 
@@ -491,7 +524,6 @@ def _supplier_checks_json(amount_checks, item_name_checks) -> str | None:
 def _supplier_request_row(scope, decision) -> InvoicePreparationExportRow:
     contract = scope.contract
     item_preparations = getattr(decision, "item_preparations", ())
-    first_item = scope.items[0] if len(scope.items) == 1 else None
     return InvoicePreparationExportRow(
         record_type=RECORD_TYPE_SUPPLIER_REQUEST,
         procurement_contract_id=str(contract.id),
@@ -512,7 +544,9 @@ def _supplier_request_row(scope, decision) -> InvoicePreparationExportRow:
         ),
         supplier_checks_json=_supplier_checks_json(decision.amount_checks, decision.item_name_checks),
         quantity=(item_preparations[0].expected_purchase_invoice_quantity if len(item_preparations) == 1 else None),
-        product_code=(item_preparations[0].tax_classification_code if len(item_preparations) == 1 else None),
+        # No product_code Fact exists anywhere in this domain — never
+        # fabricate one from tax_classification_code or any other field.
+        product_code=None,
         tax_classification_code=(item_preparations[0].tax_classification_code if len(item_preparations) == 1 else None),
     )
 
@@ -620,6 +654,9 @@ def _build_summary(
     supplier_attn_rows = list(supplier_attention)
 
     sales_outcomes = Counter(r.comparison_outcome for r in sales_prep_rows if r.comparison_outcome)
+    sales_invoice_amount_outcomes = Counter(
+        r.sales_invoice_amount_check_outcome for r in sales_prep_rows if r.sales_invoice_amount_check_outcome
+    )
     supplier_amount_outcomes = Counter(
         r.supplier_amount_check_outcome for r in supplier_req_rows if r.supplier_amount_check_outcome
     )
@@ -641,6 +678,11 @@ def _build_summary(
     }
     for outcome in ("MATCH", "DEVIATION", "NOT_COMPARABLE_MISSING_FACT", "NOT_COMPARABLE_CURRENCY_MISMATCH", "NOT_COMPARABLE_AMBIGUOUS_SCOPE"):
         summary[f"sales_comparison_{outcome}"] = sales_outcomes.get(outcome, 0)
+    for outcome in (
+        "MATCH", "DEVIATION", "NOT_COMPARABLE_MISSING_FACT", "NOT_COMPARABLE_CURRENCY_MISMATCH",
+        "NOT_COMPARABLE_AMBIGUOUS_SCOPE", "NOT_COMPARABLE_FX_MISSING", "NOT_COMPARABLE_FX_AMBIGUOUS",
+    ):
+        summary[f"sales_invoice_amount_check_{outcome}"] = sales_invoice_amount_outcomes.get(outcome, 0)
     for outcome in ("MATCH", "DEVIATION", "NOT_COMPARABLE_MISSING_FACT", "NOT_COMPARABLE_CURRENCY_MISMATCH"):
         summary[f"supplier_amount_check_{outcome}"] = supplier_amount_outcomes.get(outcome, 0)
     summary["supplier_amount_check_count"] = supplier_amount_check_count
@@ -709,6 +751,12 @@ CSV_HEADERS = [
     "fx_rate_date",
     "expected_sales_invoice_cny",
     "invoice_note",
+    "sales_invoice_amount_check_outcome",
+    "sales_invoice_amount_check_message",
+    "sales_invoice_quantity",
+    "sales_invoice_quantity_unit",
+    "sales_invoice_quantity_check_outcome",
+    "sales_invoice_quantity_check_message",
 ]
 
 
@@ -837,6 +885,18 @@ _SALES_PREPARATION_COLUMNS = [
     "sales_invoice_currency",
     "comparison_shipment_id",
     "comparison_sales_invoice_id",
+    "quantity",
+    "sales_usd_amount",
+    "fx_rate",
+    "fx_rate_date",
+    "expected_sales_invoice_cny",
+    "invoice_note",
+    "sales_invoice_amount_check_outcome",
+    "sales_invoice_amount_check_message",
+    "sales_invoice_quantity",
+    "sales_invoice_quantity_unit",
+    "sales_invoice_quantity_check_outcome",
+    "sales_invoice_quantity_check_message",
 ]
 
 _SALES_ATTENTION_COLUMNS = [
@@ -867,6 +927,9 @@ _SUPPLIER_REQUEST_COLUMNS = [
     "supplier_item_name_check_count",
     "supplier_item_name_deviation_count",
     "supplier_checks_json",
+    "quantity",
+    "product_code",
+    "tax_classification_code",
 ]
 
 _SUPPLIER_ATTENTION_COLUMNS = [

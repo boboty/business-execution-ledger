@@ -1036,6 +1036,33 @@ def test_contract_item_quantity_is_expected_quantity_and_mixed_or_missing_units_
     assert "MISSING_CONTRACT_ITEM_QUANTITY_OR_UNIT" in {hcr.code for hcr in decision.human_confirmation_requirements}
 
 
+def test_actual_quantity_is_the_allocation_quantity_not_the_whole_invoice_item_quantity(db_session):
+    """A quantity comparison must use InvoiceItemAllocation.allocated_quantity
+    — the quantity actually attributed to THIS ContractItem — never the
+    parent InvoiceItem's own (whole-line) quantity. ContractItem.quantity=10,
+    InvoiceItem.quantity=10 (the whole line), allocated_quantity=2: this
+    must read as a DEVIATION (10 vs 2), never a false MATCH."""
+    frag = _make_fragment(db_session)
+    contract = _make_contract(db_session, frag.id, "PO-F1B-17")
+    item = _make_contract_item(db_session, contract, frag.id, product_name="Widget Alpha", unit="PCS")
+    invoice, invoice_item = _make_purchase_invoice(
+        db_session, frag.id, product_name="Widget Alpha", unit="PCS", item_quantity=Decimal("10")
+    )
+    _make_invoice_item_allocation(db_session, invoice_item, item, allocated_quantity=Decimal("2"))
+    db_session.commit()
+
+    decision = _decision_for(db_session, contract.id)
+    assert invoice_item.quantity == Decimal("10")
+    check = decision.quantity_checks[0]
+    assert check.expected_quantity == Decimal("10")
+    assert check.actual_quantity == Decimal("2")
+    assert check.outcome == "DEVIATION"
+    assert check.outcome != "MATCH"
+    assert SupplierRequestAdvisoryCode.PURCHASE_INVOICE_QUANTITY_DEVIATION in {
+        advisory.code for advisory in decision.advisories
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fact -> Decision layering: vocabulary, purity, read-only
 # ---------------------------------------------------------------------------

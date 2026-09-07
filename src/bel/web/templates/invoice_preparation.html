@@ -85,15 +85,32 @@
         <li>备注数据：{{ scope.invoice_note }}</li>
       </ul>
       {% if scope.amount_control %}
-      <p class="wb-sub">金额核对（销售合同金额 / 报关申报金额 / 已确认销项发票金额）</p>
+      <p class="wb-sub">金额核对（预计 CNY 开票金额 / 已确认销项发票金额）</p>
       <p><span class="tag {{ scope.amount_control.outcome_tag }}">{{ scope.amount_control.outcome_label }}</span></p>
       <ul class="ledger-nested-list">
-        <li>销售合同金额：{{ scope.amount_control.contract_amount }} {{ scope.amount_control.contract_currency }}</li>
-        <li>报关申报金额：{{ scope.amount_control.declared_amount }} {{ scope.amount_control.declared_currency }}</li>
+        <li>预计 CNY 开票金额：{{ scope.expected_cny_amount }}</li>
         <li>已确认销项发票金额：{{ scope.amount_control.invoice_amount }} {{ scope.amount_control.invoice_currency }}</li>
       </ul>
       {% else %}
       <p class="empty-cell">暂无法核对</p>
+      {% endif %}
+      {% if scope.customs_control %}
+      <p class="wb-sub">报关金额核对（销售合同金额 / 报关申报金额，与上方 FX 核对相互独立）</p>
+      <p><span class="tag {{ scope.customs_control.outcome_tag }}">{{ scope.customs_control.outcome_label }}</span></p>
+      <ul class="ledger-nested-list">
+        <li>销售合同金额：{{ scope.customs_control.contract_amount }} {{ scope.customs_control.contract_currency }}</li>
+        <li>报关申报金额：{{ scope.customs_control.declared_amount }} {{ scope.customs_control.declared_currency }}</li>
+      </ul>
+      {% else %}
+      <p class="empty-cell">暂无法核对报关金额</p>
+      {% endif %}
+      {% if scope.invoice_quantity_control %}
+      <p class="wb-sub">销项发票数量核对（已确认销项发票 / 销售合同数量）</p>
+      <p><span class="tag {{ scope.invoice_quantity_control.outcome_tag }}">{{ scope.invoice_quantity_control.outcome_label }}</span></p>
+      <ul class="ledger-nested-list">
+        <li>应开数量：{{ scope.invoice_quantity_control.expected_quantity }} {{ scope.invoice_quantity_control.expected_unit }}</li>
+        <li>已确认销项发票数量：{{ scope.invoice_quantity_control.actual_quantity }} {{ scope.invoice_quantity_control.actual_unit }}</li>
+      </ul>
       {% endif %}
     </div>
 

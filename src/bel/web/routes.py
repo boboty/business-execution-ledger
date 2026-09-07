@@ -86,29 +86,24 @@ def _checked_period(period: str | None, session: Session) -> str:
 
 
 def _invoice_preparation_inputs(request: Request):
-    """Parse explicit reporting month and caller-supplied FX evidence.
-    Web is an input surface only; validation/provenance belongs to the
-    Application context."""
+    """Parse the explicit reporting month and the confirmed FX Evidence
+    fragment id(s) to apply. Web is an input surface only — it never
+    accepts a caller-supplied source/date/rate; only a pointer to an
+    already-confirmed fragment (via ``bel fx-rate confirm``). Content
+    resolution/validation belongs to the Application context
+    (``load_confirmed_fx_rate``)."""
     month_text = request.query_params.get("invoice_month")
     try:
         invoice_month = date.fromisoformat(month_text + "-01") if month_text else None
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="invoice_month 必须为 YYYY-MM") from exc
-    from bel.application.invoice_preparation import ApplicableFxRateEvidence
-    fx_rate_text = request.query_params.get("fx_rate")
-    fx_date_text = request.query_params.get("fx_rate_date")
-    fx_source = request.query_params.get("fx_source")
-    fx_fragment = request.query_params.get("fx_provenance_fragment_id")
-    if not any(v is not None for v in (fx_rate_text, fx_date_text, fx_source, fx_fragment)):
-        return invoice_month, ()
-    if None in (fx_rate_text, fx_date_text, fx_source, fx_fragment):
-        raise HTTPException(status_code=400, detail="FX 输入必须同时提供汇率、日期、来源和 Evidence fragment")
-    from uuid import UUID
-    try:
-        evidence = (ApplicableFxRateEvidence(source=fx_source, publication_date=date.fromisoformat(fx_date_text), usd_cny_rate=Decimal(fx_rate_text), provenance_fragment_id=UUID(fx_fragment)),)
-    except (ValueError, ArithmeticError) as exc:
-        raise HTTPException(status_code=400, detail="FX 输入格式无效") from exc
-    return invoice_month, evidence
+    fragment_ids = []
+    for text in request.query_params.getlist("fx_provenance_fragment_id"):
+        try:
+            fragment_ids.append(uuid.UUID(text))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="fx_provenance_fragment_id 必须为 UUID") from exc
+    return invoice_month, tuple(fragment_ids)
 
 
 @router.get("/", include_in_schema=False)
@@ -219,10 +214,12 @@ def invoice_preparation_page(
     the comparison, cardinality, currency-safety and follow-up outcomes
     come from the frozen F1 layers, the page is strictly read-only, and
     it never reads as an eligibility or approval verdict."""
-    invoice_month, fx_evidence = _invoice_preparation_inputs(request)
+    invoice_month, fx_fragment_ids = _invoice_preparation_inputs(request)
     with session.no_autoflush:
         try:
-            workbench = get_invoice_preparation_workbench(session, invoice_month=invoice_month, fx_rate_evidence=fx_evidence)
+            workbench = get_invoice_preparation_workbench(
+                session, invoice_month=invoice_month, fx_provenance_fragment_ids=fx_fragment_ids
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="FX Evidence provenance 无效") from exc
     vm = viewmodels.InvoicePreparationVM(workbench)
@@ -239,9 +236,11 @@ def invoice_preparation_export_xlsx(
     """F2b Data Product XLSX. The SAME Workbench source as the HTML page
     (workbench -> data product -> serializer); strictly read-only."""
     with session.no_autoflush:
-        invoice_month, fx_evidence = _invoice_preparation_inputs(request)
+        invoice_month, fx_fragment_ids = _invoice_preparation_inputs(request)
         try:
-            workbench = get_invoice_preparation_workbench(session, invoice_month=invoice_month, fx_rate_evidence=fx_evidence)
+            workbench = get_invoice_preparation_workbench(
+                session, invoice_month=invoice_month, fx_provenance_fragment_ids=fx_fragment_ids
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="FX Evidence provenance 无效") from exc
     product = build_invoice_preparation_data_product(workbench)
@@ -261,9 +260,11 @@ def invoice_preparation_export_csv(
     """F2b Data Product CSV. The SAME Workbench source as the HTML page
     (workbench -> data product -> serializer); strictly read-only."""
     with session.no_autoflush:
-        invoice_month, fx_evidence = _invoice_preparation_inputs(request)
+        invoice_month, fx_fragment_ids = _invoice_preparation_inputs(request)
         try:
-            workbench = get_invoice_preparation_workbench(session, invoice_month=invoice_month, fx_rate_evidence=fx_evidence)
+            workbench = get_invoice_preparation_workbench(
+                session, invoice_month=invoice_month, fx_provenance_fragment_ids=fx_fragment_ids
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="FX Evidence provenance 无效") from exc
     product = build_invoice_preparation_data_product(workbench)

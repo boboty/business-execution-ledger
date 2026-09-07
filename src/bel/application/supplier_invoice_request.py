@@ -723,8 +723,14 @@ def _evaluate_scope(
             and entry.invoice.direction == InvoiceDirection.PURCHASE
             and entry.invoice_item is not None
         )
+        # The InvoiceItem's OWN quantity is the whole line item, which may
+        # be split across multiple ContractItems via allocation — the
+        # quantity actually attributed to THIS ContractItem is the
+        # allocation's own allocated_quantity, never the line item total
+        # (an InvoiceItem.quantity=10 allocated_quantity=2 pair must never
+        # read as a quantity-10 fact for this item).
         actual_unit = entry.invoice_item.unit if confirmed_candidate else None
-        actual_quantity = entry.invoice_item.quantity if confirmed_candidate else None
+        actual_quantity = entry.allocation.allocated_quantity if confirmed_candidate else None
         if (
             not confirmed_candidate
             or item.quantity is None

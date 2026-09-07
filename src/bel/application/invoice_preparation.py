@@ -57,6 +57,7 @@ from bel.application.contract_business_ledger import (
     _collect_unresolved_work,
     _matches,
 )
+from bel.application.fx_rate_evidence import ApplicableFxRateEvidence, load_confirmed_fx_rate
 from bel.domain.accrual import InvoiceItemAllocation
 from bel.domain.contract import Contract, ContractItem
 from bel.domain.invoice import Invoice, InvoiceItem
@@ -96,10 +97,15 @@ from bel.infrastructure.persistence.repositories import (
 @dataclass(frozen=True)
 class SalesScopeInvoiceAllocation:
     """One existing SALES-invoice association — the Invoice Fact plus the
-    SalesInvoiceAllocation that associates it to this SalesContract."""
+    SalesInvoiceAllocation that associates it to this SalesContract, and
+    that invoice's own InvoiceItem Facts (empty when the Invoice Fact is
+    missing). There is no per-item allocation on the sales side (unlike
+    procurement's InvoiceItemAllocation) — the confirmed SALES invoice's
+    items ARE its full, unambiguous item scope."""
 
     allocation: SalesInvoiceAllocation
     invoice: Invoice | None
+    invoice_items: tuple[InvoiceItem, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -185,18 +191,12 @@ class SupplierScopeContext:
     unresolved_work: tuple[ContractLedgerUnresolvedWork, ...]
 
 
-@dataclass(frozen=True)
-class ApplicableFxRateEvidence:
-    """A caller-supplied, already-confirmed SAFE daily USD/CNY rate.
-
-    Core never fetches rates. The session entry point verifies the Evidence
-    fragment exists; pure evaluation consumes this immutable context.
-    """
-
-    source: str
-    publication_date: date
-    usd_cny_rate: Decimal
-    provenance_fragment_id: uuid.UUID
+# ``ApplicableFxRateEvidence`` is defined in ``fx_rate_evidence`` (imported
+# above) alongside its write/read pair (``execute_confirm_fx_rate`` /
+# ``load_confirmed_fx_rate``) and re-exported here for the existing
+# import path. Core never fetches rates; the session entry point below
+# reconstructs this value entirely from its own confirmed Evidence
+# fragment rather than trusting a caller-supplied source/date/rate.
 
 
 @dataclass(frozen=True)
@@ -237,12 +237,19 @@ class InvoicePreparationFilters:
 def get_invoice_preparation_context(
     session: Session, filters: InvoicePreparationFilters | None = None,
     *, invoice_month: date | None = None,
-    fx_rate_evidence: tuple[ApplicableFxRateEvidence, ...] = (),
+    fx_provenance_fragment_ids: tuple[uuid.UUID, ...] = (),
 ) -> InvoicePreparationContext:
     """Compose the read-only invoice-preparation FACT context. Strictly
     read-only — no Fact, Task, MatchCase or business-state write, and no
     autoflush side effect. Page consumers call this single function so
-    the Web surface can never diverge from the Application context."""
+    the Web surface can never diverge from the Application context.
+
+    FX input is a list of confirmed Evidence fragment ids only — never a
+    caller-supplied source/date/rate. Each id is resolved via
+    ``load_confirmed_fx_rate``, which reconstructs the confirmed value
+    entirely from that fragment's own ``raw_data``; a fragment that
+    doesn't exist or wasn't produced by ``execute_confirm_fx_rate``
+    raises ``FxRateEvidenceError`` (a ``ValueError``)."""
     filters = filters or InvoicePreparationFilters()
 
     with session.no_autoflush:
@@ -255,13 +262,9 @@ def get_invoice_preparation_context(
         sales_scopes = _build_sales_scopes(session, filters, by_sales_contract_unresolved)
         supplier_scopes = _build_supplier_scopes(session, filters, by_contract_unresolved)
 
-        # Evidence provenance is a hard boundary for session-backed use:
-        # a bare URL/string is not a confirmed Fact.
-        from bel.infrastructure.persistence.repositories import EvidenceRepository
-        evidence_repo = EvidenceRepository(session)
-        for fx in fx_rate_evidence:
-            if evidence_repo.get_fragment(fx.provenance_fragment_id) is None:
-                raise ValueError(f"FX provenance EvidenceFragment {fx.provenance_fragment_id} not found")
+        fx_rate_evidence = tuple(
+            load_confirmed_fx_rate(session, fragment_id) for fragment_id in fx_provenance_fragment_ids
+        )
         return InvoicePreparationContext(
             sales_scopes=sales_scopes, supplier_scopes=supplier_scopes,
             invoice_month=invoice_month, fx_rate_evidence=fx_rate_evidence,
@@ -280,6 +283,7 @@ def _build_sales_scopes(
     sales_payment_alloc_repo = SalesPaymentAllocationRepository(session)
     invoice_repo = InvoiceRepository(session)
     payment_repo = PaymentRepository(session)
+    invoice_item_repo = InvoiceItemRepository(session)
 
     scopes: list[SalesScopeContext] = []
     for sales_contract in sorted(
@@ -306,10 +310,18 @@ def _build_sales_scopes(
         )
 
         sales_invoices = tuple(
-            SalesScopeInvoiceAllocation(allocation=a, invoice=invoice_repo.get(a.invoice_id))
-            for a in sorted(
-                sales_invoice_alloc_repo.list_for_sales_contract(sales_contract.id),
-                key=lambda a: (a.created_at, str(a.id)),
+            SalesScopeInvoiceAllocation(
+                allocation=a, invoice=invoice,
+                invoice_items=(
+                    tuple(invoice_item_repo.list_for_invoice(invoice.id)) if invoice is not None else ()
+                ),
+            )
+            for a, invoice in (
+                (a, invoice_repo.get(a.invoice_id))
+                for a in sorted(
+                    sales_invoice_alloc_repo.list_for_sales_contract(sales_contract.id),
+                    key=lambda a: (a.created_at, str(a.id)),
+                )
             )
         )
         incoming_receipts = tuple(

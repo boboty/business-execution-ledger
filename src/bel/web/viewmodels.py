@@ -69,6 +69,7 @@ from bel.domain.exception import ExceptionStatus
 from bel.domain.invoice import InvoiceDirection
 from bel.domain.matching import MatchCaseStatus
 from bel.domain.payment import PaymentDirection
+from bel.presentation import format_sales_invoice_note
 from bel.infrastructure.persistence.repositories import (
     ContractItemRepository,
     ContractRepository,
@@ -901,7 +902,8 @@ SALES_AMOUNT_CONTROL_OUTCOME_LABELS = {
     SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT: "当前信息不足，暂无法核对",
     SalesAmountCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH: "币种不同，暂不直接比较金额",
     SalesAmountCheckOutcome.NOT_COMPARABLE_AMBIGUOUS_SCOPE: "对应范围不唯一，暂无法自动核对",
-    "NOT_COMPARABLE_FX_MISSING": "缺少明确月份或可追溯汇率，暂无法核算",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_FX_MISSING: "缺少明确月份或可追溯汇率，暂无法核算",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_FX_AMBIGUOUS: "适用汇率不唯一，暂无法核算",
 }
 
 # CSS tag class per comparison outcome — legible at a glance: MATCH is
@@ -913,12 +915,28 @@ SALES_AMOUNT_CONTROL_OUTCOME_TAG = {
     SalesAmountCheckOutcome.NOT_COMPARABLE_MISSING_FACT: "tag-unavailable",
     SalesAmountCheckOutcome.NOT_COMPARABLE_CURRENCY_MISMATCH: "tag-deviation",
     SalesAmountCheckOutcome.NOT_COMPARABLE_AMBIGUOUS_SCOPE: "tag-unavailable",
-    "NOT_COMPARABLE_FX_MISSING": "tag-unavailable",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_FX_MISSING: "tag-unavailable",
+    SalesAmountCheckOutcome.NOT_COMPARABLE_FX_AMBIGUOUS: "tag-unavailable",
+}
+
+# invoice_quantity_check adds one outcome the shared MATCH/DEVIATION/
+# NOT_COMPARABLE_* vocabulary above doesn't carry: an explicit unit
+# mismatch between the confirmed SALES invoice item and SalesContract.
+SALES_QUANTITY_CHECK_OUTCOME_LABELS = {
+    **SALES_AMOUNT_CONTROL_OUTCOME_LABELS,
+    "NOT_COMPARABLE_UNIT_MISMATCH": "计量单位不一致，暂不直接比较数量",
+}
+SALES_QUANTITY_CHECK_OUTCOME_TAG = {
+    **SALES_AMOUNT_CONTROL_OUTCOME_TAG,
+    "NOT_COMPARABLE_UNIT_MISMATCH": "tag-deviation",
 }
 
 SALES_INVOICE_ADVISORY_LABELS = {
-    SalesInvoiceAdvisoryCode.SALES_INVOICE_AMOUNT_DEVIATION: "销项发票金额与合同/报关金额存在偏差，建议复核",
-    SalesInvoiceAdvisoryCode.SALES_INVOICE_CURRENCY_DEVIATION: "销项发票币种与合同/报关币种不一致，暂不直接比较金额，建议复核",
+    SalesInvoiceAdvisoryCode.SALES_INVOICE_AMOUNT_DEVIATION: "销项发票金额与按汇率折算的预计金额存在偏差，建议复核",
+    SalesInvoiceAdvisoryCode.SALES_INVOICE_CURRENCY_DEVIATION: "销项发票币种不是人民币，暂不直接折算比较，建议复核",
+    SalesInvoiceAdvisoryCode.SALES_INVOICE_QUANTITY_DEVIATION: "销项发票数量与销售合同数量存在偏差，建议复核",
+    SalesInvoiceAdvisoryCode.SALES_CONTRACT_CUSTOMS_AMOUNT_DEVIATION: "销售合同金额与报关金额存在偏差，建议复核",
+    SalesInvoiceAdvisoryCode.SALES_CONTRACT_CUSTOMS_CURRENCY_DEVIATION: "销售合同币种与报关币种不一致，暂不直接比较金额，建议复核",
 }
 
 SUPPLIER_AMOUNT_CHECK_OUTCOME_LABELS = {
@@ -959,9 +977,23 @@ SUPPLIER_REQUEST_BLOCKER_LABELS = {
 }
 
 class SalesAmountControlVM:
-    """The F1f IP-S02 three-way comparison, presented for review: outcome
-    label + the three compared legs (None -> "—", never a fake zero or a
-    fabricated value)."""
+    """The FX-based amount comparison, presented for review: outcome
+    label + the two compared legs (None -> "—", never a fake zero or a
+    fabricated value). INDEPENDENT of SalesCustomsControlVM below."""
+
+    def __init__(self, check) -> None:
+        self.outcome_label = SALES_AMOUNT_CONTROL_OUTCOME_LABELS.get(check.outcome, check.outcome)
+        self.outcome_tag = SALES_AMOUNT_CONTROL_OUTCOME_TAG.get(check.outcome, "tag-unavailable")
+        self.contract_amount = _fmt(check.sales_contract_amount)
+        self.contract_currency = check.sales_contract_currency or "—"
+        self.invoice_amount = _fmt(check.sales_invoice_amount)
+        self.invoice_currency = check.sales_invoice_currency or "—"
+
+
+class SalesCustomsControlVM:
+    """IP-X01 — the customs-declaration comparison, presented for review:
+    outcome label + the two compared legs. A SEPARATE management fact
+    from SalesAmountControlVM — never folded into the FX conversion."""
 
     def __init__(self, check) -> None:
         self.outcome_label = SALES_AMOUNT_CONTROL_OUTCOME_LABELS.get(check.outcome, check.outcome)
@@ -970,8 +1002,19 @@ class SalesAmountControlVM:
         self.contract_currency = check.sales_contract_currency or "—"
         self.declared_amount = _fmt(check.declared_amount)
         self.declared_currency = check.declared_currency or "—"
-        self.invoice_amount = _fmt(check.sales_invoice_amount)
-        self.invoice_currency = check.sales_invoice_currency or "—"
+
+
+class SalesInvoiceQuantityControlVM:
+    """The confirmed SALES invoice's own item quantity/unit vs
+    SalesContract.quantity/unit, presented for review."""
+
+    def __init__(self, check) -> None:
+        self.outcome_label = SALES_QUANTITY_CHECK_OUTCOME_LABELS.get(check.outcome, check.outcome)
+        self.outcome_tag = SALES_QUANTITY_CHECK_OUTCOME_TAG.get(check.outcome, "tag-unavailable")
+        self.expected_quantity = _fmt(check.expected_quantity)
+        self.expected_unit = check.expected_unit or "—"
+        self.actual_quantity = _fmt(check.actual_quantity)
+        self.actual_unit = check.actual_unit or "—"
 
 
 class SalesInvoiceAdvisoryVM:
@@ -1044,12 +1087,13 @@ class InvoicePrepSalesScopeVM:
         # Preparation results are supplied by the Application decision;
         # presentation only exposes explicit values and missing inputs.
         check = decision.amount_check
+        note_data = decision.invoice_note_data
         self.expected_quantity = _fmt(getattr(decision, "expected_quantity", getattr(sc, "quantity", None)))
         self.usd_amount = _fmt(getattr(decision, "contract_usd_amount", None))
         self.fx_rate = _fmt(getattr(check, "applicable_fx_rate", None) if check else None)
         self.fx_rate_date = _fmt(getattr(check, "applicable_fx_date", None) if check else None)
         self.expected_cny_amount = _fmt(getattr(check, "expected_invoice_cny", None) if check else None)
-        self.invoice_note = "USD金额 + 汇率" if check and getattr(check, "applicable_fx_rate", None) is not None else "—"
+        self.invoice_note = format_sales_invoice_note(note_data) if note_data is not None else "—"
         self.linked_procurement_contracts = [
             InvoicePrepLinkedContractVM(entry) for entry in scope.linked_procurement_contracts
         ]
@@ -1088,6 +1132,11 @@ class InvoicePrepSalesScopeVM:
         # outcome is presented as an unavailable comparison, never as a
         # blocker and never as "may not issue invoice".
         self.amount_control = SalesAmountControlVM(decision.amount_check) if decision.amount_check else None
+        self.customs_control = SalesCustomsControlVM(decision.customs_check) if decision.customs_check else None
+        self.invoice_quantity_control = (
+            SalesInvoiceQuantityControlVM(decision.invoice_quantity_check)
+            if decision.invoice_quantity_check else None
+        )
         self.advisories = [SalesInvoiceAdvisoryVM(a) for a in decision.advisories]
         self.has_advisories = bool(self.advisories)
 

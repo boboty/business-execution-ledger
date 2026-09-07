@@ -11,7 +11,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect
 
 from bel.application.contract_item_facts import create_contract_item_fact
-from bel.application.invoice_preparation import ApplicableFxRateEvidence
+from bel.application.fx_rate_evidence import FxRateEvidenceError, execute_confirm_fx_rate, load_confirmed_fx_rate
 from bel.application.invoice_preparation_workbench import get_invoice_preparation_workbench
 from bel.application.sales_contract_facts import create_sales_contract_fact
 from bel.infrastructure.persistence.database import DatabaseRuntime
@@ -50,13 +50,18 @@ def test_forward_migration_and_preparation_roundtrip(core_pg):
                     "gross_amount": Decimal("125"), "quantity": Decimal("9"), "unit": "piece"},
             source_fragment_id=fragment.id, created_at=NOW,
         )
+        # The FX rate is confirmed through the sanctioned write path — its
+        # own EvidenceFragment, distinct from the contract's — never a
+        # borrowed, unrelated fragment id.
+        fx_confirmed = execute_confirm_fx_rate(
+            session, source="SAFE", publication_date=date(2030, 8, 30), usd_cny_rate=Decimal("7.20")
+        )
         session.commit()
-        fx_id = fragment.id
+        fx_id = fx_confirmed.provenance_fragment_id
     # Fresh session proves persisted fields, not dataclass-only propagation.
     with core_pg.session_factory() as session:
-        fx = ApplicableFxRateEvidence("SAFE", date(2030, 8, 30), Decimal("7.20"), fx_id)
         workbench = get_invoice_preparation_workbench(
-            session, invoice_month=date(2030, 9, 1), fx_rate_evidence=(fx,)
+            session, invoice_month=date(2030, 9, 1), fx_provenance_fragment_ids=(fx_id,)
         )
         purchase = workbench.supplier_report.decisions[0]
         item = purchase.item_preparations[0]
@@ -69,8 +74,19 @@ def test_forward_migration_and_preparation_roundtrip(core_pg):
         assert sales.invoice_note_data.applicable_fx_date == date(2030, 8, 30)
         assert sales.amount_check.fx_provenance_fragment_id == fx_id
         assert get_invoice_preparation_workbench(
-            session, invoice_month=date(2030, 9, 1), fx_rate_evidence=(fx,)
+            session, invoice_month=date(2030, 9, 1), fx_provenance_fragment_ids=(fx_id,)
         ) == workbench
+
+    # The hole this closes: pairing an unrelated confirmed Fact's
+    # fragment id (here, the ContractItem/SalesContract fragment) with a
+    # claim of being FX provenance must be refused, not silently accepted.
+    with core_pg.session_factory() as session:
+        with pytest.raises(FxRateEvidenceError):
+            load_confirmed_fx_rate(session, fragment.id)
+        with pytest.raises(FxRateEvidenceError):
+            get_invoice_preparation_workbench(
+                session, invoice_month=date(2030, 9, 1), fx_provenance_fragment_ids=(fragment.id,)
+            )
 
 
 def test_previous_head_upgrade_downgrade_and_drift(core_pg):

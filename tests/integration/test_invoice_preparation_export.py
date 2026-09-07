@@ -126,7 +126,10 @@ def _attention_for(product, *, code=None, category=None, sales_no=None, contract
 def test_export_builder_accepts_workbench_not_session(export_product):
     """The builder's contract is the Workbench: the produced rows carry the
     SAME canonical comparison outcomes the F1 reports decided — proving no
-    rule is re-run by the export path."""
+    rule is re-run by the export path. ``comparison_outcome`` is now the
+    customs_check (IP-X01, SalesContract vs declared amount) — INDEPENDENT
+    of confirmed-invoice presence, which is why SC-NOINV (no confirmed
+    SALES invoice) still customs-MATCHes on its contract/declared amounts."""
     match = _sales_row(export_product, "SC-MTCH")
     assert match.comparison_outcome == "MATCH"
     dev = _sales_row(export_product, "SC-DEV")
@@ -134,7 +137,8 @@ def test_export_builder_accepts_workbench_not_session(export_product):
     amb = _sales_row(export_product, "SC-AMB")
     assert amb.comparison_outcome == "NOT_COMPARABLE_AMBIGUOUS_SCOPE"
     noinv = _sales_row(export_product, "SC-NOINV")
-    assert noinv.comparison_outcome == "NOT_COMPARABLE_MISSING_FACT"
+    assert noinv.comparison_outcome == "MATCH"
+    assert noinv.sales_invoice_amount is None
     # Supplier amount-check outcome is the F1 decision's, verbatim.
     amt = _supplier_row(export_product, "PO-AMT")
     assert amt.supplier_amount_check_outcome == "DEVIATION"
@@ -143,10 +147,9 @@ def test_export_builder_accepts_workbench_not_session(export_product):
 def test_export_product_counts_match_workbench_scopes(export_product):
     assert export_product.summary["sales_scope_count"] == 4
     assert export_product.summary["supplier_scope_count"] == 9
-    assert export_product.summary["sales_comparison_MATCH"] == 1
+    assert export_product.summary["sales_comparison_MATCH"] == 2
     assert export_product.summary["sales_comparison_DEVIATION"] == 1
     assert export_product.summary["sales_comparison_NOT_COMPARABLE_AMBIGUOUS_SCOPE"] == 1
-    assert export_product.summary["sales_comparison_NOT_COMPARABLE_MISSING_FACT"] == 1
     assert export_product.summary["supplier_amount_check_DEVIATION"] == 1
     assert export_product.summary["supplier_item_name_check_DEVIATION"] == 1
     assert export_product.summary["attention_MANAGEMENT_ADVISORY"] == 5
@@ -172,21 +175,26 @@ def test_sales_match_exports_correctly(export_product):
 def test_sales_deviation_exports_advisory_separately(export_product):
     row = _sales_row(export_product, "SC-DEV")
     assert row.comparison_outcome == "DEVIATION"
+    assert row.declared_amount == Decimal("90.00")
     assert row.sales_invoice_amount == Decimal("90.00")
     # The deviation is an ATTENTION row, not flattened into the comparison.
-    advisories = _attention_for(export_product, code="SALES_INVOICE_AMOUNT_DEVIATION", sales_no="SC-DEV")
+    advisories = _attention_for(export_product, code="SALES_CONTRACT_CUSTOMS_AMOUNT_DEVIATION", sales_no="SC-DEV")
     assert len(advisories) == 1
     assert advisories[0].attention_category == ATTENTION_CATEGORY_MANAGEMENT_ADVISORY
     assert advisories[0].record_type == RECORD_TYPE_SALES_ATTENTION
 
 
 def test_sales_missing_fact_is_not_comparable_and_value_blank(export_product):
+    """SC-NOINV has no confirmed SALES invoice. customs_check (contract vs
+    declared amount) is INDEPENDENT of invoice presence and still MATCHes;
+    the invoice-specific fields (sourced from the separate amount_check)
+    are the ones that go blank."""
     row = _sales_row(export_product, "SC-NOINV")
-    assert row.comparison_outcome == "NOT_COMPARABLE_MISSING_FACT"
+    assert row.comparison_outcome == "MATCH"
     assert row.sales_invoice_amount is None
     assert row.sales_invoice_currency is None
     assert row.confirmed_sales_invoice_count == 0
-    # The declared leg is still exposed (the "why").
+    # The declared leg is still exposed — it never depended on the invoice.
     assert row.declared_amount == Decimal("100.00")
 
 
@@ -454,7 +462,7 @@ def test_csv_missing_value_is_empty_not_zero(export_product):
     reader = csv.DictReader(io.StringIO(text))
     noinv = next(r for r in reader if r["record_type"] == "SALES_PREPARATION" and r["sales_contract_no"] == "SC-NOINV")
     assert noinv["sales_invoice_amount"] == ""
-    assert noinv["comparison_outcome"] == "NOT_COMPARABLE_MISSING_FACT"
+    assert noinv["comparison_outcome"] == "MATCH"
 
 
 def test_export_is_byte_deterministic(export_product):
@@ -690,14 +698,17 @@ def test_supplier_p04_preserves_all_related_contract_ids():
 
 
 def test_sales_advisory_preserves_invoice_and_shipment_ids(export_product):
-    advisories = _attention_for(export_product, code="SALES_INVOICE_AMOUNT_DEVIATION", sales_no="SC-DEV")
+    """SALES_CONTRACT_CUSTOMS_AMOUNT_DEVIATION (customs_check, IP-X01) is
+    about the SalesContract-vs-declared-amount leg only — it carries the
+    shipment trace id, never an invoice id (the invoice is a SEPARATE,
+    independent comparison)."""
+    advisories = _attention_for(export_product, code="SALES_CONTRACT_CUSTOMS_AMOUNT_DEVIATION", sales_no="SC-DEV")
     assert len(advisories) == 1
-    invoice_ids = json.loads(advisories[0].related_invoice_ids)
+    assert advisories[0].related_invoice_ids is None
     shipment_ids = json.loads(advisories[0].related_shipment_ids)
-    assert len(invoice_ids) == 1 and len(shipment_ids) == 1
-    # They agree with the comparison's own trace ids on the row.
+    assert len(shipment_ids) == 1
+    # It agrees with the comparison's own trace id on the row.
     row = _sales_row(export_product, "SC-DEV")
-    assert invoice_ids[0] == row.comparison_sales_invoice_id
     assert shipment_ids[0] == row.comparison_shipment_id
 
 
@@ -1025,3 +1036,54 @@ def test_xlsx_package_metadata_fully_pinned(export_product):
     from tests.xlsx_assertions import assert_xlsx_package_metadata_fixed
 
     assert_xlsx_package_metadata_fixed(export_invoice_preparation_xlsx(export_product))
+
+
+# ---------------------------------------------------------------------------
+# Core Completion — real note projection, product_code never fabricated,
+# NOT_COMPARABLE_FX_AMBIGUOUS always safely mapped
+# ---------------------------------------------------------------------------
+
+
+def test_invoice_note_is_real_formatted_text_shared_with_web_presentation():
+    """The note is REAL structured USD amount + rate text (Fix 4) — never
+    the Astra placeholder literal "USD金额 + 汇率" — and comes from the
+    SAME shared formatter Web uses, so CSV/XLSX/CLI and the Web page can
+    never drift apart."""
+    from bel.application.sales_invoice_preparation import SalesInvoiceNoteData
+    from bel.presentation import format_sales_invoice_note
+
+    note_data = SalesInvoiceNoteData(
+        contract_usd_amount=Decimal("125.00"), applicable_fx_rate=Decimal("7.2000"),
+        applicable_fx_date=date(2030, 8, 30), expected_invoice_cny=Decimal("900.00"),
+    )
+    text = format_sales_invoice_note(note_data)
+    assert text == "USD 125.00；汇率 7.2000"
+    assert text != "USD金额 + 汇率"
+
+    from bel.web.viewmodels import InvoicePrepSalesScopeVM  # noqa: F401 — proves the import path resolves
+    import bel.application.invoice_preparation_export as export_module
+    import bel.web.viewmodels as viewmodels_module
+
+    assert export_module.format_sales_invoice_note is format_sales_invoice_note
+    assert viewmodels_module.format_sales_invoice_note is format_sales_invoice_note
+
+
+def test_product_code_is_never_fabricated_from_tax_classification_code(export_product):
+    """No product_code Fact exists anywhere in this domain — the export
+    row must leave it blank rather than fabricate it from
+    tax_classification_code (the Astra intermediate-state bug)."""
+    for row in export_product.supplier_request:
+        assert row.product_code is None
+
+
+def test_not_comparable_fx_ambiguous_is_safely_mapped_everywhere():
+    """A NOT_COMPARABLE_FX_AMBIGUOUS amount_check outcome must resolve to
+    a real business-facing message in every presentation surface — never
+    raise, never fall back to the bare internal code."""
+    from bel.application.invoice_preparation_export import SALES_COMPARISON_MESSAGES
+    from bel.web.viewmodels import SALES_AMOUNT_CONTROL_OUTCOME_LABELS, SALES_AMOUNT_CONTROL_OUTCOME_TAG
+
+    assert SALES_COMPARISON_MESSAGES["NOT_COMPARABLE_FX_AMBIGUOUS"]
+    assert SALES_AMOUNT_CONTROL_OUTCOME_LABELS["NOT_COMPARABLE_FX_AMBIGUOUS"]
+    assert SALES_AMOUNT_CONTROL_OUTCOME_TAG["NOT_COMPARABLE_FX_AMBIGUOUS"]
+    assert SALES_AMOUNT_CONTROL_OUTCOME_LABELS["NOT_COMPARABLE_FX_AMBIGUOUS"] != "NOT_COMPARABLE_FX_AMBIGUOUS"

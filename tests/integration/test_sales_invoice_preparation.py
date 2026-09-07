@@ -40,6 +40,7 @@ from bel.application.invoice_preparation import (
 from bel.application.sales_invoice_preparation import (
     REQUIRED_INPUT_ORDER,
     SALES_INVOICE_CONSISTENCY_CHECK_NAMES,
+    SalesCustomsAmountCheck,
     SalesInvoiceAmountCheck,
     SalesInvoicePreparationDecision,
     SalesPreparationBlocker,
@@ -577,7 +578,14 @@ def test_status_and_dto_vocabulary_carry_no_eligibility_concept():
     # job is to expose the three compared amount/currency Facts explicitly.
     # The DECISION DTO itself still carries no amount field.
     compared_amount_tokens = ("amount", "quantity", "ratio")
-    compared_amount_dtos = {"SalesInvoiceAmountCheck", "SalesInvoiceNoteData"}
+    # The comparison DTOs each expose their own compared Facts by design —
+    # amount_check (FX-based), customs_check (IP-X01), invoice_quantity_check
+    # and quantity_check (Shipment consistency), and the structured note
+    # projection.
+    compared_amount_dtos = {
+        "SalesInvoiceAmountCheck", "SalesCustomsAmountCheck", "SalesInvoiceQuantityCheck",
+        "SalesQuantityCheck", "SalesInvoiceNoteData",
+    }
     import bel.application.sales_invoice_preparation as module
 
     dto_types = [
@@ -593,12 +601,13 @@ def test_status_and_dto_vocabulary_carry_no_eligibility_concept():
             if dto_type.__name__ in compared_amount_dtos:
                 # The comparison DTO exposes compared Facts by design (F1f).
                 continue
-            # The decision DTO references the comparison via `amount_check`
-            # (a reference to the check DTO, never a should-invoice value);
-            # every other field stays free of the amount/quantity/ratio
-            # concept.
+            # The decision DTO references each comparison via its own
+            # `*_check` field (a reference to the check DTO, never a
+            # should-invoice value); every other field stays free of the
+            # amount/quantity/ratio concept.
             if dto_type.__name__ == "SalesInvoicePreparationDecision" and f.name in {
-                "amount_check", "expected_quantity", "contract_usd_amount", "invoice_note_data"
+                "amount_check", "customs_check", "invoice_quantity_check", "quantity_check",
+                "expected_quantity", "contract_usd_amount", "invoice_note_data",
             }:
                 continue
             for token in compared_amount_tokens:
@@ -606,21 +615,50 @@ def test_status_and_dto_vocabulary_carry_no_eligibility_concept():
                     f"{dto_type.__name__}.{f.name} carries banned should-invoice concept {token!r}"
                 )
 
-    # F1f locks in the comparison DTO's explicit monetary scope: the three
-    # compared Facts and their currencies are individually inspectable,
-    # and the resolved candidate ids are present — no hidden assumption.
+    # The FX-based comparison DTO's explicit monetary scope: the compared
+    # Facts and their currencies are individually inspectable, and the
+    # resolved candidate id is present — no hidden assumption.
     amount_check_fields = {f.name for f in dataclasses.fields(SalesInvoiceAmountCheck)}
+    assert {
+        "sales_contract_amount",
+        "sales_contract_currency",
+        "sales_invoice_amount",
+        "sales_invoice_currency",
+        "sales_invoice_id",
+        "outcome",
+    } <= amount_check_fields
+
+    # The IP-X01 customs-declaration comparison DTO — a SEPARATE check,
+    # never folded into the FX conversion above.
+    customs_check_fields = {f.name for f in dataclasses.fields(SalesCustomsAmountCheck)}
     assert {
         "sales_contract_amount",
         "sales_contract_currency",
         "declared_amount",
         "declared_currency",
         "shipment_id",
-        "sales_invoice_amount",
-        "sales_invoice_currency",
-        "sales_invoice_id",
         "outcome",
-    } <= amount_check_fields
+    } <= customs_check_fields
+
+
+def test_old_three_way_raw_numerical_equality_no_longer_survives_anywhere():
+    """Core Completion supersedes the historical F1f three-way numerical
+    equality (SalesContract vs Shipment declared amount vs confirmed
+    SALES invoice amount, all compared in ONE step under one currency
+    assumption). Structurally verify it is gone: the FX-based
+    SalesInvoiceAmountCheck carries no declared/shipment fields at all
+    (that leg lives ONLY on the separate SalesCustomsAmountCheck), so no
+    code path can compare all three legs together any more."""
+    amount_check_fields = {f.name for f in dataclasses.fields(SalesInvoiceAmountCheck)}
+    assert "declared_amount" not in amount_check_fields
+    assert "declared_currency" not in amount_check_fields
+    assert "shipment_id" not in amount_check_fields
+    # And the customs check, symmetrically, carries no invoice fields —
+    # it never compares against the confirmed SALES invoice.
+    customs_check_fields = {f.name for f in dataclasses.fields(SalesCustomsAmountCheck)}
+    assert "sales_invoice_amount" not in customs_check_fields
+    assert "sales_invoice_currency" not in customs_check_fields
+    assert "sales_invoice_id" not in customs_check_fields
 
 
 def test_only_genuinely_required_sales_scope_data_would_be_insufficient():

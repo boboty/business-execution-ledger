@@ -20,6 +20,7 @@ from bel.application.contract_item_facts import (
     get_contract_item,
     get_contract_item_history,
 )
+from bel.application.fx_rate_evidence import FxRateEvidenceError, execute_confirm_fx_rate
 from bel.application.get_contract import get_contract
 from bel.application.get_invoice import get_invoice
 from bel.application.get_payment import get_payment
@@ -1863,6 +1864,43 @@ def period_close_export(ctx: click.Context, period: str, fmt: str, output_path: 
     click.echo(f"Period Close Data Product written: {output_path} ({fmt})")
 
 
+@cli.group("fx-rate")
+def fx_rate_group() -> None:
+    """Confirmed FX rate Evidence maintenance (Core Completion, IP-S02).
+    Core never fetches a rate from a website; ``confirm`` is the only
+    sanctioned way to produce a confirmed FX Evidence fragment that
+    ``invoice-preparation export --fx-provenance-fragment-id`` can use."""
+
+
+@fx_rate_group.command("confirm")
+@click.option("--source", "source", required=True, help="权威来源标识（例如 SAFE）。")
+@click.option("--rate", "usd_cny_rate", type=Decimal, required=True, help="USD/CNY 汇率（正有限小数）。")
+@click.option("--date", "publication_date", type=click.DateTime(formats=["%Y-%m-%d"]), required=True, help="公告日期。")
+@click.pass_context
+def fx_rate_confirm(ctx: click.Context, source: str, usd_cny_rate: Decimal, publication_date) -> None:
+    """Confirm a SAFE daily USD/CNY rate as Evidence. Prints the
+    resulting fragment id — pass it to ``invoice-preparation export
+    --fx-provenance-fragment-id`` to use this rate in preparation."""
+    session_factory = _session_factory(ctx.obj["database_url"])
+    try:
+        with session_factory() as session:
+            confirmed = execute_confirm_fx_rate(
+                session, source=source, publication_date=publication_date.date(), usd_cny_rate=usd_cny_rate
+            )
+    except FxRateEvidenceError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+    except OperationalError as exc:
+        if is_database_busy(exc):
+            click.echo("Error: database is busy; retry when the other write completes")
+            raise SystemExit(1) from exc
+        raise
+    click.echo(
+        f"FX rate confirmed: fragment_id={confirmed.provenance_fragment_id} source={confirmed.source} "
+        f"publication_date={confirmed.publication_date} usd_cny_rate={confirmed.usd_cny_rate}"
+    )
+
+
 @cli.group("invoice-preparation")
 def invoice_preparation_group() -> None:
     """Invoice Preparation (read-only fact control + management reminders)."""
@@ -1871,10 +1909,10 @@ def invoice_preparation_group() -> None:
 @invoice_preparation_group.command("export")
 @click.option("--format", "fmt", type=click.Choice(["xlsx", "csv"]), required=True, help="Output format.")
 @click.option("--invoice-month", type=click.DateTime(formats=["%Y-%m"]), default=None, help="拟开票月份（YYYY-MM）。")
-@click.option("--fx-rate", type=Decimal, default=None, help="可追溯汇率输入（需同时提供日期和来源）。")
-@click.option("--fx-rate-date", type=click.DateTime(formats=["%Y-%m-%d"]), default=None, help="汇率公告日期。")
-@click.option("--fx-source", type=str, default=None, help="汇率权威来源标识。")
-@click.option("--fx-provenance-fragment-id", type=str, default=None, help="汇率 Evidence fragment UUID。")
+@click.option(
+    "--fx-provenance-fragment-id", "fx_provenance_fragment_ids", type=click.UUID, multiple=True,
+    help="已确认汇率 Evidence fragment UUID（可重复传入；由 `bel fx-rate confirm` 产生）。",
+)
 @click.option(
     "--output",
     "output_path",
@@ -1883,25 +1921,22 @@ def invoice_preparation_group() -> None:
     help="File to write the Data Product to.",
 )
 @click.pass_context
-def invoice_preparation_export(ctx: click.Context, fmt: str, invoice_month, fx_rate, fx_rate_date, fx_source, fx_provenance_fragment_id, output_path: Path) -> None:
+def invoice_preparation_export(
+    ctx: click.Context, fmt: str, invoice_month, fx_provenance_fragment_ids, output_path: Path
+) -> None:
     """Generate the Invoice Preparation Data Product as XLSX or CSV.
     Strictly read-only: calls the SAME Application Data Product path Web
     uses (get_invoice_preparation_workbench -> data product -> serializer)
     and writes nothing to the database."""
-    from bel.application.invoice_preparation import ApplicableFxRateEvidence
-    from uuid import UUID
     month = invoice_month.date() if invoice_month else None
-    evidence = ()
-    if any(v is not None for v in (fx_rate, fx_rate_date, fx_source, fx_provenance_fragment_id)):
-        if None in (fx_rate, fx_rate_date, fx_source, fx_provenance_fragment_id):
-            raise click.UsageError("FX 输入必须同时提供 --fx-rate、--fx-rate-date、--fx-source 和 --fx-provenance-fragment-id")
-        try:
-            evidence = (ApplicableFxRateEvidence(source=fx_source, publication_date=fx_rate_date.date(), usd_cny_rate=fx_rate, provenance_fragment_id=UUID(fx_provenance_fragment_id)),)
-        except ValueError as exc:
-            raise click.UsageError("--fx-provenance-fragment-id 必须为 UUID") from exc
     session_factory = _session_factory(ctx.obj["database_url"])
-    with session_factory() as session:
-        workbench = get_invoice_preparation_workbench(session, invoice_month=month, fx_rate_evidence=evidence)
+    try:
+        with session_factory() as session:
+            workbench = get_invoice_preparation_workbench(
+                session, invoice_month=month, fx_provenance_fragment_ids=tuple(fx_provenance_fragment_ids)
+            )
+    except FxRateEvidenceError as exc:
+        raise click.UsageError(str(exc)) from exc
     product = build_invoice_preparation_data_product(workbench)
     content = export_invoice_preparation_xlsx(product) if fmt == "xlsx" else export_invoice_preparation_csv(product)
     output_path.write_bytes(content)

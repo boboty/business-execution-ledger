@@ -107,6 +107,15 @@ with its explicit unit. Shipment/customs quantities are consistency
 context, never a fallback or a source for populating SalesContract Facts.
 Missing quantity or incomparable units remain explicit.
 
+The confirmed SALES invoice's own item quantity is additionally compared
+against `SalesContract.quantity`, under the same non-substitutive rules:
+compared only when the invoice scope is unambiguous (one confirmed SALES
+invoice) and that invoice carries exactly one InvoiceItem line with an
+explicit unit equal to `SalesContract.unit` — never summed across
+multiple invoices or multiple item lines, never mixing units. Expected
+quantity stays `SalesContract.quantity` regardless of this comparison's
+outcome; a deviation is a review signal only.
+
 ### IP-S03 — Receipt is not a hard prerequisite
 
 An incoming receipt/payment is NOT a hard eligibility prerequisite for
@@ -372,7 +381,7 @@ reclassified outcomes appear in the table below.
 | Rule | Provenance | Finding level | Implementation |
 | --- | --- | --- | --- |
 | IP-S01 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Re-leveled (F1a/F1d): three inputs report fact completeness / comparison availability only — link = management linkage, shipment = export-management anchor, no eligibility blocker; `INSUFFICIENT_FACTS` reserved for genuinely-required sales-scope data (unreachable by construction) |
-| IP-S02 | `OWNER_CONFIRMED` | `ADVISORY` / explicit missing or ambiguous input | USD contract × latest applicable SAFE USD/CNY rate; actual CNY invoice comparison and separate currency-safe customs control; explicit preparation month and provenance; supersedes F1f three-way equality |
+| IP-S02 | `OWNER_CONFIRMED` | `ADVISORY` / explicit missing or ambiguous input | USD contract × latest applicable SAFE USD/CNY rate; actual CNY invoice comparison and separate currency-safe customs control; actual SALES invoice item quantity vs SalesContract.quantity (non-substitutive); explicit preparation month and provenance; supersedes F1f three-way equality |
 | IP-S03 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Respected by F1a/F1d (receipts never consulted, no chronology finding); invoice-before-receipt is common |
 | IP-S04 | `UNRESOLVED` | `CONTEXT` (unresolved comparison, never a blocker) | Shipment input recorded `NOT_JUDGED_UNDER_MN_UNRESOLVED` (F1a boundary, re-leveled F1d); M:N facts stay visible; future comparison → `NOT_COMPARABLE` / `UNRESOLVED`; never blocks invoice preparation |
 | IP-P01 | `ACCOUNTANT_CONFIRMED` | `CONTEXT` | Payment exposed as context only (F1b); no status/advisory from payment ordering (F1d removed the `OUT_PAYMENT_PRESENT_CONTEXT_ONLY` advisory) |

@@ -53,10 +53,11 @@ def test_schema_gate_locates_alembic_ini_from_outside_the_repo():
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert "IS_ABSOLUTE True" in result.stdout
     assert "EXISTS True" in result.stdout
-    # The head moved from the baseline (f5796c006707) to the F1e
-    # migration (6aa25aa4e81f) — this asserts the SINGLE real head, not a
-    # specific hash, so it stays correct as the chain grows.
-    assert "HEADS ('6aa25aa4e81f',)" in result.stdout or "'6aa25aa4e81f'" in result.stdout
+    # The head moved from the baseline (f5796c006707) through the F1e
+    # migration (6aa25aa4e81f) to the Core Completion migration
+    # (a7d1c4e9b2f0) — this asserts the SINGLE real head, not a specific
+    # hash, so it stays correct as the chain grows.
+    assert "HEADS ('a7d1c4e9b2f0',)" in result.stdout or "'a7d1c4e9b2f0'" in result.stdout
 
 
 def test_schema_gate_error_never_contains_credentials_from_outside_the_repo():

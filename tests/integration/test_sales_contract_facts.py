@@ -153,6 +153,48 @@ def test_sales_contract_quantity_rejects_unrepresentable_or_invalid_decimal(db_s
         _create(db_session, fields={"quantity": quantity})
 
 
+def test_sales_contract_quantity_and_unit_survive_supplement_and_correction(db_session):
+    """quantity/unit are versioned Facts exactly like every other
+    SalesContract field: INITIAL -> SUPPLEMENT -> CORRECTION each keeps
+    its own revision in history, and the current projection always
+    reflects the latest assertion."""
+    result = _create(db_session, fields={"quantity": Decimal("10.0000"), "unit": "PCS"})
+    current = SalesContractRepository(db_session).get_current_revision(result.sales_contract.id)
+    frag2 = _make_fragment(db_session)
+
+    supplemented = supplement_sales_contract_fact(
+        db_session,
+        sales_contract_id=result.sales_contract.id,
+        based_on_revision_id=current.id,
+        fields={"customer": "Customer Co"},
+        source_fragment_id=frag2.id,
+        created_at=NOW,
+    )
+    db_session.commit()
+    # A supplement that doesn't touch quantity/unit preserves them as-is.
+    assert supplemented.sales_contract.quantity == Decimal("10.0000")
+    assert supplemented.sales_contract.unit == "PCS"
+
+    frag3 = _make_fragment(db_session)
+    corrected = correct_sales_contract_fact(
+        db_session,
+        sales_contract_id=result.sales_contract.id,
+        based_on_revision_id=SalesContractRepository(db_session).get_current_revision(result.sales_contract.id).id,
+        fields={"quantity": Decimal("8.0000")},
+        source_fragment_id=frag3.id,
+        created_at=NOW,
+    )
+    db_session.commit()
+
+    assert corrected.sales_contract.quantity == Decimal("8.0000")
+    assert corrected.sales_contract.unit == "PCS"
+    history = get_sales_contract_history(db_session, result.sales_contract.id)
+    assert history[0].quantity == Decimal("10.0000") and history[0].unit == "PCS"
+    assert history[1].quantity == Decimal("10.0000") and history[1].unit == "PCS"
+    assert history[2].quantity == Decimal("8.0000") and history[2].unit == "PCS"
+    assert get_sales_contract(db_session, result.sales_contract.id).quantity == Decimal("8.0000")
+
+
 def test_create_exact_replay_same_identity_same_evidence_same_assertion(db_session):
     result = _create(db_session, fields={"customer": "Customer Co"})
     frag = SalesContractRepository(db_session).get_initial_revision(result.sales_contract.id).source_fragment_id

@@ -677,7 +677,10 @@ def _build_workbench_db(db_path):
         _make_shipment_fact(session, match_contract, frag.id, "SHIP-MTCH", Decimal("100.00"), "USD")
         _make_sales_invoice_alloc(session, frag.id, match_sc, gross_amount=Decimal("100.00"), currency="USD")
 
-        # SC-DEV: invoice gross deviates (90 vs 100 USD).
+        # SC-DEV: declared customs amount deviates from the contract (90 vs
+        # 100 USD) -> customs_check DEVIATION. The confirmed SALES invoice
+        # (also 90 vs 100) exercises sales_invoice_amount/currency staying
+        # inspectable on the SEPARATE, FX-gated amount_check.
         dev_contract = _make_contract_f2a(session, frag.id, "PO-DEV", gross_amount=Decimal("100.00"), currency="USD")
         dev_sc = _make_sales_contract(
             session, frag.id, "SC-DEV",
@@ -685,7 +688,7 @@ def _build_workbench_db(db_path):
         )
         add_procurement_sales_link(session, procurement_contract_id=dev_contract.id, sales_contract_id=dev_sc.id,
                                    source_fragment_id=frag.id, confirmation_type=LinkConfirmationType.AUTO_CONFIRMED, created_at=NOW)
-        _make_shipment_fact(session, dev_contract, frag.id, "SHIP-DEV", Decimal("100.00"), "USD")
+        _make_shipment_fact(session, dev_contract, frag.id, "SHIP-DEV", Decimal("90.00"), "USD")
         _make_sales_invoice_alloc(session, frag.id, dev_sc, gross_amount=Decimal("90.00"), currency="USD")
 
         # SC-AMB: multiple current links -> ambiguous scope.
@@ -768,7 +771,7 @@ def test_f2a_renders_sales_deviation_and_advisory(workbench_ctx):
     response = client.get("/invoice-preparation")
     assert "SC-DEV" in response.text
     assert F2A_SALES_DEVIATION_LABEL in response.text
-    assert "销项发票金额与合同/报关金额存在偏差，建议复核" in response.text
+    assert "销售合同金额与报关金额存在偏差，建议复核" in response.text
 
 
 def test_f2a_renders_sales_not_comparable_missing_and_ambiguous(workbench_ctx):
@@ -906,7 +909,11 @@ def test_f2a_incomplete_allocation_does_not_become_confirmed_fact():
     assert scope.confirmed_invoice_allocations == []
     assert len(scope.incomplete_allocations) == 1
     assert scope.incomplete_allocations[0].kind_label == "销项发票关联"
-    assert scope.amount_control.outcome_label == F2A_SALES_MISSING_LABEL
+    # No invoice_month is supplied by this pure context either, so the
+    # FX-based comparison reports its own unavailable reason first — but
+    # the invoice leg itself still renders as unavailable, never a
+    # fabricated value from the dangling allocation.
+    assert scope.amount_control.outcome_label == "缺少明确月份或可追溯汇率，暂无法核算"
     assert scope.amount_control.invoice_amount == "—"
     assert scope.has_advisories is False
 
