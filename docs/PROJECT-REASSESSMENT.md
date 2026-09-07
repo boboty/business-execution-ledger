@@ -1,74 +1,154 @@
 # 项目再评估与下一阶段
 
-本次判断来自仓库代码、冻结规则和独立合成测试；本文不包含私有验收结果。
+本次判断基于当前仓库代码、冻结规则、Application Tool Contract 及其独立复核。
+本文不包含私有验收值或私有业务数据。
 
 ## BEL 今天是什么
 
-BEL 已经形成采购合同为主轴的业务事实维护、确定性分配、月结工作台和
-Data Product 系统。销售合同及采购销售桥接单独建模；Web 与 CLI 共享
-Application 投影。它还没有成为 Agent Runtime，也不能仅凭功能清单宣称
-已替代 Excel 成为 System of Record。
+BEL 已完成第一阶段切换，并已成为第一阶段合同执行事实与确定性业务状态的
+System of Record。当前 Core 已形成：
 
-原目标仍适合现有架构。下一阶段的价值来自让业务负责人能够复核并接受
-权威事实，而不是增加页面数量或先接入模型。
+- Evidence / Fact / Decision 分层与追溯；
+- 采购与销售业务域分离；
+- 合同、商品、发票、付款、出运及显式 Allocation / Relationship；
+- 确定性采购匹配与人工确认边界；
+- Period Close、Invoice Preparation、Exception & Task 等共享业务状态投影；
+- PostgreSQL 运行时、迁移纪律、Cutover / Reconciliation / Data Product；
+- 最小 Application Tool Contract v1。
 
-## 保留与调整
+BEL 不是 Agent Runtime，也不是普通“合同/发票/付款表单管理系统”。它的核心
+价值是：以治理后的事实和关系为基础，通过确定性规则重建可追溯的业务执行
+状态，并把不确定性显式暴露给人或上层操作者。
 
-- 保留 Evidence / Fact / Decision 分层、事实修订历史、明确的待确认状态。
-  它们支持纠错和追溯，不应退化为任意覆盖字段的 CRUD。
-- 保留独立采购与销售模型、无金额分摊的多对多桥接和人工销售匹配。
-  `Contract.buyer` 是我方实体；不能用作外部客户。
-- 保留 PostgreSQL、只向前的迁移、应用服务负责写入和投影共享。
-- 保留采购已确认关系优先、可确定时按时间顺序分配的规则。
-  顺序分配不等于原始来源逐笔证明，页面与导出都必须保留分配依据。
-- 不要求每个业务对象达到理论上的最细粒度才允许日常使用；现有商品级
-  暂估规则仍有部分到票、部分冲回的实际理由，不能因此删除商品层。
-- 不以“所有任务清零”代替切换差异归零。管理提醒、运营待办、切换差异
-  有不同作用，不能合并成一种阻塞。
+## 保留不变的核心边界
 
-主要复杂度集中于大型持久化仓库、CLI 和历史阶段文档。修订链和并发保护
-有实际价值；仅按文件大小拆分没有足够收益，本阶段不做此类重构。
+- `Evidence ≠ Fact ≠ Decision`；状态不能退化为人工维护的任意 `status` 字段。
+- 事实修订使用 correction / supersession 语义，不把历史事实静默覆盖掉。
+- 采购与销售模型保持结构性分离；多对多关系和 Allocation 必须显式表达。
+- Business Core 不包含财务、税务、ERP 消费方词汇。
+- Prompt 不是业务规则；权威业务状态由确定性代码计算。
+- Operator / Agent 只能通过 Application / Tool Contract 操作 BEL，不能直接接触数据库。
+- 不以“所有任务清零”代替业务事实正确，也不把不同类型的 blocker、advisory、Task
+  强行合并成一个通用工作流对象。
 
-## 有实质影响的发现
+## Tool Contract 独立复核后的关键判断
 
-| 分类 | 发现与处理 |
-| --- | --- |
-| 实现缺陷 | 对账用缺省空列表接受 `{}`；改为要求显式 `entries` 列表，畸形结构拒绝，合法空范围保留。 |
-| 实现缺陷 | Gate 只检查计划文件可读；补充解析和现有计划结构校验，不执行回填。 |
-| 复核能力缺口 | 差异只给键与结果；共享对账诊断现提供原因、预期、实际和不同字段，稳定排序，仅写私有报告。 |
-| 追溯缺口 | 报告不能区分所读取的两份控制输入；记录描述符读取所得字节的 SHA-256。这仅标识输入，不证明业务签署或所有原始来源完整性。 |
-| 表达缺陷 | 顺序分配在页面显示技术代码，台账导出仅保留确认类型；增加中文解释并导出 `match_method`。 |
-| 验收覆盖边界 | 当前 `build_contract_execution_snapshot` 比较合同执行事实层。Gate 对月结、开票准备和异常中心验证可运行及导出确定性，不等于独立验证全部业务结论。不得扩大 PASS 的含义。 |
+最小 Tool Contract 已经证明采购发票工作发现、Fact/Evidence/Allocation 检查、
+确定性 matching 和再次读取权威状态这条纵向链路可以通过受限 JSON capability
+表达；但它还没有证明一个带模型不确定性、重试和中断的 Runtime 可以安全运行。
 
-对账原因码是诊断，不是新的业务裁决。重复基线键、未裁决结果和
-`unresolved:` 来源继续按原规则不可通过；金额等价规范化保持原样。
-结构校验也不证明基线已经获得业务确认。
+独立复核暴露出三类下一阶段必须先解决的问题：
 
-## 选择的主要阶段：可复核的第一阶段切换验收闭环
+1. **单次响应一致性。** 当前 `invoice_work` 在 PostgreSQL READ COMMITTED 下由多次
+   查询拼出一个结果；并发提交可能让同一响应同时包含新旧状态。该问题应在
+   Application 读取边界解决，而不是要求上层模型自行修复。
+2. **逻辑边界不等于执行边界。** `ToolContract` 是良好的逻辑 capability 边界，
+   但同进程对象引用、数据库凭据、shell/CLI 等旁路仍可能绕开它。第一 Runtime 前
+   需要可信 Host 和实际受限的执行/权限边界。
+3. **完成语义必须保守。** batch matching 的授权范围、`OUTCOME_UNKNOWN` 后的当前
+   状态对账、`UNMATCHED` 与 `human_work=[]` 的含义都不能被 Runtime 简化成“任务已完成”。
+   必须冻结 bounded retry、stop 和 residual-work handoff 语义。
 
-执行顺序及验收依据：
+因此，下一步不是直接接 Pi，也不是继续增加新的业务 Tool。
 
-1. 新建 PostgreSQL 候选并用 Alembic 迁移，从授权事实来源运行现有回填。
-   不复制历史 SQLite 或 PostgreSQL 业务状态。
-2. 运行采购确定性匹配，验证重复运行不改变业务状态；人工销售匹配保留。
-3. 用同一候选生成四类 Data Product 和待处理事项，放在私有目录供复核。
-   候选输出只是实际观察，不能反向构造独立验收基线。
-4. 使用业务确认的 Cutover Baseline 运行正式只读 Gate。畸形或缺失输入
-   不得通过；原有差异必须经来源支持的修复或业务裁决处理。
-5. 对正式 Gate 尚未逐项对账的业务结论，明确复核范围及业务接受依据。
-   不凭“可以导出”宣称结论已经验收。
-6. 业务负责人决定是否宣告 System of Record。技术执行者不能代替宣告。
+## 当前选择的主要阶段：Executable Delegation Boundary
 
-技术验证使用独立合成数据及一次性 PostgreSQL 测试库；真实验收的公开
-输出始终只有场景 ID 与 PASS/FAIL，诊断和业务复核材料只留在私有根目录。
+当前主线为：
+
+```text
+Application Tool Contract v1
+        ↓
+修复 single-response consistent view
+        ↓
+Trusted Host / private JSON transport
+        ↓
+model-free independent client
+        ↓
+authorization / retry / stop / residual-work semantics
+        ↓
+Gate
+        ↓
+Restricted Operator / Agent Runtime
+```
+
+这一阶段只证明“BEL 能否被安全委托操作”，不建设通用 Agent 平台。
+
+### Gate 至少要证明
+
+- 一个 operator-facing read response 内部有一致的观察视图；
+- Runtime/client 无数据库凭据、无 Core 对象引用、无通用写旁路；
+- WRITE capability 只能由可信 Host 授权；
+- `OUTCOME_UNKNOWN` 后按当前权威状态对账，不做盲目重试；
+- `UNMATCHED`、`HUMAN_CONFIRMATION_REQUIRED`、没有 MatchCase、没有 `human_work`
+  保持各自真实语义；
+- 模型或客户端不能通过 Prompt/脚本重新实现 matching 规则；
+- 无对话历史也可以从 BEL 当前状态恢复并继续；
+- 固定工作链若脚本已经足够，则 Agent 必须证明额外的复核/交接价值，否则不扩大
+  Runtime 投资。
+
+## Operator / Runtime 选择
+
+Pi 仍然是第一 restricted operator runtime 的候选，但它不再是 Architecture Law。
+PydanticAI、OpenAI Agents SDK、语言选择、进程数量、transport 和 Runtime 顺序都属于
+可逆的实现决策。
+
+当前不冻结一个抽象 `AgentRuntime Interface`。先让 Tool Contract + Host 边界成为
+稳定 SPI；等第二个真实 consumer/runtime 出现后，再从两个实现中提炼真正共同的
+Runtime abstraction。
+
+## Intelligent Intake：明确延后，且位于 Core 之外
+
+当前不在 BEL Core 内建设 Semantic Understanding / Semantic Normalization Layer。
+
+这一周 BEL Core 的快速收敛本来就建立在一个正确前提上：最初 Excel / PDF 等原始
+材料先由 Codex 辅助理解、归一化和人工复核关键歧义，再进入现有 BEL import / backfill
+路径。对于当前本地、低频使用，这个流程已经足够，不需要提前产品化。
+
+未来只有在新来源持续接入、重复归一化成本明显、多人使用或自动化 Intake 成为真实
+需求时，才单独建设 `bel-intake`：
+
+```text
+Raw Excel / PDF / Documents
+        ↓
+bel-intake
+parse / interpret / normalize / propose
+        ↓
+BEL Intake Contract
+        ↓
+bel-core
+Evidence / Fact / Rule / Decision / Task
+        ↓
+Tool Contract
+        ↓
+Operator / Pi / other Runtime
+```
+
+`bel-intake` 可以拥有 OCR、Parser、LLM Provider、Prompt、Evaluation 和归一化逻辑，
+但不拥有权威业务状态。真正需要长期稳定的是 **BEL Intake Contract**，而不是某个
+模型调用接口。
+
+当前因此维持：
+
+```text
+新 Excel / PDF
+→ Codex-assisted preprocessing
+→ 人工检查关键歧义
+→ 可审阅的结构化中间结果
+→ BEL existing import / backfill
+```
+
+这个过程先作为开发/运营流程存在，不进入近期产品 Roadmap。
 
 ## 后续顺序
 
-完成第一阶段业务接受后，优先定义最小 Application Tool Contract，围绕
-一个实际操作证明只读查询、结构化提议、确定性校验、写入和重试边界。
-驾驶舱作为按使用需求决定的可选投影，不应成为安全 Agent 接入的硬依赖。
+1. 修复 Tool Contract operator-facing read 的 mixed-view consistency。
+2. 完成 Executable Delegation Boundary 与 model-free independent client Gate。
+3. 接入第一 restricted Operator / Runtime，并验证真实 Agent value。
+4. 继续按业务价值扩展 BEL 的 Business State / Tool capability，而不是为了 Agent 增加能力。
+5. 第二个真实 Runtime/consumer 出现后验证 substitutability。
+6. MCP、外部生态和 downstream adapters 按真实接入需求推进。
+7. `bel-intake` 在重复 Intake 需求真实出现后再产品化。
 
-模型语义解释随后通过这一边界试点：Evidence → Structured Proposal →
-确定性校验 → Fact / Task / Ignore。先证明边界，再扩展模型或框架；不继续
-无上限堆叠关键词，也不让模型进入确定性规则引擎。具体 Runtime 的冻结
-选择及可替换性要求，本阶段不变更。
+长期责任边界保持一句话：
+
+> **Intake interprets. Core decides. Operator acts.**
