@@ -1,10 +1,12 @@
 # Roadmap
 
 第一阶段切换验收与 System of Record 宣告已于 2026-09-06 完成，并以
-`v0.3.0 — First-stage System of Record` 标记。当前阶段顺序以
-[项目再评估](docs/PROJECT-REASSESSMENT.md) 为准：最小
-Application Tool Contract 已实现，下一步为独立评审。驾驶舱是按业务使用需要安排的可选投影，不是
-Agent 接入的前置条件。下文的阶段记录保留历史上下文。
+`v0.3.0 — First-stage System of Record` 标记。最小 Application Tool Contract v1
+也已实现并完成独立复核。当前阶段顺序以
+[项目再评估](docs/PROJECT-REASSESSMENT.md) 为准：先修复 operator-facing read
+的一致性问题并建立 Executable Delegation Boundary，再接入第一 restricted
+Operator / Agent Runtime。Business Cockpit 是可选业务投影；`bel-intake` 是后续独立
+能力，当前不在 Business Core 内建设语义理解层。下文阶段记录保留历史上下文。
 
 Business Execution Ledger (BEL) is being built as a deterministic
 business execution layer for agentic systems. The roadmap is
@@ -380,60 +382,148 @@ owner explicitly accepted the result and declared BEL the first-stage
 System of Record. The declaration is recorded in
 [docs/FIRST-STAGE-SOR-DECLARATION.md](docs/FIRST-STAGE-SOR-DECLARATION.md).
 
-## Implemented — Minimal Application Tool Contract (pending independent review)
+## Implemented and reviewed — Minimal Application Tool Contract v1
 
-The minimal v1 boundary is implemented: procurement invoice work discovery,
-Fact/Evidence/Allocation inspection, and the existing deterministic invoice
-matching batch, with host-controlled write authorization and explicit retry
-semantics. Synthetic contract tests and PostgreSQL transaction/concurrency
-checks prove the first operator workflow, including human-confirmation handoff.
-See [Application Tool Contract](docs/APPLICATION-TOOL-CONTRACT.md).
-Independent review is the next gate; no Agent Runtime is introduced.
+The minimal v1 boundary is implemented and independently reviewed:
+procurement invoice work discovery, Fact/Evidence/Allocation inspection,
+and the existing deterministic invoice matching batch, with host-controlled
+write authorization and explicit retry semantics. The cardinality repair
+preserves all authoritative MatchCases per invoice rather than fabricating one
+"current" case. See
+[Application Tool Contract](docs/APPLICATION-TOOL-CONTRACT.md).
 
-The contract should expose only deliberate Application capabilities,
-preserve the Evidence → Fact → Decision boundary, make uncertainty and
-human-confirmation requirements explicit, and remain independent of any
-specific model/runtime. The first Agent Runtime comes only after this
-boundary is defined and contract-tested.
+The review confirmed the Tool Contract as a useful logical capability boundary,
+but also demonstrated that a logical boundary is not yet a safe execution
+boundary for a model-driven Runtime. Three issues therefore become prerequisites
+for the next stage: single-response read consistency, actual host/credential
+isolation, and conservative authorization/retry/stop/residual-work semantics.
+
+## Next — Executable Delegation Boundary R0
+
+Solve only what is required to make the existing Tool Contract safely consumable
+by an independent operator/client:
+
+1. **Single-response consistent view** — one operator-facing response must not
+   mix business states from different commit points under PostgreSQL
+   `READ COMMITTED`.
+2. **Trusted Host** — the Host owns database configuration and write capability
+   authorization; the client/runtime receives neither DB credentials nor Core
+   object references.
+3. **Private JSON transport** — use the smallest transport that proves a real
+   process/object boundary; do not introduce MCP or a general network service.
+4. **Model-free independent client** — prove the transport and authority boundary
+   before introducing model behavior.
+5. **Recovery semantics** — `OUTCOME_UNKNOWN` means re-read authoritative current
+   state; retries are bounded reconciliation, not an exactly-once promise.
+6. **Residual-work semantics** — `UNMATCHED`, `HUMAN_CONFIRMATION_REQUIRED`, no
+   MatchCase and empty `human_work` remain distinct; a successful call must never
+   be summarized as "all work completed" without evidence.
+7. **Bypass checks** — the client/runtime must not gain generic shell/DB/Core write
+   paths that make Tool authorization meaningless.
+
+Gate this stage on the production PostgreSQL contract, including interleaved
+read/write behavior, multi-MatchCase coverage, post-commit disconnect/reconcile,
+unauthorized calls and boundary bypass checks.
+
+No model, Agent framework, semantic-normalization layer or new business rule is
+part of this stage.
+
+## Then — Restricted Operator / Agent Runtime
+
+Attach a deliberately narrow Runtime only after Delegation Boundary R0 passes.
+The first vertical slice remains procurement batch execution, authoritative
+outcome review and residual-work handoff:
+
+```text
+discover procurement work
+→ inspect authoritative facts / allocations / evidence references
+→ under Host authorization run deterministic procurement matching
+→ re-read authoritative state
+→ distinguish allocated / HCR / UNMATCHED / no recorded decision
+→ hand residual work to a human and stop
+```
+
+The Runtime does not become a second rule engine and does not perform human
+confirmation.
+
+Pi remains a candidate for the first restricted Operator Runtime, but framework
+brand, language, process count and Runtime ordering are implementation decisions,
+not architecture law. Do not freeze a general `AgentRuntime Interface` before
+multiple real consumers reveal a genuine common abstraction.
+
+The Agent value Gate is product-level as well as technical: the fixed tool chain
+can be scripted. A model-driven Operator must demonstrate useful incremental
+value in understanding the work request, choosing necessary inspections,
+organizing evidence-backed handoff, or reducing human review cost. If it does
+not, retain the deterministic script for this workflow and do not expand Runtime
+investment merely to make the system more "agentic".
 
 ## Optional post-first-stage projection — Business Cockpit
 
-The Business Cockpit is still in scope as a business-facing projection,
-but it is no longer a prerequisite for Agent access. Schedule it when
-real business use justifies it; do not pull it forward merely to provide
-a UI shell for Agent work.
+The Business Cockpit remains in scope as a business-facing projection, but it is
+not a prerequisite for Agent access. Schedule it when real business use justifies
+it; do not pull it forward merely to provide a UI shell for Agent work.
 
-## Then — Agent Runtime
+## Deferred — Intelligent Intake outside the Core
 
-The frozen order within this stage is: Application Tool Contract first,
-then the first Agent Runtime behind it, then runtime substitutability,
-then MCP/ecosystem.
+BEL does not currently embed a Semantic Understanding / Semantic Normalization
+Layer inside the Business Core.
 
-- Define the Application API / Tool Contract boundary an Agent Runtime
-  would sit behind — this comes before any runtime is introduced
-- Introduce the first Agent Runtime through that boundary
-- Keep the Business Core independent of any specific model or agent
-  framework
-- Add automated architecture checks that fail if the Business Core
-  imports an agent runtime
-- Prove runtime substitutability with contract tests against more than
-  one runtime
+For current local use, source onboarding can continue with the workflow that
+already enabled the first-stage Core to converge quickly:
 
-## Ecosystem
+```text
+new Excel / PDF / source material
+→ Codex-assisted understanding and normalization
+→ human review of material ambiguity
+→ reviewable structured intermediate
+→ existing BEL import / backfill
+```
 
-- Define stable Tool / MCP contracts for external agent runtimes
-- Add adapters for downstream finance, tax, ERP and analytics consumers
-  without leaking their vocabulary into the Business Core
-- Publish reusable synthetic business scenarios for testing agentic
-  business systems
-- Improve contributor documentation and issue templates as outside
-  contributors arrive
+This remains a development/operations workflow, not a product subsystem.
+
+When repeated source onboarding, multi-user operation or normalization cost makes
+productization worthwhile, introduce a separate `bel-intake` capability:
+
+```text
+Raw business material
+        ↓
+bel-intake
+parse / interpret / normalize / propose
+        ↓
+BEL Intake Contract
+        ↓
+bel-core
+```
+
+`bel-intake` may own OCR/parsers, LLM providers, prompts, normalization and
+evaluation. It never owns authoritative business state. The stable seam is the
+business input contract BEL validates and admits, not a provider-specific model
+API.
+
+## Later — Runtime substitution and ecosystem
+
+- Prove runtime/client substitutability with a second real consumer without
+  changing the Business Core, rules, schema or Tool semantics.
+- Only then extract any truly common Runtime abstraction.
+- Define MCP/external-agent contracts when an actual external consumer requires
+  them.
+- Add adapters for downstream finance, tax, ERP and analytics consumers without
+  leaking their vocabulary into the Business Core.
+- Publish reusable synthetic business scenarios for testing agentic business
+  systems.
+- Improve contributor documentation and issue templates as outside contributors
+  arrive.
 
 ## What will not change
 
-The core boundary is deliberate: agents may understand evidence,
-propose associations, explain exceptions and operate tools;
-authoritative business facts, business states and close decisions
-remain governed by structured data and deterministic rules.
+The core boundary is deliberate:
+
+> **Intake interprets. Core decides. Operator acts.**
+
+Future Intake may understand and normalize external material; Operators may
+inspect state, propose actions and call tools. Authoritative business facts,
+relationships, business states and close decisions remain governed by structured
+data and deterministic rules inside BEL.
 
 See `docs/ARCHITECTURE.md` for the frozen architecture principles.
